@@ -51,6 +51,12 @@ pub struct Simulation {
     /// each body at its release.
     #[serde(default, skip_serializing_if = "is_zero_f")]
     pub jitter: f64,
+    /// How much a ragdoll's reactions differ from take to take, 0..1 (by
+    /// the seed: how soon an arm comes up, how far and how readily it
+    /// steps, how hard it balances; at 1 by up to a quarter, and a sixth
+    /// of a second). 0: only `jitter` tells takes apart.
+    #[serde(default, skip_serializing_if = "is_zero_f")]
+    pub vary: f64,
     /// Bodies stay in the picture plane: no movement in z, turning about z
     /// only (flat layers as bodies).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -92,6 +98,9 @@ fn is_rate(v: &f64) -> bool {
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
 fn is_zero_f(v: &f64) -> bool {
     *v == 0.0
 }
@@ -101,7 +110,7 @@ fn is_zero3(v: &[f64; 3]) -> bool {
 
 impl Default for Simulation {
     fn default() -> Self {
-        Self { unit: unit(), gravity: gravity(), start: None, end: None, rate: rate(), seed: 0, jitter: 0.0, flat: false, ground: None, joints: Vec::new(), blasts: Vec::new(), ragdolls: Vec::new(), crowds: Vec::new() }
+        Self { unit: unit(), gravity: gravity(), start: None, end: None, rate: rate(), seed: 0, jitter: 0.0, vary: 0.0, flat: false, ground: None, joints: Vec::new(), blasts: Vec::new(), ragdolls: Vec::new(), crowds: Vec::new() }
     }
 }
 
@@ -340,6 +349,17 @@ pub struct Joint {
     /// anchor, a rope in pieces that hang by the slack it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<String>,
+    /// Rope: made of this many bodies (capsules jointed end to end, baked
+    /// as `<joint>/<n>`) that swing, whip and lie on what is between its
+    /// ends. 0: no bodies, a curve drawn between the ends (cheap).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub links: u32,
+    /// Rope with `links`: its radius, px (default: the drawn layer's, else
+    /// 4), and its mass in all, kg (default: as water).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mass: Option<f64>,
 }
 
 fn axis_z() -> [f64; 3] {
@@ -415,9 +435,19 @@ pub struct Ragdoll {
     #[serde(default, skip_serializing_if = "is_zero_f")]
     pub bounce: f64,
     /// Joint limits by bone id (or a part of it: "arm", "leg"); the first
-    /// that matches. Bones none matches take `swing` 40, `twist` ±20.
+    /// that matches. Bones none matches take a human's by their names
+    /// (`human_limit`: knees and elbows hinges that bend one way, and so
+    /// on; defaults, to be given here where they are wrong), and those no
+    /// name tells take `swing` 40, `twist` ±20. An entry for bone "" is
+    /// for every bone the entries before it leave.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<BoneLimit>,
+    /// The way the figure faces in its root's space as it stands at
+    /// `rest`, [x, z] (default [0, −1]: toward the viewer, as an imported
+    /// glTF character does): knees bend back from it and elbows forward,
+    /// when their hinges come from the bones' names.
+    #[serde(default = "crowd_facing", skip_serializing_if = "is_crowd_facing")]
+    pub facing: [f64; 2],
     /// A bone's collider given outright (px, the bone layer's space),
     /// for where a capsule along the bone is wrong: a foot is a box that
     /// stands flat. By bone id or a part of it; the first that matches.
@@ -444,12 +474,21 @@ pub struct Ragdoll {
     /// What sets the motors (default: the clip and the behaviours).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<Controller>,
+    /// The bones behaviours stand on, reach with and shield (layer ids).
+    /// Default: by name, bones called foot (or a last toe), hand, head.
+    /// A hand's arm is the two bones it hangs from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feet: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 impl Ragdoll {
     /// A limp ragdoll of the skeleton under `root`.
     pub fn of(id: String, root: String, mass: f64, thickness: f64, friction: f64) -> Ragdoll {
-        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None }
+        Ragdoll { id, root, bones: Vec::new(), release: None, rest: None, mass, thickness, friction, bounce: 0.0, limits: Vec::new(), facing: crowd_facing(), shapes: Vec::new(), strength: zero_prop(), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new(), self_collide: true, controller: None, feet: Vec::new(), hands: Vec::new(), head: None }
     }
 }
 
@@ -509,6 +548,59 @@ pub struct BoneLimit {
     /// space only, `swing` degrees one way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hinge: Option<[f64; 3]>,
+}
+
+/// How a joint bends, from its bone's name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Bend {
+    /// Any way within `swing`, and `twist` about its length.
+    Ball,
+    /// A hinge that folds the bone back (a knee), `swing` degrees.
+    Back,
+    /// A hinge that folds the bone forward (an elbow).
+    Forward,
+}
+
+/// A human joint's range by the name of the bone it holds (`name`: the
+/// bone's own, without what its skeleton's ids share): degrees of swing
+/// and of twist each way, and how it bends. The names are those of the
+/// usual rigs (Blender's, Mixamo's, Unreal's mannequin, and plain ones:
+/// thigh, shin, upper, fore). Round figures from anatomy's ranges of
+/// motion, on the loose side so a fall looks limp, not stiff; defaults.
+/// None: the name tells nothing.
+pub fn human_limit(name: &str) -> Option<(f64, f64, Bend)> {
+    let n = name.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+    // (The specific before the general: a forearm before an arm, an
+    // upper leg before a leg, a finger before a hand. A hinge does not
+    // twist: its number is what an entry written by hand has unsaid.)
+    Some(if has(&["thumb", "index", "middle", "ring", "pinky", "finger"]) {
+        (45.0, 5.0, Bend::Ball)
+    } else if has(&["toe", "ball"]) {
+        (30.0, 5.0, Bend::Ball)
+    } else if has(&["head"]) {
+        (35.0, 40.0, Bend::Ball)
+    } else if has(&["neck"]) {
+        (30.0, 35.0, Bend::Ball)
+    } else if has(&["clavicle", "shoulder", "collar"]) {
+        (20.0, 10.0, Bend::Ball)
+    } else if has(&["forearm", "fore_arm", "lowerarm", "lower_arm", "fore", "elbow"]) {
+        (140.0, default_twist(), Bend::Forward)
+    } else if has(&["hand", "wrist"]) {
+        (50.0, 20.0, Bend::Ball)
+    } else if has(&["thigh", "upleg", "up_leg", "upperleg", "upper_leg", "femur"]) {
+        (70.0, 25.0, Bend::Ball)
+    } else if has(&["shin", "calf", "lowerleg", "lower_leg", "knee", "tibia", "leg"]) {
+        (140.0, default_twist(), Bend::Back)
+    } else if has(&["foot", "ankle"]) {
+        (35.0, 10.0, Bend::Ball)
+    } else if has(&["upperarm", "upper_arm", "uparm", "upper", "arm", "humer"]) {
+        (100.0, 60.0, Bend::Ball)
+    } else if has(&["spine", "chest", "torso", "abdomen", "waist", "belly", "back"]) {
+        (25.0, 20.0, Bend::Ball)
+    } else {
+        return None;
+    })
 }
 
 pub fn default_swing() -> f64 {
@@ -697,6 +789,26 @@ pub struct Crowd {
     /// Agents knocked down fall as ragdolls made like this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ragdoll: Option<CrowdRagdoll>,
+    /// Instances: a second pose of the character that an agent takes
+    /// while something is coming at it (arms up, ducked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<CrowdGuard>,
+}
+
+/// A crowd's guard: the character's pose at `pose` (a time of its own
+/// keys: key the pose there, outside its walk's cycle), blended over an
+/// agent's walk while a body that would knock it down is on its way to
+/// it within `ahead` seconds, and for a moment after.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrowdGuard {
+    pub pose: TimeRef,
+    #[serde(default = "one")]
+    pub ahead: f64,
+    /// The bones the pose takes, and all that hang from them (layer ids;
+    /// default: every bone). Leave the legs out and they walk on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bones: Vec<String>,
 }
 
 /// How a crowd's agents are made ragdolls (`Ragdoll`'s fields of the same
@@ -734,6 +846,9 @@ fn crowd_fallen() -> u32 {
 }
 fn crowd_facing() -> [f64; 2] {
     [0.0, -1.0]
+}
+fn is_crowd_facing(v: &[f64; 2]) -> bool {
+    *v == crowd_facing()
 }
 fn crowd_speed() -> f64 {
     140.0
@@ -811,6 +926,37 @@ pub fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 fn norm(v: [f64; 3]) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+/// The turn that takes y to `d` (unit).
+pub fn quat_y_to(d: [f64; 3]) -> [f64; 4] {
+    let c = d[1];
+    if c < -1.0 + 1e-9 {
+        return [1.0, 0.0, 0.0, 0.0];
+    }
+    let axis = cross([0.0, 1.0, 0.0], d);
+    let q = [axis[0], axis[1], axis[2], 1.0 + c];
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    q.map(|v| v / n)
+}
+
+/// How far a rope `length` long sags between ends `apart` from each
+/// other: the depth of the parabola as long as it (found by halving: its
+/// length grows with its sag). 0 when it is taut.
+pub fn rope_sag(length: f64, apart: f64) -> f64 {
+    if length <= apart {
+        return 0.0;
+    }
+    let long_with = |sag: f64| {
+        let a = 4.0 * sag / apart.max(1e-9);
+        if a < 1e-9 { apart } else { apart * (0.5 * (1.0 + a * a).sqrt() + crate::dm::ln(a + (1.0 + a * a).sqrt()) / (2.0 * a)) }
+    };
+    let (mut lo, mut hi) = (0.0, length / 2.0);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if long_with(mid) < length { lo = mid } else { hi = mid }
+    }
+    lo
 }
 
 /// A rotation matrix's quaternion (columns `c`: orthonormal, right-handed).
@@ -929,9 +1075,23 @@ pub struct HerdTrack {
     /// and the ragdoll of the pool it fell as (`u32::MAX`: none).
     pub down: Vec<u32>,
     pub slot: Vec<u32>,
+    /// Per sample, per agent, when the crowd has a guard: how far it has
+    /// taken its guard's pose (0..1). Empty otherwise.
+    pub guard: Vec<f32>,
 }
 
 impl HerdTrack {
+    /// How far agent `k` has its guard up at sample position `x` (0..1).
+    pub fn guard_at(&self, k: usize, x: f64) -> f64 {
+        let n = self.count as usize;
+        let Some(last) = (self.guard.len() / n.max(1)).checked_sub(1) else { return 0.0 };
+        let x = x.clamp(0.0, last as f64);
+        let i = (x.floor() as usize).min(last);
+        let j = (i + 1).min(last);
+        let (a, b) = (self.guard[i * n + k] as f64, self.guard[j * n + k] as f64);
+        a + (b - a) * (x - i as f64)
+    }
+
     pub fn len(&self) -> usize {
         if self.count == 0 { 0 } else { self.samples.len() / self.count as usize }
     }
@@ -1080,6 +1240,14 @@ impl Bake {
                 o.extend_from_slice(&v.to_le_bytes());
             }
         }
+        // (And after them, the guards of the crowds that have one.)
+        for (k, h) in self.herds.iter().enumerate().filter(|(_, h)| !h.guard.is_empty()) {
+            o.extend_from_slice(&(k as u32).to_le_bytes());
+            o.extend_from_slice(&(h.guard.len() as u32).to_le_bytes());
+            for v in &h.guard {
+                o.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         o
     }
 
@@ -1153,7 +1321,13 @@ impl Bake {
                     *m = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
                 }
                 let [down, slot] = marks;
-                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot });
+                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot, guard: Vec::new() });
+            }
+            while !r.0.is_empty() {
+                let (k, n) = (r.u32()? as usize, r.u32()? as usize);
+                let raw = r.take(n.checked_mul(4).ok_or("the bake is cut short")?)?;
+                let herd = herds.get_mut(k).ok_or("the bake has a guard for no crowd")?;
+                herd.guard = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
             }
         }
         Ok(Bake { hash, start, rate, tracks, events, herds })
@@ -1257,6 +1431,24 @@ pub struct BodyInput {
     /// Bodies of one group (a ragdoll's bones) never collide with the
     /// bone they are jointed to; 0 is no group.
     pub group: u32,
+    /// Bodies it never touches (a rope's link: the two it is tied to).
+    pub apart: Vec<usize>,
+    /// An emitter's particle: the body is out of the world but for these
+    /// spans (`release` is `u32::MAX`), put at each one's start where the
+    /// particle is born.
+    pub lives: Vec<LifeInput>,
+}
+
+/// One particle of an emitter's slot as a body: in the world from sample
+/// `from` until `to`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LifeInput {
+    pub from: u32,
+    pub to: u32,
+    /// Where the particle is at `from`, and a sample later by its own
+    /// flight (its speed as it becomes a body).
+    pub pose: Pose,
+    pub next: Pose,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1348,6 +1540,12 @@ pub struct RagdollInput {
     /// (seconds, bone index, px/s, seconds it lasts).
     pub hits: Vec<(f64, usize, [f64; 3], f64)>,
     pub controller: Option<Controller>,
+    /// Its feet, hands (each `true` when it is the left) and head, as
+    /// bone indices, when the document names them (else behaviours find
+    /// them by the bones' names).
+    pub feet: Option<Vec<usize>>,
+    pub hands: Option<Vec<(usize, bool)>>,
+    pub head: Option<usize>,
 }
 
 /// A crowd's agent: where it starts and goes, and its skeleton.
@@ -1388,6 +1586,9 @@ pub struct CrowdInput {
     pub knock: f64,
     pub plan: bool,
     pub dodge: f64,
+    /// Seconds ahead an agent raises its guard at what is coming (None:
+    /// it has no guard).
+    pub guard: Option<f64>,
 }
 
 /// Everything a bake is made from: the document's simulation resolved to
@@ -1406,6 +1607,8 @@ pub struct SimInput {
     pub gravity: [f64; 3],
     pub seed: u64,
     pub jitter: f64,
+    /// How much ragdolls' reactions differ by the seed (0..1).
+    pub vary: f64,
     pub flat: bool,
     pub ground: Option<Ground>,
     pub bodies: Vec<BodyInput>,
@@ -1486,6 +1689,11 @@ impl SimInput {
         h.fs(&[self.start, self.rate, self.samples as f64, self.substeps as f64, self.unit, self.jitter]);
         h.fs(&self.gravity);
         h.u64(self.seed);
+        // (Only where there is any: older bakes keep their hash.)
+        if self.vary != 0.0 {
+            h.str("vary");
+            h.f(self.vary);
+        }
         h.u64(self.flat as u64);
         h.opt(self.ground.as_ref().map(|g| [g.y, g.friction, g.bounce]).as_ref().map(|v| &v[..]));
         h.u64(self.bodies.len() as u64);
@@ -1533,6 +1741,19 @@ impl SimInput {
                 h.fs(&p.velocity);
                 h.fs(&p.spin);
                 h.opt(p.point.as_ref().map(|v| &v[..]));
+            }
+            // (Only where there are any: older bakes keep their hash.)
+            if !b.apart.is_empty() {
+                h.str("apart");
+                h.fs(&b.apart.iter().map(|&i| i as f64).collect::<Vec<_>>());
+            }
+            if !b.lives.is_empty() {
+                h.str("lives");
+                for l in &b.lives {
+                    h.fs(&[l.from as f64, l.to as f64]);
+                    h.pose(&l.pose);
+                    h.pose(&l.next);
+                }
             }
         }
         h.u64(self.joints.len() as u64);
@@ -1596,12 +1817,24 @@ impl SimInput {
                 h.fs(v);
             }
             h.str(&r.controller.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()).unwrap_or_default());
+            // (Only where the document names them: older bakes keep their hash.)
+            if r.feet.is_some() || r.hands.is_some() || r.head.is_some() {
+                h.str("parts");
+                h.opt(r.feet.as_ref().map(|f| f.iter().map(|&b| b as f64).collect::<Vec<_>>()).as_deref());
+                h.opt(r.hands.as_ref().map(|f| f.iter().flat_map(|&(b, left)| [b as f64, left as u8 as f64]).collect::<Vec<_>>()).as_deref());
+                h.u64(r.head.map(|b| b as u64 + 1).unwrap_or(0));
+            }
         }
         h.u64(self.crowds.len() as u64);
         for c in &self.crowds {
             h.str(&c.id);
             h.fs(&[c.speed, c.vary, c.radius, c.height, c.stride, c.cycle, c.clip_at, c.knock, c.dodge, c.plan as u8 as f64]);
             h.fs(&c.facing);
+            // (Only where there is one: older bakes keep their hash.)
+            if let Some(ahead) = c.guard {
+                h.str("guard");
+                h.f(ahead);
+            }
             h.u64(c.instanced as u64);
             h.u64(c.pool.len() as u64);
             for r in &c.pool {
@@ -1669,6 +1902,24 @@ mod tests {
     }
 
     #[test]
+    fn a_humans_limits_are_told_by_the_usual_rigs_names() {
+        let kind = |n: &str| human_limit(n).map(|(swing, _, bend)| (swing, bend));
+        // Mixamo, Blender's Rigify, Unreal's mannequin, and plain names.
+        for knee in ["mixamorig:LeftLeg", "shin.L", "calf_r", "lower_leg.R", "RightKnee"] {
+            assert_eq!(kind(knee), Some((140.0, Bend::Back)), "{knee}");
+        }
+        for elbow in ["mixamorig:RightForeArm", "forearm.L", "lowerarm_l", "fore_r"] {
+            assert_eq!(kind(elbow), Some((140.0, Bend::Forward)), "{elbow}");
+        }
+        for (name, swing) in [("mixamorig:LeftUpLeg", 70.0), ("thigh.R", 70.0), ("upper_leg.L", 70.0), ("mixamorig:LeftArm", 100.0), ("upper_arm.L", 100.0), ("upperarm_r", 100.0), ("upper_l", 100.0), ("mixamorig:LeftShoulder", 20.0), ("clavicle_l", 20.0), ("mixamorig:LeftHand", 50.0), ("mixamorig:LeftHandIndex1", 45.0), ("thumb_01_l", 45.0), ("mixamorig:LeftToeBase", 30.0), ("ball_l", 30.0), ("mixamorig:LeftFoot", 35.0), ("mixamorig:Spine1", 25.0), ("spine_03", 25.0), ("mixamorig:Neck", 30.0), ("Head", 35.0)] {
+            assert_eq!(kind(name), Some((swing, Bend::Ball)), "{name}");
+        }
+        for unknown in ["pelvis", "mixamorig:Hips", "root", "tail_03", "mid"] {
+            assert_eq!(human_limit(unknown), None, "{unknown}");
+        }
+    }
+
+    #[test]
     fn poses_compose_and_invert() {
         let a = decompose(Mat4::translate(1.0, 2.0, 3.0).then(Mat4::rotate_x(30.0)).then(Mat4::rotate_z(50.0))).0;
         let b = decompose(Mat4::translate(-4.0, 0.5, 2.0).then(Mat4::rotate_y(-70.0))).0;
@@ -1700,11 +1951,18 @@ mod tests {
         // two agents, three samples; the second turns the short way
         // round through ±π, and its clip wraps without running back.
         let (pi, y) = (std::f32::consts::PI, 800.0);
-        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0] };
+        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0], guard: Vec::new() };
         let with = Bake { herds: vec![herd], ..bake.clone() };
         let bytes = with.to_bytes();
         assert_eq!(Bake::from_bytes(&bytes).unwrap(), with);
         assert!(bytes.len() > bake.to_bytes().len() && Bake::from_bytes(&bytes[..bytes.len() - 3]).is_err());
+        // A crowd's guards come last, when it has one, and are read
+        // between the samples as the rest is.
+        let mut guarded = with.clone();
+        guarded.herds[0].guard = vec![0.0, 0.0, 0.0, 0.5, 0.25, 1.0];
+        let more = guarded.to_bytes();
+        assert_eq!(Bake::from_bytes(&more).unwrap(), guarded);
+        assert!(more.len() == bytes.len() + 8 + 24 && (guarded.herds[0].guard_at(1, 1.5) - 0.75).abs() < 1e-9 && guarded.herds[0].guard_at(0, 1.5) == 0.125 && with.herds[0].guard_at(1, 1.0) == 0.0);
         let h = &with.herds[0];
         assert_eq!(h.len(), 3);
         let (pose, clock, turn) = h.agent(0, 0.5).unwrap();

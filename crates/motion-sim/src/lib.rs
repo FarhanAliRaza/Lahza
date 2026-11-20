@@ -68,6 +68,17 @@ impl Take {
                 self.world.release(input, i, b);
             }
         }
+        // An emitter's particles: born into the world, and taken out.
+        for (i, b) in input.bodies.iter().enumerate() {
+            for life in &b.lives {
+                if life.to == k && life.from < k {
+                    self.world.gone(i);
+                }
+                if life.from == k {
+                    self.world.born(input, i, b, life);
+                }
+            }
+        }
     }
 
     /// Step `s` of the steps between samples `k` and `k + 1`.
@@ -90,6 +101,7 @@ impl Take {
             let drive = self.brains[rig].think(&mut self.world, input, r, x, t, self.turns[rig].as_deref());
             self.world.drive_ragdoll(r, rig, x, Some(&drive.targets), Some(&drive.scale));
             self.world.free[rig] = drive.pass;
+            self.world.slip[rig] = drive.slip;
             self.world.hit_ragdoll(input, r, t);
         }
         self.world.step(input, t);
@@ -177,6 +189,9 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
                     let action = p.act(&policy::observe(&take.world, input, r, &feet, k as f64)).map_err(|e| format!("ragdoll '{}': {e}", r.id))?;
                     take.turns[rig] = Some(policy::turns(r, &action));
                 }
+                // (Down, it is its behaviours': it lies, and gets up if
+                // it has `get_up`; the search takes it again once it stands.)
+                Some(Mind::Search(_)) if take.brains[rig].fallen.is_some() => take.turns[rig] = None,
                 Some(Mind::Search(s)) => {
                     let (turns, stride) = s.decide(&take, input, rig, k, t);
                     take.turns[rig] = Some(turns);
@@ -212,6 +227,23 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
     for (body, at) in let_go {
         if let Some(track) = dynamic.iter().position(|&i| i == body) {
             tracks[track].from = at;
+        }
+    }
+    // A particle's track begins with its first life. The sample before a
+    // later one is where it came from (drawing between the two is along
+    // its way in, not from where the last one died).
+    for (track, &i) in tracks.iter_mut().zip(&dynamic) {
+        let lives = &input.bodies[i].lives;
+        if let Some(first) = lives.first() {
+            track.from = first.from;
+        }
+        for (n, life) in lives.iter().enumerate() {
+            if life.from == 0 || n > 0 && lives[n - 1].to >= life.from {
+                continue;
+            }
+            let (p, q) = (life.pose, life.next);
+            let back = lahza_motion_core::sim::quat_mul(lahza_motion_core::sim::quat_mul(p.q, [-q.q[0], -q.q[1], -q.q[2], q.q[3]]), p.q);
+            track.samples[life.from as usize - 1] = [(2.0 * p.p[0] - q.p[0]) as f32, (2.0 * p.p[1] - q.p[1]) as f32, (2.0 * p.p[2] - q.p[2]) as f32, back[0] as f32, back[1] as f32, back[2] as f32, back[3] as f32];
         }
     }
     // (Bones never let go have nothing to say: their agents place them.)

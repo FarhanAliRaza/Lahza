@@ -29,6 +29,9 @@ struct Agent {
     /// (none: straight there), and the body it last stepped aside from.
     path: Vec<[f64; 2]>,
     dodged: Option<usize>,
+    /// How far its guard is up (0..1), and until when it holds it.
+    guard: f64,
+    wary: f64,
     /// Its place at this sample and the next.
     now: Pose,
     next: Pose,
@@ -41,6 +44,8 @@ pub struct Herd {
     /// Per crowd of instances: its samples so far, each agent's ragdoll
     /// of the pool, and how many of the pool are taken.
     rows: Vec<Vec<[f32; 4]>>,
+    /// And, for those with a guard, how far each agent's is up.
+    guards: Vec<Vec<f32>>,
     slots: Vec<Vec<u32>>,
     taken: Vec<usize>,
     /// Samples planned so far.
@@ -285,6 +290,8 @@ impl Herd {
                     proxy,
                     path: Vec::new(),
                     dodged: None,
+                    guard: 0.0,
+                    wary: f64::NEG_INFINITY,
                     now,
                     next: now,
                     track: Track { id: a.id.clone(), from: 0, rest: a.rest, samples: Vec::with_capacity(room), clock: Vec::with_capacity(room) },
@@ -295,6 +302,7 @@ impl Herd {
         Herd {
             agents,
             events: Vec::new(),
+            guards: vec![Vec::new(); input.crowds.len()],
             rows: input.crowds.iter().map(|c| Vec::with_capacity(if c.instanced { c.agents.len() * (input.samples as usize + 1) } else { 0 })).collect(),
             slots: input.crowds.iter().map(|c| vec![u32::MAX; if c.instanced { c.agents.len() } else { 0 }]).collect(),
             taken: vec![0; input.crowds.len()],
@@ -368,6 +376,9 @@ impl Herd {
                 a.now = a.next;
                 if c.instanced {
                     self.rows[n].push([a.now.p[0] as f32, a.now.p[2] as f32, turn(c, k, a.heading) as f32, Self::clock(c, a) as f32]);
+                    if c.guard.is_some() {
+                        self.guards[n].push(a.guard as f32);
+                    }
                 } else {
                     a.track.samples.push(sample_of(&a.now));
                     a.track.clock.push(Self::clock(c, a) as f32);
@@ -446,7 +457,11 @@ impl Herd {
                 // on it within `dodge` seconds at a speed that would
                 // knock it down. It steps out of its line.
                 let mut dodging = false;
-                if c.dodge > 0.0 {
+                // (And, with a guard, what would be on it within the
+                // guard's time: its guard goes up.)
+                let ahead = c.guard.unwrap_or(0.0);
+                let mut threatened = false;
+                if c.dodge > 0.0 || ahead > 0.0 {
                     for b in blocks.iter().filter(|b| !b.fixed) {
                         let rel = [b.vel[0] - a.vel[0], b.vel[1], b.vel[2] - a.vel[1]];
                         if (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt() < c.knock {
@@ -457,8 +472,8 @@ impl Herd {
                         if vv < 1.0 || closing <= 0.0 {
                             continue;
                         }
-                        let when = (closing / vv).min(c.dodge);
-                        if closing / vv > c.dodge {
+                        let when = closing / vv;
+                        if when > c.dodge.max(ahead) {
                             continue;
                         }
                         let miss = [p[0] + v[0] * when, p[1] + v[1] * when];
@@ -466,6 +481,10 @@ impl Herd {
                         let y = (b.lo[1] + b.hi[1]) / 2.0 + b.vel[1] * when + 0.5 * gravity * when * when;
                         let tall = (b.hi[1] - b.lo[1]) / 2.0;
                         if len2(miss) >= 1.5 * c.radius + size || y + tall < feet - c.height || y - tall > feet {
+                            continue;
+                        }
+                        threatened |= when <= ahead;
+                        if when > c.dodge {
                             continue;
                         }
                         // Away from its line, to the side it already is.
@@ -480,6 +499,14 @@ impl Herd {
                             self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "dodge".into(), a: who, b: input.bodies[b.body].id.clone(), speed: (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt().round() });
                         }
                     }
+                }
+                // Its guard: up in a sixth of a second, held half a
+                // second after the last threat, down over half a second.
+                if c.guard.is_some() {
+                    if threatened {
+                        a.wary = t + 0.5;
+                    }
+                    a.guard = if t < a.wary { (a.guard + dt / 0.16).min(1.0) } else { (a.guard - dt / 0.5).max(0.0) };
                 }
                 // (A dodge is a lunge: twice its pace, taken up at once.)
                 let (most, take) = if dodging { (2.2 * a.speed, 0.6) } else { (a.speed, 0.25) };
@@ -643,6 +670,7 @@ impl Herd {
                     samples: std::mem::take(&mut self.rows[n]),
                     down: herd.iter().map(|a| a.down.unwrap_or(u32::MAX)).collect(),
                     slot: std::mem::take(&mut self.slots[n]),
+                    guard: std::mem::take(&mut self.guards[n]),
                 });
                 continue;
             }

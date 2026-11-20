@@ -96,6 +96,19 @@ fn a_bake_says_its_share_and_stops_when_told() {
     });
     assert_eq!(stopped.err().as_deref(), Some(STOPPED));
     assert_eq!(asked.get(), 28, "nothing was stepped after the stop");
+
+#[test]
+fn a_flat_landing_without_bounce_does_not_tip() {
+    // What tips a box that lands flat is its bounce: the four corners'
+    // rebounds are worked out one after another (see the measure below).
+    // With none, on it and on the ground, it lands as it fell.
+    let tilt = |bounce: f64| {
+        let mut p = project(json!({"id": "s1", "simulation": {"ground": {"y": 900, "bounce": bounce}}, "layers": [boxed("b", 960.0, 200.0, json!({"bounce": bounce}))]}), 3.0);
+        let bake = baked(&mut p);
+        bake.tracks[0].samples.iter().map(|s| 2.0 * (s[6].abs().min(1.0) as f64).acos().to_degrees()).fold(0.0, f64::max)
+    };
+    let (none, some) = (tilt(0.0), tilt(0.1));
+    assert!(none < 0.5 && some > 1.0, "it tips {none:.2}° without bounce, {some:.2}° with the default");
 }
 
 fn chaos(seed: u64, jitter: f64) -> Project {
@@ -452,8 +465,274 @@ fn every_copy_of_an_instancer_is_a_body_of_its_own() {
     let held = baked(&mut tied);
     let s = &held.tracks[held.track("brick#4").unwrap()].samples;
     assert!((s[s.len() - 1][1] - s[0][1]).abs() < 1.0 && held.tracks[held.track("brick#3").unwrap()].samples[s.len() - 1][1] > 700.0);
-    // An emitter's particles are no bodies.
-    let e = Compiled::new(&project(scene(json!({"type": "emitter", "rate": 10, "lifetime": 1})), 1.0)).sim_input(0, None).1.join("\n");
-    assert!(e.contains("brick.body: a layer inside an emitter"), "{e}");
     assert_eq!(crate::behaviour_tests::pin(&bake), (25353, 2539571057427851888), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+/// A ball on 400 px of rope tied at (600, 200), let go level with the tie;
+/// a bar across its swing when `bar`.
+fn roped(links: u32, bar: bool, mass: f64) -> Project {
+    let mut layers = vec![
+        json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "transform": {"position": [1000, 200]}, "body": {"mass": mass}}),
+        json!({"id": "cord", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 4, "height": 50}, "transform": {"position": [100, 900]}}),
+    ];
+    if bar {
+        layers.push(json!({"id": "bar", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 20, "height": 300}, "transform": {"position": [600, 400], "rotation_x": 90}, "body": {"type": "fixed"}}));
+    }
+    project(json!({"id": "s1", "simulation": {"joints": [{"id": "rope", "type": "rope", "a": "ball", "anchor_b": [600, 200, 0], "length": 400, "draw": "cord", "links": links}]}, "layers": layers}), 4.0)
+}
+
+#[test]
+fn a_rope_of_links_swings_and_lies_on_what_it_meets() {
+    use lahza_motion_core::compile::Content;
+    let tie = [600.0, 200.0, 0.0];
+    let far = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    // What a take was: the rope's length joint to joint at its longest,
+    // how deep a link's middle got into the bar, and the ball's path.
+    let take = |links: u32, bar: bool, mass: f64| {
+        let mut p = roped(links, bar, mass);
+        let bake = baked(&mut p);
+        let n = bake.tracks[0].samples.len();
+        let pt = |id: &str, k: usize| {
+            let s = at(&bake, id, k);
+            [s[0] as f64, s[1] as f64, s[2] as f64]
+        };
+        let (mut longest, mut inside) = (0.0f64, f64::MIN);
+        for k in 0..n {
+            // (Link 0 is at the ball; a link's middle to the next's is a
+            // link's length when the joint between them holds.)
+            let mut long = 25.0;
+            let mut prev = pt("ball", k);
+            for l in 0..links {
+                let c = pt(&format!("rope/{l}"), k);
+                if l > 0 {
+                    long += far(prev, c);
+                }
+                prev = c;
+                inside = inside.max(24.0 - (c[0] - 600.0).hypot(c[1] - 400.0));
+            }
+            longest = longest.max(long);
+            assert!(far(pt("ball", k), tie) < 401.0, "the rope let the ball {:.1} px from its tie", far(pt("ball", k), tie));
+        }
+        let ball: Vec<[f64; 3]> = (0..n).map(|k| pt("ball", k)).collect();
+        (p, bake, longest, inside, ball)
+    };
+    // Nothing in its way: it swings through to the other side, and the
+    // links stay end to end (the rope is 400 px; 16 links of 25).
+    let (p, bake, longest, _, ball) = take(16, false, 5.0);
+    assert!(ball.iter().any(|b| b[0] < 300.0), "it swings to the left of its tie");
+    assert!(longest < 404.0, "its links came apart: {longest:.1} px joint to joint");
+    // It is drawn link by link, from the ball to the tie, each piece
+    // beginning where the last ended.
+    let c = Compiled::new(&p);
+    for t in [0.0, 0.5, 1.3] {
+        let frame = c.frame(t);
+        let pieces: Vec<([f64; 3], [f64; 3])> = frame.layers.iter().filter(|l| l.id.starts_with("cord")).map(|l| {
+            let Content::Mesh(m) = &l.content else { panic!() };
+            let w = m.world.0;
+            ([w[3], w[7], w[11]], [w[1] * 25.0, w[5] * 25.0, w[9] * 25.0])
+        }).collect();
+        assert_eq!(pieces.len(), 16);
+        let m = bake.world(bake.track("ball").unwrap(), t).unwrap().0;
+        let (begin, end): ([f64; 3], [f64; 3]) = (std::array::from_fn(|k| pieces[0].0[k] - pieces[0].1[k]), std::array::from_fn(|k| pieces[15].0[k] + pieces[15].1[k]));
+        assert!(far(begin, [m[3], m[7], m[11]]) < 1e-6 && far(end, tie) < 1e-6, "at {t}: from {begin:?} to {end:?}");
+        for w in pieces.windows(2) {
+            let (end, begin): ([f64; 3], [f64; 3]) = (std::array::from_fn(|k| w[0].0[k] + w[0].1[k]), std::array::from_fn(|k| w[1].0[k] - w[1].1[k]));
+            assert!(far(end, begin) < 1e-6);
+        }
+        // A link's piece lies on its link (the middle link, mid-swing).
+        let link = bake.world(bake.track("rope/8").unwrap(), t).unwrap().0;
+        assert!(far(pieces[8].0, [link[3], link[7], link[11]]) < 2.0, "at {t}");
+    }
+    // A bar across its swing, 200 px under the tie: the rope lies on it
+    // and the ball is wound round it, where the drawn curve (no links)
+    // swings on through.
+    let (_, wound, longest, inside, ball) = take(16, true, 5.0);
+    assert!(inside < 1.0, "a link is {inside:.1} px inside the bar");
+    assert!(longest < 404.0, "{longest:.1}");
+    let end = ball[ball.len() - 1];
+    assert!(far(end, [600.0, 400.0, 0.0]) < 120.0 && ball[45..].iter().all(|b| b[0] > 450.0), "the ball ends at {end:?}");
+    let through = baked(&mut roped(0, true, 5.0));
+    assert!(through.tracks.len() == 1 && through.tracks[0].samples.iter().any(|s| s[0] < 300.0));
+    // A heavier ball presses the rope into the bar: 50 kg by 2 px, 500 kg
+    // by 12 (a link is light beside it, and the solver's passes are few).
+    let (_, _, _, inside, _) = take(16, true, 50.0);
+    assert!(inside < 4.0, "{inside:.1}");
+    // Only ropes have links.
+    let mut spring = serde_json::to_value(&roped(4, false, 5.0).scenes[0]).unwrap();
+    spring["simulation"]["joints"][0]["type"] = json!("spring");
+    assert!(Compiled::new(&project(spring, 1.0)).sim_input(0, None).1.join("\n").contains("joints.0.links: only a rope is made of links"));
+    assert_eq!(crate::behaviour_tests::pin(&wound), (61580, 11416658259355396517), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn copies_two_instancers_deep_are_bodies_and_three_are_refused() {
+    use lahza_motion_core::compile::Content;
+    // Two stacks of three bricks: an instancer of bricks in an instancer.
+    let scene = |deep: bool| {
+        let stack = json!({"id": "stack", "kind": "instancer", "layout": {"type": "grid", "columns": 1, "rows": 3, "spacing": [0, 60]},
+            "layers": [{"id": "brick", "kind": "mesh", "mesh": {"type": "box", "size": [80, 40], "depth": 40}, "body": {}}]});
+        let stacks = json!({"id": "stacks", "kind": "instancer", "transform": {"position": [600, 300], "rotation": 8}, "layout": {"type": "grid", "columns": 2, "rows": 1, "spacing": [200, 0]}, "layers": [stack]});
+        let top = if deep { json!({"id": "more", "kind": "instancer", "layout": {"type": "grid", "columns": 2, "rows": 1, "spacing": [600, 0]}, "layers": [stacks]}) } else { stacks };
+        json!({"id": "s1", "simulation": {"ground": {"y": 800}}, "layers": [top]})
+    };
+    let mut p = project(scene(false), 3.0);
+    let bake = baked(&mut p);
+    let ids: Vec<&str> = bake.tracks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["brick#0#0", "brick#0#1", "brick#0#2", "brick#1#0", "brick#1#1", "brick#1#2"]);
+    let place = |id: &str, k: usize| {
+        let s = bake.tracks[bake.track(id).unwrap()].samples[k];
+        [s[0] as f64, s[1] as f64, s[2] as f64]
+    };
+    let apart = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    // They start where the two grids have them, and fall as six bodies.
+    assert!((apart(place("brick#0#0", 0), place("brick#1#0", 0)) - 200.0).abs() < 1e-3 && (apart(place("brick#0#0", 0), place("brick#0#2", 0)) - 120.0).abs() < 1e-3);
+    let last = bake.tracks[0].samples.len() - 1;
+    for id in &ids {
+        let end = place(id, last);
+        assert!(end[1] > 690.0 && end[1] < 781.0, "{id} ended at {end:?}");
+        for other in ids.iter().filter(|o| *o != id) {
+            assert!(apart(end, place(other, last)) > 39.0, "{id} and {other}");
+        }
+    }
+    // Drawn: each copy where the bake has its body.
+    let c = Compiled::new(&p);
+    for t in [0.0, 0.6, 2.5] {
+        let frame = c.frame(t);
+        let drawn: Vec<[f64; 3]> = frame.layers.iter().filter(|l| &*l.id == "brick").map(|l| match &l.content {
+            Content::Mesh(m) => [m.world.0[3], m.world.0[7], m.world.0[11]],
+            _ => panic!(),
+        }).collect();
+        assert_eq!(drawn.len(), 6);
+        for id in &ids {
+            let w = bake.world(bake.track(id).unwrap(), t).unwrap().0;
+            assert!(drawn.iter().any(|d| apart(*d, [w[3], w[7], w[11]]) < 1e-6), "at {t}: {id} is not drawn at {:?}", [w[3], w[7], w[11]]);
+        }
+    }
+    assert_eq!(crate::behaviour_tests::pin(&bake), (16679, 7626806709829618763), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    // Three deep is refused, and why.
+    let e = Compiled::new(&project(scene(true), 1.0)).sim_input(0, None).1.join("\n");
+    assert!(e.contains("brick.body: a layer three instancers deep"), "{e}");
+}
+
+#[test]
+fn an_emitters_particles_are_bodies_while_they_live() {
+    use lahza_motion_core::compile::Content;
+    // Four pebbles a second thrown up and to the right from (400, 600),
+    // each living 1.5 s; a floor 100 px under the emitter.
+    let scene = json!({"id": "s1", "simulation": {"ground": {"y": 700}}, "layers": [
+        {"id": "spout", "kind": "instancer", "transform": {"position": [400, 600]},
+         "layout": {"type": "emitter", "rate": 4, "lifetime": 1.5, "lifetime_jitter": 0, "direction": 45, "spread": 0, "speed": 400, "speed_jitter": 0, "gravity": [0, 981], "seed": 7},
+         "layers": [{"id": "pebble", "kind": "mesh", "mesh": {"type": "sphere", "radius": 12}, "body": {"bounce": 0.3}}]}
+    ]});
+    let mut p = project(scene, 4.0);
+    let (input, errors) = Compiled::new(&p).sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    // A body a slot (six: a life and a half of births), each with the
+    // lives of the particles the slot holds in turn.
+    let slots = input.bodies.len();
+    assert!(slots >= 6 && input.bodies.iter().all(|b| b.id.starts_with("pebble#") && b.release == u32::MAX), "{:?}", input.bodies.iter().map(|b| &b.id).collect::<Vec<_>>());
+    let lives: Vec<(u32, u32)> = input.bodies[0].lives.iter().map(|l| (l.from, l.to)).collect();
+    // (Slot 0: born at 0 s, and again every `slots` quarters of a second.)
+    assert_eq!(lives[0], (0, 45), "{lives:?}");
+    assert!(lives.len() >= 2 && lives[1].0 as usize == slots * 30 / 4 + usize::from(slots * 30 % 4 != 0), "{lives:?} of {slots} slots");
+    let bake = baked(&mut p);
+    let tr = &bake.tracks[bake.track("pebble#1").unwrap()];
+    assert_eq!(tr.from, 8, "slot 1's first is born at 0.25 s: the first sample after is 8");
+    let at = |k: usize| [tr.samples[k][0] as f64, tr.samples[k][1] as f64];
+    // It leaves as the emitter throws it (283 px/s each way), comes down
+    // on the floor instead of falling through it as a particle does, and
+    // bounces on.
+    let (a, b) = (at(8), at(11));
+    assert!(((b[0] - a[0]) / 0.1 - 283.0).abs() < 15.0 && b[1] < a[1], "it leaves at {:?} px/s", [(b[0] - a[0]) / 0.1, (b[1] - a[1]) / 0.1]);
+    let lowest = (8..8 + 45).map(|k| at(k)[1]).fold(0.0, f64::max);
+    assert!(lowest > 680.0 && lowest < 689.5, "its lowest is y {lowest:.1} (the floor is at 700, less its radius)");
+    assert!(bake.events.iter().any(|e| e.kind == "touch" && e.a == "pebble#1" && e.b == "ground"), "{:?}", bake.events);
+    // Drawn: while it lives, where the bake has it; not after.
+    let c = Compiled::new(&p);
+    let drawn = |t: f64| -> Vec<[f64; 2]> {
+        c.frame(t).layers.iter().filter(|l| &*l.id == "pebble").map(|l| match &l.content {
+            Content::Mesh(m) => [m.world.0[3], m.world.0[7]],
+            _ => panic!(),
+        }).collect()
+    };
+    let near = |ps: &[[f64; 2]], q: [f64; 2]| ps.iter().any(|p| (p[0] - q[0]).hypot(p[1] - q[1]) < 1e-3);
+    assert!(near(&drawn(1.0), at(30)) && near(&drawn(1.5), at(45)), "{:?} vs {:?}", drawn(1.0), at(30));
+    assert_eq!(drawn(0.1).len(), 1);
+    assert_eq!(drawn(0.9).len(), 4);
+    // Between its birth and the first sample after, it is where the
+    // emitter has it (the bake does not stand for it yet).
+    let early = drawn(0.26);
+    assert!(early.iter().any(|p| (p[0] - 402.83).abs() < 0.5), "{early:?}");
+    // A particle is a body the simulation moves.
+    let mut fixed = serde_json::to_value(&p.scenes[0]).unwrap();
+    fixed["layers"][0]["layers"][0]["body"]["type"] = json!("fixed");
+    assert!(Compiled::new(&project(fixed, 1.0)).sim_input(0, None).1.join("\n").contains("an emitter's particle is a body the simulation moves"));
+    assert_eq!(crate::behaviour_tests::pin(&bake), (23075, 9110451255763848001), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+/// How far a box dropped flat tips after it lands, by the solver's
+/// settings: `cargo test --release -p lahza-motion-sim flat_landing -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_a_flat_landing_by_solver_settings() {
+    use rapier3d::prelude::*;
+    type Set = Box<dyn Fn(&mut PhysicsWorld)>;
+    let p = project(json!({"id": "s1", "simulation": {"ground": {"y": 900}}, "layers": [boxed("b", 960.0, 200.0, json!({}))]}), 3.0);
+    let (input, _) = Compiled::new(&p).sim_input(0, None);
+    let colliders = |w: &mut PhysicsWorld, f: &dyn Fn(&mut Collider)| {
+        let hs: Vec<ColliderHandle> = w.colliders.iter().map(|(h, _)| h).collect();
+        for h in hs {
+            f(&mut w.colliders[h]);
+        }
+    };
+    let cases: Vec<(&str, Set)> = vec![
+        ("as it is", Box::new(|_| {})),
+        ("16 solver passes", Box::new(|w| w.integration_parameters.num_solver_iterations = 16)),
+        ("4 inner PGS passes", Box::new(|w| w.integration_parameters.num_internal_pgs_iterations = 4)),
+        ("4 inner stabilization passes", Box::new(|w| w.integration_parameters.num_internal_stabilization_iterations = 4)),
+        ("16 passes, 4 PGS, 4 stabilization", Box::new(|w| { w.integration_parameters.num_solver_iterations = 16; w.integration_parameters.num_internal_pgs_iterations = 4; w.integration_parameters.num_internal_stabilization_iterations = 4; })),
+        ("no warm start", Box::new(|w| w.integration_parameters.warmstart_coefficient = 0.0)),
+        ("no contact clustering", Box::new(|w| w.integration_parameters.contact_clustering = false)),
+        ("no contact recycling", Box::new(|w| w.integration_parameters.contact_recycling = false)),
+        ("no clustering, no recycling", Box::new(|w| { w.integration_parameters.contact_clustering = false; w.integration_parameters.contact_recycling = false; })),
+        ("friction in the bias pass", Box::new(|w| w.integration_parameters.friction_in_bias_pass = true)),
+        ("Coulomb friction", Box::new(|w| w.integration_parameters.friction_model = FrictionModel::Coulomb)),
+        ("softer contacts (10 Hz)", Box::new(|w| { w.integration_parameters.contact_softness.natural_frequency = 10.0; w.integration_parameters.static_contact_softness.natural_frequency = 10.0; })),
+        ("stiffer contacts (120 Hz)", Box::new(|w| { w.integration_parameters.contact_softness.natural_frequency = 120.0; w.integration_parameters.static_contact_softness.natural_frequency = 120.0; })),
+        ("more damped contacts (ratio 20)", Box::new(|w| { w.integration_parameters.contact_softness.damping_ratio = 20.0; w.integration_parameters.static_contact_softness.damping_ratio = 20.0; })),
+        ("no prediction distance", Box::new(|w| w.integration_parameters.normalized_prediction_distance = 0.0)),
+        ("prediction distance 0.2", Box::new(|w| w.integration_parameters.normalized_prediction_distance = 0.2)),
+        ("a contact skin of 1 cm", Box::new(move |w| colliders(w, &|c| c.set_contact_skin(0.01)))),
+        ("no bounce", Box::new(move |w| colliders(w, &|c| c.set_restitution(0.0)))),
+        ("no friction", Box::new(move |w| colliders(w, &|c| c.set_friction(0.0)))),
+        ("the floor a box, not a half-space", Box::new(|w| {
+            let hs: Vec<ColliderHandle> = w.colliders.iter().filter(|(_, c)| c.shape().as_halfspace().is_some()).map(|(h, _)| h).collect();
+            for h in hs {
+                let c = &mut w.colliders[h];
+                c.set_shape(SharedShape::cuboid(50.0, 1.0, 50.0));
+                c.set_position_wrt_parent(rapier3d::math::Pose::from_translation(Vector::new(0.0, 1.0, 0.0)));
+            }
+        })),
+        ("960 steps a second", Box::new(|w| w.integration_parameters.dt = 1.0 / 960.0)),
+    ];
+    for (name, set) in cases {
+        let mut take = Take::new(&input, &mut core_meshes).unwrap();
+        set(&mut take.world.w);
+        let per = (1.0 / (input.rate * take.world.w.integration_parameters.dt as f64)).round() as u64;
+        let (mut tilt, mut landed, mut end) = (0.0f64, false, [0.0; 3]);
+        for k in 0..input.samples {
+            for s in 0..per {
+                // (Its own count of steps a frame, for the finer step.)
+                let t = input.start + (k as f64 + s as f64 / per as f64) / input.rate;
+                take.world.step(&input, t);
+            }
+            let pose = take.world.pose(0);
+            landed |= pose.p[1] > 845.0;
+            if landed {
+                tilt = tilt.max(2.0 * pose.q[3].abs().min(1.0).acos().to_degrees());
+            }
+            end = pose.p;
+        }
+        eprintln!("{name:36} tips {tilt:5.2}°, ends {:6.1} px to the side, at y {:.1}", (end[0] - 960.0).hypot(end[2]), end[1]);
+    }
 }

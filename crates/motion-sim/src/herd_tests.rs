@@ -4,6 +4,7 @@ use crate::crowd_tests::{agent, at, crowd_scene, floor, level};
 use crate::tests::{baked, project};
 use lahza_motion_core::compile::Content;
 use lahza_motion_core::sim::Bake;
+use lahza_motion_core::space::Mat4;
 use lahza_motion_core::{Compiled, LayerState, Project};
 use serde_json::{json, Value};
 
@@ -100,6 +101,31 @@ fn instances_of_one_character_walk_as_its_copies_did() {
     }
     // The cards are the farther ones.
     let depth = |l: &LayerState| l.view.unwrap().apply(0.0, 0.0, 0.0)[2];
+    // None changes from the character to its picture in a frame: within
+    // the last tenth of `near` an agent is the character coming in over
+    // its picture (both drawn, the character part see-through, more of
+    // it the nearer); nearer than that it is all there, and past `near`
+    // none of it. (The six are within a twentieth of each other's depth.)
+    {
+        let far = cards.iter().map(|c| depth(c)).fold(f64::INFINITY, f64::min);
+        let drawn = |near: f64| {
+            let mut q = p.clone();
+            let crowd = &mut q.scenes[0].simulation.as_mut().unwrap().crowds[0];
+            (crowd.full, crowd.near) = (6, Some(near));
+            let frame = Compiled::new(&q).frame(1.0);
+            let (mut marks, mut cards) = (Vec::new(), Vec::new());
+            states(&frame.layers, "a0-mark", &mut marks);
+            states(&frame.layers, "a0", &mut cards);
+            assert!(cards.iter().all(|c| c.opacity == 1.0));
+            let mut by_depth: Vec<(f64, f64)> = marks.iter().map(|m| (depth(m), m.opacity)).collect();
+            by_depth.sort_by(|a, b| a.0.total_cmp(&b.0));
+            (by_depth.iter().map(|m| m.1).collect::<Vec<f64>>(), cards.len())
+        };
+        let (coming, under) = drawn(far * 1.04);
+        assert!(coming.len() == 6 && under == 6 && coming.iter().all(|o| *o > 0.0 && *o < 1.0), "{coming:?} over {under} pictures");
+        assert_eq!(drawn(far * 2.0), (vec![1.0; 6], 0));
+        assert_eq!(drawn(far * 0.5), (vec![], 6));
+    }
     let nearest_card = cards.iter().map(|c| depth(c)).fold(f64::INFINITY, f64::min);
     assert!(marks.iter().all(|m| depth(m) < nearest_card + 250.0));
     // The same frame asked for twice names the same pictures.
@@ -109,7 +135,7 @@ fn instances_of_one_character_walk_as_its_copies_did() {
 #[test]
 fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
     let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
-    let mut p = herd_scene(vec![ball.clone()], json!({"ragdoll": {"mass": 60, "max": 2}}), 1, 12.0);
+    let mut p = herd_scene(vec![ball.clone()], json!({"ragdoll": {"mass": 60, "max": 2, "limits": [{"bone": ""}]}}), 1, 12.0);
     let bake = baked(&mut p);
     let knocks: Vec<_> = bake.events.iter().filter(|e| e.kind == "knock").collect();
     assert_eq!(knocks.len(), 1, "{knocks:?}");
@@ -177,6 +203,9 @@ fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
 /// character's left leg swung in its clip: 30° forward and back a cycle.
 fn struck(ragdoll: Value) -> std::sync::Arc<Bake> {
     let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
+    // (As pinned: every joint 40° and 20°, not a human's by its name.)
+    let mut ragdoll = ragdoll;
+    ragdoll["limits"] = json!([{"bone": ""}]);
     let mut p = herd_scene(vec![ball], json!({"ragdoll": ragdoll, "dodge": 0}), 1, 6.0);
     let mut scene = serde_json::to_value(&p.scenes[0]).unwrap();
     let leg = scene["layers"][1]["layers"][0]["layers"].as_array_mut().unwrap().iter_mut().find(|l| l["id"] == "a0-leg_l").unwrap();
@@ -259,4 +288,138 @@ fn a_try_ahead_has_the_agents_walk_on() {
         // The take itself is not moved by that: its agents are the crowd's to move.
         assert!(level(place(&take, i), before[i]) < 1e-9);
     }
+}
+
+#[test]
+fn an_agent_raises_its_guard_at_what_is_coming_and_is_drawn_in_it() {
+    // The character with an arm on its spine; at 3.5 s (after its walk's
+    // cycle) its spine is keyed a quarter round: that is its guard's pose. A
+    // ball is thrown along the row's line at instance 3 from 900 px off.
+    let scene = |crowd: Value| {
+        let mut a = agent(0, 300.0, 0.0);
+        let spine = &mut a["layers"][0]["layers"][0];
+        spine["transform"]["rotation"] = json!({"keys": [{"at": 2, "v": 0}, {"at": 3.5, "v": 90, "ease": "linear"}]});
+        spine["layers"].as_array_mut().unwrap().push(json!({"id": "a0-arm", "kind": "mesh", "mesh": {"type": "box", "size": [10, 60], "depth": 10}, "transform": {"position": [0, -30]}}));
+        let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [540, 720], "z": -900}, "body": {"mass": 30, "velocity": [0, -120, 1500]}});
+        let mut c = json!({"id": "walkers", "character": "a0", "starts": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(),
+            "goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(), "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0});
+        for (k, v) in crowd.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        project(json!({"id": "s1", "simulation": {"crowds": [c]}, "layers": [floor(), a, ball]}), 4.0)
+    };
+    let guard = json!({"guard": {"pose": 3.5, "ahead": 1.0, "bones": ["a0-spine"]}});
+    let mut p = scene(guard.clone());
+    let bake = baked(&mut p);
+    let h = &bake.herds[0];
+    assert_eq!(h.guard.len(), h.samples.len());
+    let up = |k: usize, sample: usize| h.guard[sample * 6 + k];
+    // The one it is thrown at sees it from the start (0.6 s off, within
+    // the second its guard looks ahead): its guard is up in a sixth of a
+    // second, held while it comes and half a second after, then down.
+    assert!(up(3, 0) == 0.0 && up(3, 6) > 0.99 && up(3, 30) > 0.99, "{:?}", (0..40).map(|s| up(3, s)).collect::<Vec<_>>());
+    let last = h.len() - 1;
+    assert!(up(3, last) == 0.0 && (0..=last).any(|s| up(3, s) > 0.2 && up(3, s) < 0.8 && s > 30));
+    // Those the ball is not coming at keep theirs down.
+    assert!((0..=last).all(|s| up(0, s) == 0.0 && up(5, s) == 0.0));
+    // It walks as it does without a guard (its steps aside are the same),
+    // and the bake comes back from its bytes.
+    let plain = baked(&mut scene(json!({})));
+    assert!(plain.herds[0].samples == h.samples && plain.herds[0].guard.is_empty() && plain.hash != bake.hash);
+    assert_eq!(Bake::from_bytes(&bake.to_bytes()).unwrap(), *bake);
+    // Drawn: its arm stands up as it walks, lies a quarter round with
+    // the guard up, and is between the two on the way; the others' and
+    // what is not under the spine (the marker) are as they walk.
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let arms = |t: f64| -> Vec<Mat4> {
+        let frame = c.frame(t);
+        let mut found = Vec::new();
+        states(&frame.layers, "a0-arm", &mut found);
+        found.iter().map(|l| match &l.content {
+            Content::Mesh(m) => m.world,
+            _ => panic!(),
+        }).collect()
+    };
+    // (The arm's own up, y, in the scene, a column of its world: how
+    // much of it is level, whichever way the agent has turned, and how
+    // much upright.)
+    let lean = |m: &Mat4| (m.0[1].hypot(m.0[9]), m.0[5]);
+    let (before, during) = (arms(0.0), arms(1.0));
+    assert_eq!((before.len(), during.len()), (6, 6));
+    assert!(before.iter().all(|m| lean(m).0.abs() < 1e-9 && (lean(m).1 - 1.0).abs() < 1e-9), "{:?}", before.iter().map(lean).collect::<Vec<_>>());
+    let turned: Vec<&Mat4> = during.iter().filter(|m| lean(m).1.abs() < 1e-6 && (lean(m).0.abs() - 1.0).abs() < 1e-6).collect();
+    assert_eq!(turned.len(), 1, "one arm a quarter round at 1 s: {:?}", during.iter().map(lean).collect::<Vec<_>>());
+    let rising = arms(2.0 / 30.0);
+    assert!(rising.iter().any(|m| lean(m).0.abs() > 0.2 && lean(m).0.abs() < 0.9), "{:?}", rising.iter().map(lean).collect::<Vec<_>>());
+    let mut marks = Vec::new();
+    let (walk, kept) = (Compiled::new(&{ let mut q = scene(json!({})); baked(&mut q); q }).frame(1.0), c.frame(1.0));
+    states(&walk.layers, "a0-mark", &mut marks);
+    let mut guarded_marks = Vec::new();
+    states(&kept.layers, "a0-mark", &mut guarded_marks);
+    assert!(marks.len() == 6 && marks.iter().zip(&guarded_marks).all(|(a, b)| a.matrix == b.matrix));
+    // The pose is a moment of the scene.
+    let e = Compiled::new(&scene(json!({"guard": {"pose": 50.0}}))).sim_input(0, None).1.join("\n");
+    assert!(e.contains("crowds.0.guard.pose: 50 s is outside the scene"), "{e}");
+    // A crowd of layers has no guard, and says why.
+    let mut layered = crowd_scene(vec![], guard, 1, 1.0);
+    let e = Compiled::new(&layered).sim_input(0, None).1.join("\n");
+    assert!(e.contains("crowds.0.guard: only a crowd of instances"), "{e}");
+    layered.bakes.clear();
+    assert_eq!(crate::behaviour_tests::pin(&bake), (18476, 11403343376360516901), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn a_light_that_moves_makes_new_pictures_a_step_not_a_frame() {
+    // Six instances standing where they are, all as pictures, under a
+    // sun that drifts some eight degrees and brightens by a tenth in a
+    // second (and one that swings a quarter round and half as bright
+    // again in that second).
+    let scene = |lights: Value| {
+        let mut c = json!({"id": "walkers", "character": "a0", "starts": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(),
+            "goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>(), "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0, "full": 0});
+        c["dodge"] = json!(0);
+        project(json!({"id": "s1", "lights": lights, "simulation": {"crowds": [c]}, "layers": [floor(), agent(0, 300.0, 0.0)]}), 1.0)
+    };
+    // How many makings the frames of the second ask for: a picture is
+    // made anew when its key is not the one it was last made with.
+    let makings = |p: &mut Project| {
+        baked(p);
+        let c = Compiled::new(p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let mut held: std::collections::HashMap<std::sync::Arc<str>, u64> = Default::default();
+        let (mut made, mut shown) = (0, 0);
+        for k in 0..30 {
+            for picture in &c.frame(k as f64 / 30.0).pictures {
+                shown += 1;
+                if held.insert(picture.name.clone(), picture.key) != Some(picture.key) {
+                    made += 1;
+                }
+            }
+        }
+        (made, shown)
+    };
+    let still = json!([{"from": [-0.5, -1.0, -0.8], "intensity": 1.2}, {"type": "ambient", "intensity": 0.3}]);
+    let sun = |to: [f64; 3], brighter: f64| json!([{"from": {"keys": [{"at": 0, "v": [-0.5, -1.0, -0.8]}, {"at": 1, "v": to, "ease": "linear"}]}, "intensity": {"keys": [{"at": 0, "v": 1.0}, {"at": 1, "v": brighter, "ease": "linear"}]}}, {"type": "ambient", "intensity": 0.3}]);
+    let moving = sun([-0.3, -1.0, -0.8], 1.1);
+    let (once, shown) = makings(&mut scene(still));
+    let (stepped, shown_moving) = makings(&mut scene(moving.clone()));
+    let (fast, _) = makings(&mut scene(sun([0.8, -1.0, -0.5], 1.5)));
+    eprintln!("{once} makings of {shown} showings under a still light; {stepped} of {shown_moving} under one that drifts; {fast} under one that swings");
+    // Still: each picture made once (they stand: one moment each).
+    assert!(once <= 6 && shown >= 30);
+    // Drifting: before, every showing was a making (its lights were part
+    // of its key to the last bit). Now one a step of the light: its
+    // eight degrees are two or three steps, its tenth brighter two.
+    assert!(stepped <= shown_moving / 4 && stepped > once, "{stepped} makings of {shown_moving} showings");
+    // (A light that swings a quarter round in a second takes a step
+    // nearly every frame: that one is still a making a frame.)
+    assert!(fast > shown_moving / 2);
+    // A picture is what its key says: the same frame asked for first or
+    // last carries the same pictures.
+    let mut p = scene(moving);
+    baked(&mut p);
+    let (a, b) = (Compiled::new(&p), Compiled::new(&p));
+    b.frame(0.2);
+    assert_eq!(a.frame(0.7).pictures, b.frame(0.7).pictures);
 }

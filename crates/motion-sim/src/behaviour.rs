@@ -138,6 +138,9 @@ pub struct Drive {
     /// Per bone: placed by a behaviour this step (an arm aimed, a body
     /// getting up): it passes through the rest of its body.
     pub pass: Vec<bool>,
+    /// Per bone: the one bone it passes through this step, plus one (0:
+    /// none).
+    pub slip: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -167,7 +170,39 @@ pub struct Brain {
     /// Per behaviour: the arm it took, kept while it uses one (the
     /// nearer shoulder changes as the body sways).
     taken: Vec<Option<usize>>,
+    /// Per bone: its capsule in its own frame (its ends, its radius), for
+    /// the bones that are capsules.
+    caps: Vec<Option<(V, V, f64)>>,
+    /// This take's turn of mind (`simulation.vary`, by the seed): seconds
+    /// before an arm answers, and what its steps' length, its readiness
+    /// to step and its balance's gain are times.
+    quirk: Quirk,
     pub events: Vec<SimEvent>,
+}
+
+#[derive(Clone, Copy)]
+struct Quirk {
+    late: f64,
+    stride: f64,
+    ready: f64,
+    gain: f64,
+}
+
+/// The nearest points of segments `p1 q1` and `p2 q2`: how far along
+/// each (0..1), and how far apart.
+fn nearest(p1: V, q1: V, p2: V, q2: V) -> (f64, f64, f64) {
+    let (d1, d2, r) = (sub(q1, p1), sub(q2, p2), sub(p1, p2));
+    let (a, e, f) = (dot(d1, d1), dot(d2, d2), dot(d2, r));
+    let (b, c) = (dot(d1, d2), dot(d1, r));
+    let denom = a * e - b * b;
+    let mut s = if denom > 1e-12 { ((b * f - c * e) / denom).clamp(0.0, 1.0) } else { 0.0 };
+    let mut t = if e > 1e-12 { (b * s + f) / e } else { 0.0 };
+    if t < 0.0 {
+        (t, s) = (0.0, if a > 1e-12 { (-c / a).clamp(0.0, 1.0) } else { 0.0 });
+    } else if t > 1.0 {
+        (t, s) = (1.0, if a > 1e-12 { ((b - c) / a).clamp(0.0, 1.0) } else { 0.0 });
+    }
+    (s, t, len(sub(add(p1, mul(d1, s)), add(p2, mul(d2, t)))))
 }
 
 /// Seconds a behaviour's target takes to reach what is asked.
@@ -178,16 +213,35 @@ impl Brain {
         let name = |b: usize| input.bodies[r.bones[b].body].id.to_lowercase();
         let has = |b: usize, part: &str| name(b).rsplit(['-', '/']).next().is_some_and(|n| n.contains(part));
         let leaf = |b: usize| !r.bones.iter().any(|x| x.parent == Some(b));
-        let feet: Vec<usize> = (0..r.bones.len()).filter(|&b| has(b, "foot") || has(b, "toe") && leaf(b)).collect();
+        // Its feet, hands and head: as the document names them, else by
+        // the bones' names.
+        let feet: Vec<usize> = r.feet.clone().unwrap_or_else(|| (0..r.bones.len()).filter(|&b| has(b, "foot") || has(b, "toe") && leaf(b)).collect());
+        let hands: Vec<(usize, bool)> = r.hands.clone().unwrap_or_else(|| {
+            (0..r.bones.len()).filter(|&b| has(b, "hand")).map(|hand| {
+                let n = name(hand);
+                (hand, n.ends_with("_l") || n.ends_with(".l") || n.contains("left"))
+            }).collect()
+        });
         let mut arms = Vec::new();
-        for hand in (0..r.bones.len()).filter(|&b| has(b, "hand")) {
+        for (hand, left) in hands {
             let Some(fore) = r.bones[hand].parent else { continue };
             let Some(upper) = r.bones[fore].parent else { continue };
-            let n = name(hand);
-            let left = n.ends_with("_l") || n.ends_with(".l") || n.contains("left");
             arms.push(Arm { hand, fore, upper, left });
         }
-        Brain { feet, arms, head: (0..r.bones.len()).find(|&b| has(b, "head")), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
+        let caps = r.bones.iter().map(|b| match input.bodies[b.body].colliders.first() {
+            Some(lahza_motion_core::sim::ColliderInput { shape: lahza_motion_core::sim::ShapeInput::Capsule { radius, half }, local }) => {
+                let m = local.0;
+                let end = |s: f64| [m[3] + m[1] * half * s, m[7] + m[5] * half * s, m[11] + m[9] * half * s];
+                Some((end(-1.0), end(1.0), *radius))
+            }
+            _ => None,
+        }).collect();
+        // (Drawn once a ragdoll a take, whether used or not.)
+        let which = input.ragdolls.iter().position(|x| std::ptr::eq(x, r)).unwrap_or(0) as u64;
+        let mut rng = crate::world::Rng(input.seed ^ (which + 1).wrapping_mul(0x8cb92ba72f3d8dd7) ^ 0x7175_6972_6b);
+        let v = input.vary.clamp(0.0, 1.0);
+        let quirk = Quirk { late: v * (rng.signed() + 1.0) / 12.0, stride: 1.0 + v * 0.25 * rng.signed(), ready: 1.0 + v * 0.25 * rng.signed(), gain: 1.0 + v * 0.15 * rng.signed() };
+        Brain { quirk, caps, feet, arms, head: r.head.or_else(|| (0..r.bones.len()).find(|&b| has(b, "head"))), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
     }
 
     /// A bone's joint targets that point arm `arm` at `target` (px): the
@@ -213,6 +267,98 @@ impl Brain {
         Some((quat_mul(conj(chest.q), upper), quat_mul(f.bind, turn(hinge, flex.min(f.swing.to_radians())))))
     }
 
+    /// Where arm `arm`'s hand should make for now, to get to `target`
+    /// round its own trunk and head, not through them. `target` is first
+    /// brought out to the surface of what it lies in (a hand goes onto a
+    /// chest). Then, while the straight way from the hand to it passes
+    /// through the trunk (its bones' capsules, as wide again as the
+    /// forearm is thick), the hand makes for a point beside the trunk
+    /// where that way is deepest in it, on the side the way already
+    /// leans to and toward the body's front; and what it makes for is
+    /// moved out until the forearm, from the elbow, clears the trunk too.
+    /// Worked out anew each step from where the hand is, so it goes
+    /// round as far as it must.
+    fn route(&self, world: &World, r: &RagdollInput, arm: &Arm, target: V) -> V {
+        // (The trunk: what the arm hangs from, down to the root, and the head.)
+        let mut trunk: Vec<usize> = Vec::new();
+        let mut cur = r.bones[arm.upper].parent;
+        while let Some(b) = cur {
+            trunk.push(b);
+            cur = r.bones[b].parent;
+        }
+        trunk.extend(self.head.filter(|h| !trunk.contains(h)));
+        let thick = self.caps[arm.fore].map_or(8.0, |c| c.2);
+        let shoulder = world.pose(r.bones[arm.upper].body).p;
+        // (The body's front: the way it stood facing, as its root is now turned.)
+        let front = self.stood.map(|s| quat_rotate(world.pose(r.bones[0].body).q, s.front));
+        trunk.retain(|&b| self.caps[b].is_some());
+        let caps: Vec<(V, V, f64)> = trunk.iter().filter_map(|&b| {
+            let (a, c, radius) = self.caps[b]?;
+            let p = world.pose(r.bones[b].body);
+            Some((p.apply(a), p.apply(c), radius))
+        }).collect();
+        // The way out of a capsule from a point by it: away from its line,
+        // leaning to the front and to the arm's own side.
+        let out = |a: V, b: V, at: V, from: V| -> V {
+            let axis = unit(sub(b, a)).unwrap_or([0.0, 1.0, 0.0]);
+            let across = |v: V| sub(v, mul(axis, dot(v, axis)));
+            let lean = add(mul(front.unwrap_or([0.0; 3]), 0.8), mul(unit(across(sub(shoulder, at))).unwrap_or([0.0; 3]), 0.3));
+            unit(across(add(unit(across(sub(from, at))).unwrap_or([0.0; 3]), lean))).or(front).unwrap_or([0.0, 0.0, -1.0])
+        };
+        let on = |a: V, b: V, t: f64| add(a, mul(sub(b, a), t));
+        let hand = world.pose(r.bones[arm.hand].body).apply(mul(r.bones[arm.hand].along, r.bones[arm.hand].length * 0.5));
+        // A target inside the trunk is on it.
+        let mut target = target;
+        let mut resting: Option<(usize, f64)> = None;
+        for (k, (a, b, radius)) in caps.iter().enumerate() {
+            let (_, t, d) = nearest(target, target, *a, *b);
+            // (The hand's middle is aimed: its tip is half its length on.)
+            let skin = radius + r.bones[arm.hand].length * 0.3 + self.caps[arm.hand].map_or(thick * 0.6, |c| c.2);
+            if d < radius + thick * 0.6 {
+                let at = on(*a, *b, t);
+                target = add(at, mul(out(*a, *b, at, hand), skin));
+                resting = Some((k, skin));
+            }
+        }
+        // The first of the trunk in the straight way.
+        let mut aim = target;
+        let mut first: Option<(f64, V)> = None;
+        for (k, (a, b, radius)) in caps.iter().enumerate() {
+            let wide = radius + thick + 4.0;
+            let (s, t, d) = nearest(hand, target, *a, *b);
+            // (In the way: the way goes through it, deeper than where it
+            // starts and where it ends. A hand by a head, making for a
+            // place by the head, has nothing to go round.)
+            let ends = nearest(hand, hand, *a, *b).2.min(nearest(target, target, *a, *b).2);
+            let _ = (k, resting);
+            if d < wide && d < ends - 3.0 && first.is_none_or(|(before, _)| s < before) {
+                let at = on(*a, *b, t);
+                first = Some((s, add(at, mul(out(*a, *b, at, on(hand, target, s)), wide * 1.15))));
+            }
+        }
+        if let Some((_, beside)) = first {
+            aim = beside;
+        }
+        // The forearm clears the trunk too (but what the target lies on,
+        // and what the arm itself hangs from: a folded arm lies along it).
+        let elbow = world.pose(r.bones[arm.fore].body).p;
+        for _ in 0..2 {
+            for (k, (a, b, radius)) in caps.iter().enumerate() {
+                if resting.is_some_and(|(on_it, _)| on_it == k) && first.is_none() || Some(trunk[k]) == r.bones[arm.upper].parent {
+                    continue;
+                }
+                let wide = radius + thick + 2.0;
+                let (s, t, d) = nearest(elbow, aim, *a, *b);
+                let ends = nearest(elbow, elbow, *a, *b).2.min(nearest(aim, aim, *a, *b).2);
+                if d < wide && d < ends - 3.0 {
+                    let at = on(*a, *b, t);
+                    aim = add(aim, mul(out(*a, *b, at, on(elbow, aim, s)), (wide - d) / s.max(0.3)));
+                }
+            }
+        }
+        aim
+    }
+
     /// The targets and strengths for the step from time `t` that ends at
     /// sample position `x`; pushes the body where a behaviour does.
     ///
@@ -220,7 +366,7 @@ impl Brain {
     /// controller's: a policy's action, a search's choice).
     pub fn think(&mut self, world: &mut World, input: &SimInput, r: &RagdollInput, x: f64, t: f64, turns: Option<&[Option<[f64; 4]>]>) -> Drive {
         let n = r.bones.len();
-        let mut drive = Drive { targets: vec![None; n], scale: vec![1.0; n], pass: vec![false; n] };
+        let mut drive = Drive { targets: vec![None; n], scale: vec![1.0; n], pass: vec![false; n], slip: vec![0; n] };
         if let Some(turns) = turns {
             for (k, turn) in turns.iter().enumerate().take(n) {
                 if let Some(turn) = turn {
@@ -273,7 +419,9 @@ impl Brain {
             .collect();
         let foot_at = |b: usize| places.iter().find(|(f, _)| *f == b).map(|(_, p)| *p).unwrap_or([0.0; 3]);
         let balance = find(BehaviourKind::Balance);
-        if let (Some(up), false, Some(_)) = (unit(mul(input.gravity, -1.0)), self.feet.is_empty(), balance.or(find(BehaviourKind::Step))) {
+        // (With `get_up` alone too: a figure a controller keeps up falls,
+        // lies and rises as one that balances does.)
+        if let (Some(up), false, Some(_)) = (unit(mul(input.gravity, -1.0)), self.feet.is_empty(), balance.or(find(BehaviourKind::Step)).or(find(BehaviourKind::GetUp))) {
             let flat = |v: V| sub(v, mul(up, dot(v, up)));
             let swinging = self.step.as_ref().map(|s| s.foot);
             let standing: Vec<usize> = self.feet.iter().copied().filter(|f| Some(*f) != swinging || self.feet.len() == 1).collect();
@@ -433,7 +581,7 @@ impl Brain {
                 let fall_time = (height.max(1.0) / (g * u).max(1e-9)).sqrt();
                 let error = flat(sub(add(com, mul(vel, fall_time)), support));
                 if let Some((b, amount)) = balance {
-                    let (gain, assist) = (param(b, "gain", 1.0), param(b, "assist", 0.25) * amount);
+                    let (gain, assist) = (param(b, "gain", 1.0) * self.quirk.gain, param(b, "assist", 0.25) * amount);
                     // Lean at the ankles: toes pressed down toward the way it tips.
                     if let Some(way) = unit(error) {
                         let angle = (gain * len(error) / height.max(1.0)).min(0.35) * amount;
@@ -461,13 +609,13 @@ impl Brain {
                     }
                 }
                 if let Some((b, _)) = find(BehaviourKind::Step) {
-                    let trigger = param(b, "trigger", 0.12 * stand);
+                    let trigger = param(b, "trigger", 0.12 * stand) * self.quirk.ready;
                     if self.step.is_none() && t >= self.step_ready && len(error) > trigger && self.feet.len() >= 2 {
                         // The foot behind, to past where it is falling to.
                         if let Some(way) = unit(error) {
                             let foot = *self.feet.iter().min_by(|a, b| dot(sub(foot_at(**a), support), way).total_cmp(&dot(sub(foot_at(**b), support), way))).unwrap();
                             let from = foot_at(foot);
-                            let reach = param(b, "length", 0.5 * stand);
+                            let reach = param(b, "length", 0.5 * stand) * self.quirk.stride;
                             let aim = add(support, mul(error, 1.4));
                             let to = add(from, capped(flat(sub(aim, from)), reach));
                             self.step = Some(Step { foot, from, to, start: t, dur: param(b, "time", 0.28).max(0.05), lift: 0.12 * stand });
@@ -529,7 +677,7 @@ impl Brain {
                     let away = len(sub(target, world.pose(r.bones[arm.upper].body).p));
                     let within = param(b, "within", 4.0 * reach);
                     // Comes up as the thing comes within reach of `within`.
-                    let near = ((within - away) / (0.3 * within).max(1.0)).clamp(0.0, 1.0);
+                    let near = ((within * (2.0 - self.quirk.ready) - away) / (0.3 * within).max(1.0)).clamp(0.0, 1.0);
                     if near > 0.0 {
                         arms[k] = Some((target, amount * near));
                         (self.taken[i], using[i]) = (Some(k), true);
@@ -538,7 +686,9 @@ impl Brain {
                 BehaviourKind::Reach => {
                     let Some((bone, at)) = self.hit else { continue };
                     let hold = param(b, "hold", 1.5);
-                    if t - at > hold {
+                    // (It answers a little late, by its turn of mind.)
+                    let at = at + self.quirk.late;
+                    if t - at > hold || self.quirk.late > 0.0 && t < at {
                         continue;
                     }
                     let target = world.pose(r.bones[bone].body).apply(mul(r.bones[bone].along, r.bones[bone].length * 0.5));
@@ -551,6 +701,9 @@ impl Brain {
                 }
                 BehaviourKind::Protect => {
                     let Some(head) = self.head else { continue };
+                    if self.quirk.late > 0.0 && t < b.from + self.quirk.late {
+                        continue;
+                    }
                     let h = &r.bones[head];
                     let centre = world.pose(h.body).apply(mul(h.along, h.length * 0.5));
                     for (k, arm) in self.arms.iter().enumerate() {
@@ -572,17 +725,23 @@ impl Brain {
         for (k, wanted) in arms.iter().enumerate() {
             let Some((target, amount)) = wanted else { continue };
             let arm = &self.arms[k];
-            let Some((upper, fore)) = self.aim(world, r, arm, *target) else { continue };
+            let Some((upper, fore)) = self.aim(world, r, arm, self.route(world, r, arm, *target)) else { continue };
             for (bone, want) in [(arm.upper, upper), (arm.fore, fore)] {
                 let clip = world.clip(r, bone, x).unwrap_or(r.bones[bone].bind);
                 drive.targets[bone] = Some(blend(clip, want, amount.clamp(0.0, 1.0)));
             }
         }
-        // An arm that is aimed, or on its way back, passes through its body.
+        // An arm that is aimed, or on its way back: its upper arm passes
+        // through its body (it is worked out without the body in its
+        // way). Its forearm and hand meet the body and are led round it,
+        // but for the bone the arm hangs from: a folded arm lies along
+        // its own chest, whose capsule holds the shoulders.
         for arm in &self.arms {
             if [arm.upper, arm.fore].iter().any(|&b| arms_aimed(&drive, &self.aimed, b)) {
-                for b in [arm.upper, arm.fore, arm.hand] {
-                    drive.pass[b] = true;
+                drive.pass[arm.upper] = true;
+                if let Some(chest) = r.bones[arm.upper].parent {
+                    drive.slip[arm.fore] = chest as u32 + 1;
+                    drive.slip[arm.hand] = chest as u32 + 1;
                 }
             }
         }
@@ -617,6 +776,11 @@ impl Brain {
     }
 
     /// The upper arms: bones' indices.
+    /// Its forearms, as `upper_arms` has their upper arms.
+    pub fn fore_arms(&self) -> Vec<usize> {
+        self.arms.iter().map(|a| a.fore).collect()
+    }
+
     pub fn upper_arms(&self) -> Vec<usize> {
         self.arms.iter().map(|a| a.upper).collect()
     }

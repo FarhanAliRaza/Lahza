@@ -49,8 +49,12 @@ def apply(ops):
     return run("motion", "apply", PROJECT, path)
 
 
-# Joint limits: knees and elbows are hinges about the bone's x (the way
-# the character's limbs bend), the rest swing and twist.
+# Joint limits. None are given: a ragdoll takes a human's from its bones'
+# names (thigh, shin, upper, fore...), and for this character those are
+# the ones below, which were first written by hand (BY_HAND=1 gives them
+# outright; the bake is the same bytes either way): knees and elbows are
+# hinges about the bone's x (the way the character's limbs bend), the
+# rest swing and twist.
 LIMITS = [
     {"bone": "shin", "swing": 140, "hinge": [-1, 0, 0]},
     {"bone": "fore", "swing": 140, "hinge": [1, 0, 0]},
@@ -66,7 +70,9 @@ LIMITS = [
 
 def scene(name, start, ragdoll, length):
     hero = f"{name}-hero"
-    doll = dict({"id": "doll", "root": f"{hero}-hips", "release": start + 0.8, "rest": start + 0.0, "limits": LIMITS, "mass": 70}, **ragdoll)
+    doll = dict({"id": "doll", "root": f"{hero}-hips", "release": start + 0.8, "rest": start + 0.0, "mass": 70}, **ragdoll)
+    if os.environ.get("BY_HAND"):
+        doll["limits"] = LIMITS
     return {
         "id": name, "start": start, "end": start + length, "background": "#eef0f4",
         "camera": {"fov": 38, "orbit": [-28, 10]},

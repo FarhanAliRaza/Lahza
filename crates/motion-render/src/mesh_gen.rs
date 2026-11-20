@@ -424,22 +424,24 @@ impl Generators {
         }
         // Skinned meshes: the bind mesh's triangles, and every point moved
         // by its joints.
-        let skins: Vec<(&Job, u32)> = jobs.iter().filter_map(|j| match &j.mesh.source {
-            Source::Skinned { matrices, .. } => Some((j, matrices.len() as u32)),
+        // (Each with its joints, the rows a point of its bind mesh takes,
+        // and whether its pose is dual quaternions.)
+        let skins: Vec<(&Job, [u32; 3])> = jobs.iter().filter_map(|j| match &j.mesh.source {
+            Source::Skinned { base, posed } => Some((j, [posed.matrices.len() as u32, base.srows() as u32, posed.dual.is_some() as u32])),
             _ => None,
         }).collect();
         if !skins.is_empty() {
             {
                 let mut pass = encoder.transfer("skinned mesh triangles");
-                for (j, _) in &skins {
+                for (j, [_, srows, _]) in &skins {
                     let (points, triangles) = (j.mesh.verts, j.mesh.tris);
-                    pass.copy_buffer_to_buffer(pool.at((j.before + points * crate::mesh3d::SROWS as u32) as u64 * 16), pool.at((j.at + points * crate::mesh3d::PROWS as u32) as u64 * 16), triangles as u64 * 16);
+                    pass.copy_buffer_to_buffer(pool.at((j.before + points * srows) as u64 * 16), pool.at((j.at + points * crate::mesh3d::PROWS as u32) as u64 * 16), triangles as u64 * 16);
                 }
             }
             let mut pass = encoder.compute("skinned mesh points");
-            for (j, joints) in &skins {
+            for (j, [joints, srows, dual]) in &skins {
                 let mut pc = pass.with(&finish.skin);
-                pc.bind(0, &SkinData { u_skin: SkinPass { counts: [j.mesh.verts, j.before, j.at, j.pose], more: [*joints, 0, 0, 0] }, b_rows: pool.into() });
+                pc.bind(0, &SkinData { u_skin: SkinPass { counts: [j.mesh.verts, j.before, j.at, j.pose], more: [*joints, *srows, *dual, 0] }, b_rows: pool.into() });
                 pc.dispatch(groups(j.mesh.verts));
             }
             self.generated += skins.len() as u64;

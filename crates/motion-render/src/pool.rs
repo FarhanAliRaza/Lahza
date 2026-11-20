@@ -227,7 +227,7 @@ impl MeshPool {
                 // A skinned mesh: its mesh before the pose in the pool once,
                 // and this frame's pose (three rows a joint) beside it.
                 let mut pose = 0;
-                if let Source::Skinned { base, matrices } = &r.mesh.source {
+                if let Source::Skinned { base, posed } = &r.mesh.source {
                     before = match self.entries.get_mut(&base.key) {
                         Some(e) => {
                             e.used = frame;
@@ -246,13 +246,13 @@ impl MeshPool {
                             at
                         }
                     };
-                    let n = (matrices.len() * 3) as u32;
+                    let n = (posed.matrices.len() * posed.rows_per_joint()) as u32;
                     let Some(at) = self.alloc(n.max(1), id) else {
                         self.warning = Some("mesh memory budget reached; some meshes are not drawn".into());
                         continue;
                     };
                     copies.push((rows.len(), at, n));
-                    rows.extend(matrices.iter().flatten().copied());
+                    posed.write(&mut rows);
                     let posed: Arc<[u8]> = r.mesh.key.iter().copied().chain(*b" pose").collect::<Vec<u8>>().into();
                     self.entries.insert(posed, Entry { at, rows: n.max(1), used: frame, animated: true });
                     pose = at;
@@ -421,11 +421,11 @@ impl MeshPool {
                 rows.push(m.verts * crate::mesh3d::BROWS as u32 + m.tris);
             }
             // A skinned mesh: its mesh before the pose (once), and the pose.
-            if let Source::Skinned { base, matrices } = &m.source {
+            if let Source::Skinned { base, posed } = &m.source {
                 if !self.entries.contains_key(&base.key) && seen.insert(&base.key) {
                     rows.push(base.rows() as u32);
                 }
-                rows.push((matrices.len() as u32 * 3).max(1));
+                rows.push(((posed.matrices.len() * posed.rows_per_joint()) as u32).max(1));
             }
         }
         rows

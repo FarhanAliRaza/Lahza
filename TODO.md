@@ -47,6 +47,16 @@ plugins were not installed), and seven window tests under Xvfb):
   normal-mapped face no longer shadows itself, which was the spots in
   the GPU-against-CPU comparison.
 
+- Since, in the simulation (its own section has each with its test): a
+  rope of links, bodies two instancers deep and as an emitter's
+  particles; eight joints a point, dual quaternions beside linear blend
+  on the CPU and in the pool's kernel, imported rotations that follow
+  the file's slerp, a `.gltf` with its buffer and pictures; a ragdoll's
+  limits from its bones' names, aimed arms led round the body; a take's
+  events on its sheet, reactions that differ by seed; the search with
+  elbows and getting up; a crowd's guard pose, far agents that come in
+  over their pictures, pictures lit by stepped lights.
+
 To do on the owner's machine (the RTX 3060, a desktop, Claude Code signed
 in), since none of it can be seen from a container:
 1. Send a request with the API-key runner (it needs a key; it has only
@@ -716,7 +726,30 @@ at fa1dfd7): on x86-64 with glibc kept off its FMA and AVX paths
 do hash differently with and without) all 35 of `motion-sim`'s tests
 pass and every pin holds; on aarch64 under `qemu-user` 34 pass, every
 pinned bake among them, the one failure being the policy test, whose
-ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
+ONNX Runtime is x86-64 only. Not run: a real ARM machine.
+
+A later round (one container, a Xeon with FMA; `motion-sim` 50 tests
+with 7 ignored measures, debug and release) took the lines each part had
+left. Pinned new, in `motion-sim`'s tests: a rope of links wound round a
+bar (61580 bytes, FNV 11416658259355396517), bodies two instancers deep
+(16679, 7626806709829618763), an emitter's particles (23075,
+9110451255763848001), a human's limits from bone names (57712,
+16705265968754114252), six takes of arms led round the body (36621,
+11581137727660598137; 36488, 947309298340335586; 36488,
+17833138615412773368; 36488, 16887651574034388283; 36552,
+8588104402154634968; 36552, 7065585522355567997), a take varied by
+its seed (57021, 6885115440864738725), getting up under the search
+(126115, 13679216537685136859), a crowd with its guard (18476,
+11403343376360516901). Changed, and why: getting up from four falls
+(139438, 3354145111831044034 → 10638684219171540933: an arm on its
+way back to the clip now meets the body) and the search's take (56950,
+17133235751400427189 → 56831, 7627719729510559245: the same, and an
+elbow's bend an arm in its plan). Every other pin is as it was: what
+was added to a bake's input (a rope's links, a particle's lives,
+`vary`, a guard, named feet) is hashed only where a scene has it, and
+the takes pinned with 40° joints say them outright now that names give
+a human's. These pins were made on one machine and not yet on a
+second. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -769,17 +802,66 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      `body` inside one is a body a copy, `<layer>#<n>` in the bake, in
      joints and in events; tested: a tipped grid of six bricks falls as
      six and is drawn where the bake has each; pinned).
+   - A rope of links (`joints[].links`: that many capsules end to end,
+     a ball joint between each two and at both ends, baked as
+     `<joint>/<n>` and drawn joint to joint with the `draw` layer; the
+     curve without `links` stays the cheap choice). The rope joint is
+     kept beside the chain and bears the load, so what hangs is never
+     farther than the rope is long; links never touch the two bodies the
+     rope is tied to, and scenes with one take 12 solver passes. Tested:
+     a 5 kg ball on 400 px of rope in 16 links swings through and its
+     links stay end to end (under 404 px joint to joint); with a bar
+     across its swing the rope lies on the bar and the ball is wound
+     round it (no link's middle more than 1 px inside the bar), where
+     the drawn curve swings on through. A heavier ball presses the rope
+     into the bar: 2 px at 50 kg, 12 px at 500 kg (a link is light
+     beside it). Pinned. `tumble.py`'s wall uses it (looked at: it sags
+     a little by its own weight while held, bends on the brick it meets
+     and whips after the hit); 16 links add nothing that shows to the
+     bake's time (48 bodies, 0.25 s).
+   - Bodies two instancers deep (`<layer>#<copy>#<copy>`; tested: two
+     stacks of three bricks from an instancer in an instancer fall as
+     six and are drawn where the bake has each; pinned), and three deep
+     refused with the reason. Bodies as an emitter's particles: a body a
+     slot (`<layer>#<slot>`), out of the world but while the slot holds
+     a particle; at each birth it is put where the emitter has the
+     particle, with the speed of its flight, and from then it is the
+     simulation's (the emitter's own gravity and drag are not; it keeps
+     the size it was born with, and its opacity and tint over life).
+     Before a life's first sample it is drawn where the emitter has it;
+     the bake's sample before a later life is where that particle came
+     from. Tested: a slot's lives against the emitter's rate, the speed
+     it leaves with, that it lands on a floor a particle falls through,
+     drawn where the bake has it while it lives; pinned. `tumble.py`'s
+     `pour` (blocks thrown onto a tilted plank, sliding into a heap; 33
+     slots for 5 s bake in 0.05 s) was looked at. An emitter inside an
+     instancer, or holding one, with bodies is refused.
    - Left, needing what is not here: Slang-generated meshes as
      colliders (their points come from `slangc`, which this machine has
      not; the code path is the hull of a generated mesh, untried).
-   - Left, not done (nothing outside is needed, only the work): a box
-     landing flat at speed tips a degree or two before settling
-     (rapier's contact solver; more iterations do not change it, and
-     another solver was not tried). A drawn rope hangs still: its slack
-     does not swing or whip, and it passes through what is between its
-     ends (it is a curve drawn between two bodies, not a chain of them).
-     No bodies inside an emitter (its particles come and go) nor two
-     instancers deep; a ragdoll's or a crowd's layers cannot be copies.
+   - A box landing flat at speed tips before it settles (3.7° on the
+     test's box, which falls 6.5 m): looked into, and it is its bounce.
+     The four corners of the face each get their rebound, worked out
+     one after another by rapier's solver, and the first to be served
+     lifts first. Tried on that drop (`measure_a_flat_landing_by_solver_settings`,
+     an ignored test that prints the table): 16 solver passes 1.4°; 4
+     inner PGS passes 2.6°; 4 inner stabilization passes 3.5°; all three
+     3.7°; no warm start 3.7°; contact clustering or recycling off 3.7°;
+     friction in the bias pass 3.2°; Coulomb friction 3.7°; contacts
+     softer (10 Hz) 3.7°, stiffer (120 Hz) 3.7°, more damped 3.7°; no
+     prediction distance 2.2°, ten times it 9.6°; a contact skin 3.3°;
+     no friction 3.6°; a box for a floor 3.7°; 960 steps a second 8.1°.
+     Only one thing takes it away: `"bounce": 0` on the body and on the
+     ground, 0.24° (tested). No setting is changed: none of them mends
+     it, each would change every pinned bake, and the default bounce
+     stays 0.1 because things that land on an edge or a corner should
+     rebound. For a slab that must land dead flat: `bounce` 0.
+   - Left, needing what is not here: a solver that works out a face's
+     contacts together (a block solver) is rapier's to have, not a
+     setting of it; with one, a flat landing could keep its bounce.
+   - Left, not done: a ragdoll's or a crowd's layers cannot be copies
+     of an instancer (a crowd of instances is the way to many of one
+     character).
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any
      node, and the skinned mesh layer has `"skin": {"index", "joints":
@@ -797,18 +879,55 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      unskinned mesh; the GPU's pool skinning against the CPU's on six
      frames and one path-traced frame (lavapipe, pool counts checked);
      the import and a joint keyed by an edit, through the tools.
-   - Measured: 3.9 ms to skin 100 000 points with four joints each on
-     one core. The GPU side is not timed (lavapipe is no measure).
-   - Left, not done: four joints a point (glTF's JOINTS_1 is not
-     read); no dual quaternions (linear blend: elbows thin at sharp
-     bends); the file's rotations become three layer angles keyed
-     linearly, not slerped; `model_import` copies one file, so a `.gltf`
-     must embed its buffer (or be a `.glb`); a skinned mesh under a
-     Slang deformer or displacement is not deformed (the deformer side
-     needs `slangc` to try). Morph targets are refused. None of these
-     was asked for by a shot yet; each is renderer and importer work
-     whose GPU half cannot be looked at here (lavapipe draws it, slowly,
-     and the suite compares it with the CPU's).
+   - Eight joints a point: glTF's JOINTS_1 and WEIGHTS_1 are read
+     (`SkinData::more`; weights are made to sum to one over the eight;
+     JOINTS_2 is refused). The CPU sums them in order and the pool's
+     bind mesh has six rows a point for such a skin. Tested: the test
+     arm with each point's second joint moved to JOINTS_1 skins to the
+     same points, to the bit, as the arm said with four; drawn the same.
+   - Dual quaternions beside linear blend: a skin's `"blend": "dual"`
+     (`skin::Posed`, `skin_point_dual`, and the second half of
+     `meshskin.wgsl`: five rows a joint, the real and the dual
+     quaternion and what is left of J · B, its scale, which is blended
+     as matrices first). Each joint's quaternion is taken on the side
+     of the point's first. Tested: a ring half on a joint twisted 180°
+     is a point blended as matrices and as wide as it was as dual
+     quaternions, turned a quarter; one joint alone is its matrix
+     either way, scale and all; across the test arm's quarter bend the
+     ring between the joints is within 1 % of its width at rest, and
+     more than 5 % thinner blended as matrices (looked at: the elbow's
+     outside is round, not cut). The GPU against the CPU on software
+     Vulkan: dual quaternions with eight joints a point over four
+     frames, and in the pool dual, eight, and both, three frames each
+     (pool counts checked).
+   - Imported rotations follow the file's slerp: glTF turns from key to
+     key the short way at an even speed, a layer's three angles each go
+     straight between their keys. `model::rotation_keys` adds keys
+     between the file's until the angles' lines are within a quarter of
+     a degree of the file's turn, and takes of a rotation's two sets of
+     angles the one nearer the key before. Tested: a 170° turn about a
+     skew axis and on through where the two sets meet stays within a
+     third of a degree of slerp at every hundredth of a second (tens of
+     degrees off with the file's keys alone); a turn about one axis
+     gets no more keys than the file has.
+   - A `.gltf` is imported with what is beside it: the files its buffers
+     are in are copied with it (kept at their paths under
+     `assets/models/<id>/`, registered as assets), and pictures it names
+     by path are read from its folder and copied like embedded ones. A
+     buffer that is a link or a path out of the folder is refused with
+     its name. Tested through the tools: the arm with `arm.bin` and a
+     picture beside it, imported, its source folder deleted, checks and
+     draws.
+   - Measured, one core, 100 000 points: 5.2 ms with four joints each
+     (linear), 9.8 ms with dual quaternions, 5.7 ms with eight a point
+     of which four have no weight. The GPU side is not timed (lavapipe
+     is no measure).
+   - Left, needing what is not here: a skinned mesh under a Slang
+     deformer or a Slang displacement is not deformed (both need
+     `slangc` to try). Morph targets are refused (a model that has them
+     to try on: none here, and they are a second kernel in the pool,
+     whose GPU half wants a card to look at). What the pool's kernel
+     costs on a card, with a character of real size.
 3. **A ragdoll that falls: done.** `simulation.ragdolls`: every bone
    under `root` (the joints' comps) is a body, a capsule along the bone
    toward its child (a given shape where that is wrong: box feet), mass
@@ -831,17 +950,56 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      thighs). Tested: the limp figure with a hand thrown across it has
      its forearm 21 px and its hand 24 px inside its chest without, and
      no bone more than 2 px inside another with (the forearm lies on the
-     chest), through the fall and at rest; pinned. A bone a behaviour is
-     placing (an aimed arm, the whole body while it gets up) passes
-     through the rest for those steps: arm targets are worked out
-     without the body in the way, and stopped short of the head and of
-     a hit when their arms met the chest on the way.
-   - Left, not done: limits are per bone by hand (no defaults by bone
-     name: a table of human joint ranges keyed on names is guesswork
-     without characters to try it on); a limp figure with the default
-     40° limits falls like a plank, slowly. Arms a behaviour aims do not
-     go round the body, they go through it (going round is planning an
-     arm's path, which nothing here does).
+     chest), through the fall and at rest; pinned. While it gets up the
+     whole body still passes through itself (it is placed pose by pose).
+   - Limits come from the bones' names where none are given
+     (`sim::human_limit`: a table of a human's ranges by the names the
+     usual rigs use, Blender's, Mixamo's, Unreal's and plain ones;
+     knees and elbows hinges of 140° whose axle is across the bone and
+     the way the figure faces, `facing`, so that knees fold back and
+     elbows forward; thighs 70° and 25° of twist, upper arms 100/60,
+     feet 35/10, hands 50/20, a head 35/40, a spine 25/20, and so on). A
+     bone's own name is its id without what the skeleton's ids share
+     (the model's id). They are defaults, round figures on the loose
+     side: an entry in `limits` stands before them, and one for bone ""
+     takes every bone the entries before it leave. A name that tells
+     nothing keeps 40° and 20°. Tried on the test character: with no
+     limits given, `ragdoll.py`'s takes bake to the same bytes as with
+     the limits that were written for it by hand. Tested: the figure's
+     hinges and ranges with none given; thrown hard, no joint past its
+     range, knees back only and elbows forward only, about their axles;
+     limp and shoved at 150 px/s a knee folds to its 140° and the hips
+     are down in 0.9 s (forward) or 1.4 s (back), where 40° joints all
+     round fold it 57° and it comes down as a plank in 2.1 s. Pinned.
+     The takes pinned before say their old limits outright (an entry
+     for ""), so their bytes are as they were.
+   - An aimed arm goes round the body (`Brain::route`): a target inside
+     the trunk is brought out to its surface (a hand goes onto a chest,
+     not into it); while the straight way from the hand passes through
+     the trunk or the head (their capsules, wider by the forearm's
+     thickness) the hand makes for a point beside it there, on the side
+     the way leans to and toward the body's front, and what it makes
+     for is moved out until the forearm clears too; worked out anew
+     each step. The forearm and hand of an aimed arm now meet the body
+     (they passed through all of it), but for the one bone the arm
+     hangs from, whose capsule is the fat one that holds the shoulders:
+     with that met too, on the test character the arms were held up on
+     their own chest. The upper arm still passes. Tested on six takes
+     (arms about the head, a hand to a hit on the chest, to the other
+     forearm, the left to the far thigh, and each hand to a ball across
+     the body): a forearm or hand never more than 4 px into the hips,
+     spine or head and 12 px into its own chest's capsule, where before
+     forearms were 24 to 30 px into the spine in every one and a hand
+     39 px into the chest; each hand gets where it was sent (wrists 25
+     to 53 px from it; the far thigh, 88 px, is past the arm's reach
+     round the hips), and it stands through all six. Pinned. On the
+     test character (`ragdoll.py`'s `brace`) the wrists are 19 to 40 px
+     from the head's joint from 1.2 s to 1.6 s (read off the bake; on
+     the sheet the figure is small).
+   - Left, not done: an arm goes round its trunk and head only, not
+     round its legs, the other arm, or anything outside it; the elbow
+     is where the hinge puts it (no swivel is chosen to keep it clear:
+     the forearm is kept clear by moving what the hand makes for).
 4. **A ragdoll that acts: done, with balance helped.**
    - Motors follow the clip: `strength` 0..1, keyed, per limb with
      `strengths`. A motor is a second joint beside the one with the
@@ -896,8 +1054,15 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      force, not a body that finds its feet (its feet stay where they lay
      and it is drawn over them; it does not step to them); no behaviour
      looks where it is going.
-   - Left, not done: feet and hands are found by bone name (`foot`,
-     `hand`, `head`), not given in the document.
+   - Feet, hands and a head can be named in the document (`feet`,
+     `hands`, `head` on a ragdoll: bone layer ids; a hand's arm is the
+     two bones it hangs from, and it is the left one when it is on the
+     figure's left as it faces); without them they are found by name
+     (`foot`, a last `toe`, `hand`, `head`) as before. Tested: said as
+     the names have them the take is the same sample for sample; one
+     hand said, only that arm shields; the chest said to be the head,
+     the hands go to it; what is no bone, or hangs from fewer than two,
+     is refused by name.
 5. **Directing it: done as far as the tools go.** Intent is written on
    the timeline in the document: `hits`, bodies thrown, `release`,
    `strength` keys per limb, behaviours over spans, all with time
@@ -915,9 +1080,24 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      calls one would make; a model to make them is outside this
      machine), and with it anything that scores a take against the
      intent, which is that model's judgement of the sheet.
-   - Left, not done: `snapshot` does not mark where on the sheet the
-     events fall. Variation by seed is in the blows and releases only,
-     not in how a body reacts.
+   - `snapshot` says what happened by each frame since the frame before
+     it in its scene (`frames[].events`, from the bake), and a sheet
+     marks it over the foot of the frame: what a figure did by name
+     (`fall 1.20`, `step ×2`), the hardest touches, and how many more.
+     Tested through the tools: every event of the take up to the last
+     frame is listed once, none on a frame before the push, and the
+     marks are on the sheet (looked at).
+   - Takes differ by seed in how a body reacts too, when asked:
+     `simulation.vary` (0..1) gives each ragdoll a turn of mind for the
+     take, drawn from the seed: its arms answer up to a sixth of a
+     second late (`reach`, `protect`), its steps are up to a quarter
+     longer or shorter and as much readier or slower to come (`step`,
+     and how near a thing a `guard` waits for), its balance's gain up to
+     15 % more or less. At 0 (the default) nothing is drawn on and
+     bakes are as they were. Tested: with no jitter, six seeds of one
+     pushed figure raise their arms between 0.73 and 0.80 s and end
+     with the leading foot from x 1130 to 1183; all six step and stay
+     up; the same seed is the same bytes; pinned.
 6. **A network that sets the motors: the interface and the no-training
    route are built; no policy was trained.**
    - The interface (`motion-sim/src/policy.rs`): once a frame an
@@ -940,37 +1120,50 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
    - The no-training route (`search.rs`, `controller: {"type":
      "search"}`): each 0.1 s, 16 tries 0.5 s ahead in copies of the
      world. A try is a plan: three leans (ankles, hips, spine), a swing
-     of each upper arm (ten numbers; a search over every joint would
-     need far more tries), and for a third of them, when its weight is
-     headed off its feet, a step of the foot behind to where it is
-     falling to or up to 1.8 times as far. Scored on falling, weight past
-     the feet, tilt, height, effort and a little for a step. The tries
-     run on every core; the plans are drawn before any is tried and the
-     first of the least cost kept, so the take is the same on one core
-     as on four (tested to the byte, pinned).
+     of each upper arm and a bend of each elbow (twelve numbers; a
+     search over every joint would need far more tries), and for a third
+     of them, when its weight is headed off its feet, a step of the foot
+     behind to where it is falling to or up to 1.8 times as far. Scored
+     on falling, weight past the feet, tilt, height, effort and a little
+     for a step. The tries run on every core; the plans are drawn before
+     any is tried and the first of the least cost kept, so the take is
+     the same on one core as on four (tested to the byte, pinned).
+   - Knocked down, it gets up: with `get_up` among its behaviours (and
+     no `balance`) a figure the search keeps up falls, lies, rises as
+     `get_up` does it (helped, as said in part 4) and is the search's
+     again once it stands; nothing is tried while it is down. Tested:
+     shoved at 1800 px/s it falls, is up again within 7.5 s, and stands
+     to the end of a 9 s take with its hips within 20 px of where they
+     stood; pinned.
    - Measured on the test figure, pushes at the chest in px/s, with no
      force on its body (a step's foot is carried by a force, as the
-     `step` behaviour's is): motors holding the clip fall at 300. Search
-     with a 0.25 s horizon (too short to see a step land) holds 300 and
-     falls at 450, as it did when it only leaned; at the default 0.5 s
-     it holds 1000 with one or two steps and falls at 1400; at 1 s it
-     holds 1400 and falls at 1800; 32 tries hold no more than 16.
-     Against part 4: `balance` with its help (a quarter of body weight
-     on the hips) holds 1400, with steps 1800, at no cost.
+     `step` behaviour's is), with the elbows in the plan: motors holding
+     the clip fall at 300. Search at the default 0.5 s holds 1400 with
+     up to five steps and falls at 1800 (before the elbows it held 1000
+     and fell at 1400); at 1 s the same, 1400 and 1800. With a 0.25 s
+     horizon it now falls at 300 (twelve numbers are more than a quarter
+     second's look ahead can tell apart; it held 300 with ten); 32 tries
+     hold 1000 and fall at 1400, less than 16 do (more tries are not
+     better: the first of the least cost is kept, and a costlier look is
+     not a longer one). Against part 4: `balance` with its help (a
+     quarter of body weight on the hips) holds 1400, with steps 1800, at
+     no cost.
    - What it costs, a 4 s take (0.2 s without): at the defaults 63 104
-     steps tried for 960 taken, 18.9 s on one core, 12.2 s on two, 6.3 s
-     on four (a try's copy of the world is made on its own core; four
-     cores give three times, not four); 1 s ahead, 9 s on four. So the
-     search now buys unhelped balance up to what the helped behaviour
-     holds, at 30 to 45 times the bake on four cores. To decide: whether
-     takes want the unhelped look enough to pay for it.
-   - Left, not done (each is more numbers in the plan, so more tries a
-     decision: time, not a missing machine): a step is the `step`
+     steps tried for 960 taken, 12.5 s on one core, 7.1 s on two, 4.0 s
+     on four; 1 s ahead, 7 s on four. So the search buys unhelped
+     balance up to what the helped behaviour holds without steps, at
+     about 20 times the bake on four cores. To decide: whether takes
+     want the unhelped look enough to pay for it.
+   - Left, and each is more numbers in the plan, so more tries a
+     decision, so a longer look ahead to tell them apart (the quarter
+     second above shows the price of two more): a step is the `step`
      behaviour's (a foot carried, not a leg swung), one at a time, and
-     only toward where it is falling; arms only swing from the shoulder
-     (no elbow, no reach for support); the plan is ten numbers, not a
-     pose; it does not get up. In a try a crowd's agents walk on
-     straight at the speed they had (they do not steer in it).
+     only toward where it is falling; an arm does not reach for
+     support; the plan is twelve numbers, not a pose. In a try a
+     crowd's agents walk on straight at the speed they had (to steer in
+     it every try would copy and step the crowd: 16 crowds ten times a
+     second). These are what a trained policy is for, which is the line
+     above: needing what is not here.
 7. **Crowds: done, as layers or as instances with impostors.**
    `simulation.crowds`. Once a frame every agent steers: toward its goal
    at its own pace, off agents within three radii (found by a grid), off
@@ -1058,28 +1251,68 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      5000 are drawn at all. Not measured: the GPU renderer and the path
      tracer (no GPU here), and a character of real size, where a picture
      should gain far more.
-   - Left, needing a GPU to do rightly: what is wrong with pictures is
-     the renderers' to mend, in the rasteriser's shader and the path
-     tracer, and only the CPU's half can be seen here. They cast and
-     take no shadows from the scene (cards would have to be drawn into
-     the shadow maps with their pictures' coverage); they are drawn
-     again whenever the lights change, every frame under an animated
-     light (lighting a picture needs its normals kept and lit in the
-     shader); an agent pops when it changes between mesh and picture (a
-     cross-fade is two see-through draws of it, sorted); the path tracer
-     sees a card, not a body. Not measured for the same want: the GPU
+   - No pop at the switch: the farthest of the agents drawn as the
+     character (an eighth of `full`, twelve at most) and those in the
+     last tenth of `near` are drawn as the character, part see-through,
+     over their picture, more of the character the nearer; a crowd
+     whose `full` is under eight is as it was. Tested (states: with
+     `near` just past the six, each is the character between none and
+     all of it over its own picture; nearer all character, farther all
+     picture). Looked at on the CPU renderer with 1000 (`herd.py`).
+   - A picture's lights are stepped: it is lit by the scene's lights to
+     the nearest step (a direction to under four degrees, a colour, the
+     sky and the exposure to a sixteenth of a stop, a lamp's place to a
+     sixteenth of how far off it is), and its key is of those. So a
+     light that drifts makes a new picture a step, not a frame, and a
+     frame's pictures are still the same whenever it is asked for.
+     Tested: six pictures under a sun that drifts eight degrees and
+     brightens a tenth in a second are made 30 times over its 150
+     showings (every showing before: 150); under a still light 5; a sun
+     that swings a quarter round in a second still makes one nearly
+     every frame (120).
+   - Measured again (four cores, CPU renderer, 1280×720, with the guard
+     and the band): 1000 agents, 150 of them meshes, bake 1.1 s, a
+     second of export 33.9 s (39.9 s before).
+   - Left, needing what is not here: pictures cast and take no shadows
+     from the scene, and are lit again (by steps now) when lights
+     change. Both are the renderers' to mend, in the rasteriser's
+     shader, its shadow maps and the path tracer (cards drawn into the
+     shadow maps with their pictures' coverage; a picture's normals
+     kept and lit in the shader; the tracer sees a card, not a body),
+     which are another session's files this round and whose GPU half
+     wants a card to look at. Not measured for the same want: the GPU
      renderer and the path tracer on crowds, and a character of real
      size (none here, and no licence read for one).
-   - Left, not done: an agent has one clip, so it steps aside and does
-     nothing else: no guard, no duck, no look (a second clip a
-     character and a blend an agent in the bake); none knocked down
-     gets up (a ragdoll of the pool has no brain), and past the pool one
-     stands frozen; it does not get out of the way of other agents'
-     falls. A way is planned round what stands still only (its level
-     box: a wall at an angle shuts its whole box), by each agent alone
-     (no lanes, no waiting for a gap: a doorway jams), and not round a
-     body in motion. `check` evaluates every agent at every sample it
-     takes, which is slow at thousands.
+   - A guard (`crowds[].guard`: `pose`, a moment of the scene at which
+     the character is keyed in its second pose; `ahead`, seconds; and
+     `bones`, the bones the pose takes with all that hang from them,
+     the rest walking on). An agent whose knocking down is on its way
+     within `ahead` seconds has its guard up in a sixth of a second,
+     holds it half a second after the last threat and lowers it over
+     half a second. The bake keeps how far each agent's is up per
+     sample (after the herds, only for crowds that have one: other
+     bakes are the bytes they were). `compile` blends the pose over the
+     walk's moment joint by joint, in quarters, and shares each blend
+     among the agents in it; a far agent's picture is of the guard up
+     when its is half up or more. Instances only (a crowd of layers
+     says why not). Tested: the agent a ball is thrown at has its guard
+     up before the ball arrives and down again after, the others never;
+     it walks the same samples as without a guard; drawn, its arm is a
+     quarter round with the guard up, between on the way, and what is
+     not under the pose's bones is as it walks; pinned.
+     `herd.py` with `GUARD=1` (36 agents, arms keyed up at 7.5 s) was
+     looked at: the agents by the ball's line have their arms up as it
+     comes and lower them after.
+   - Left, not done: the guard is one pose, raised at what would knock
+     an agent down: no duck by where the thing comes from, no look; one
+     knocked down with its guard up falls from its walk's pose; none
+     knocked down gets up (a ragdoll of the pool has no brain), and past
+     the pool one stands frozen; it does not get out of the way of other
+     agents' falls. A way is planned round what stands still only (its
+     level box: a wall at an angle shuts its whole box), by each agent
+     alone (no lanes, no waiting for a gap: a doorway jams), and not
+     round a body in motion. `check` evaluates every agent at every
+     sample it takes, which is slow at thousands.
 
 ## Directing an agent from the editor
 

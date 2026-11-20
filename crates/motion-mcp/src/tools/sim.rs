@@ -2,6 +2,7 @@
 
 use super::*;
 use lahza_motion_core::compile::SimStatus;
+use lahza_motion_core::sim::SimEvent;
 use lahza_motion_core::mesh::{Mesh, MeshParams, MeshShape};
 
 pub(super) fn def() -> ToolDef {
@@ -130,4 +131,58 @@ impl Toolbox {
         }
         Ok(Output::json(json!({"scenes": out})))
     }
+}
+
+/// For each of `times` (timeline seconds, as a snapshot's frames): the
+/// events of its scene's bake since the frame before it in that scene
+/// (the earliest of a scene: since the scene began).
+pub(super) fn events_by_frame(compiled: &Compiled, times: &[f64]) -> Vec<Vec<SimEvent>> {
+    let scene_of = |t: f64| compiled.scenes.iter().position(|s| t >= s.start - 1e-9 && t < s.end + 1e-9);
+    times
+        .iter()
+        .map(|&t| {
+            let Some(scene) = scene_of(t) else { return Vec::new() };
+            let Some(bake) = &compiled.scenes[scene].sim.bake else { return Vec::new() };
+            // The latest other frame of the scene before this one.
+            let since = times.iter().copied().filter(|&o| o < t - 1e-9 && scene_of(o) == Some(scene)).fold(f64::NEG_INFINITY, f64::max);
+            bake.events.iter().filter(|e| e.t > since + 1e-9 && e.t <= t + 1e-9).cloned().collect()
+        })
+        .collect()
+}
+
+/// A frame's events in a line of at most `most` characters: what a figure
+/// did (falls, steps, rises, dodges, knocks) by name, then the hardest
+/// touches, then how many more.
+pub(super) fn mark(events: &[SimEvent], most: usize) -> String {
+    let short = |id: &str| id.rsplit(['-', '/']).next().unwrap_or(id).to_string();
+    let mut parts: Vec<String> = Vec::new();
+    let mut kinds: Vec<&str> = Vec::new();
+    for e in events.iter().filter(|e| e.kind != "touch") {
+        if !kinds.contains(&e.kind.as_str()) {
+            kinds.push(&e.kind);
+        }
+    }
+    for kind in kinds {
+        let of: Vec<&SimEvent> = events.iter().filter(|e| e.kind == kind).collect();
+        parts.push(if of.len() == 1 { format!("{kind} {:.2}", of[0].t) } else { format!("{kind} ×{}", of.len()) });
+    }
+    let mut touches: Vec<&SimEvent> = events.iter().filter(|e| e.kind == "touch").collect();
+    touches.sort_by(|a, b| b.speed.total_cmp(&a.speed).then(a.t.total_cmp(&b.t)));
+    let mut line = parts.join(" · ");
+    let mut shown = 0;
+    for e in &touches {
+        let next = format!("{}{}×{} {:.2}", if line.is_empty() { "" } else { " · " }, short(&e.a), short(&e.b), e.t);
+        if shown >= 2 || line.chars().count() + next.chars().count() + 12 > most {
+            break;
+        }
+        line += &next;
+        shown += 1;
+    }
+    if touches.len() > shown {
+        line += &format!("{}+{} touch{}", if line.is_empty() { "" } else { " · " }, touches.len() - shown, if touches.len() - shown == 1 { "" } else { "es" });
+    }
+    if line.chars().count() > most {
+        line = line.chars().take(most.saturating_sub(1)).collect::<String>() + "…";
+    }
+    line
 }

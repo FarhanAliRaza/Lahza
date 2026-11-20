@@ -8,6 +8,8 @@ the scene's simulation (`"body"` on a layer; the scene's `"simulation"`):
   letters — extruded letters dropped onto a floor: they tumble, land on
             each other and are knocked about by a ball thrown in at 2.2 s
   wall    — a wall of boxes at rest; a heavy ball on a rope swings into it
+  pour    — an emitter whose particles are bodies: blocks thrown onto a
+            tilted plank, sliding off it into a heap, each gone after 4 s
 
 then bakes both (`lahza-motion bake`), checks, and writes a contact sheet
 per scene. The CPU renderer draws them unless GPU=1. Set RENDER=1 for an
@@ -89,7 +91,9 @@ wall = {
     "environment": {"preset": "night", "intensity": 0.8},
     "simulation": {"joints": [
         # The ball hangs from a point above the wall by a rope.
-        {"id": "rope", "type": "rope", "a": "wrecker", "b": None, "anchor_b": [W / 2 - 60, 60, 0], "length": 440, "draw": "cord"},
+        {"id": "rope", "type": "rope", "a": "wrecker", "b": None, "anchor_b": [W / 2 - 60, 60, 0], "length": 440, "draw": "cord",
+         # Sixteen bodies end to end: it swings, and lies on what it meets.
+         "links": 16},
     ]},
     "layers": [dict(floor(), id="floor2", material={"preset": "matte", "color": "#2a3040"})] + [
         {"id": f"b{r}-{c}", "kind": "mesh",
@@ -112,19 +116,41 @@ wall = {
     ],
 }
 
-for s in (letters, wall):
+pour = {
+    "id": "pour", "start": 9.0, "end": 14.0, "background": "#f4f1ea",
+    "camera": {"fov": 38, "orbit": [-10, 12]},
+    "lights": LIGHTS,
+    "layers": [dict(floor(), id="floor3")] + [
+        {"id": "plank", "kind": "mesh", "mesh": {"type": "box", "size": [520, 24], "depth": 260},
+         "material": {"preset": "matte", "color": "#9aa3b5"},
+         "transform": {"position": [W / 2 + 40, 400], "rotation": 18},
+         "body": {"type": "fixed", "friction": 0.3}},
+        # Every particle is a body from its birth to its death (the bake's
+        # `block#<slot>`): thrown as the emitter throws it, then the
+        # simulation's.
+        {"id": "spout", "kind": "instancer", "transform": {"position": [W / 2 - 330, 150]},
+         "layout": {"type": "emitter", "rate": 7, "lifetime": 4, "lifetime_jitter": 0.1, "direction": 70, "spread": 16,
+                    "speed": 330, "speed_jitter": 0.2, "gravity": [0, 981], "spin": 120, "seed": 5, "start": 9.0,
+                    "opacity_over_life": [[0, 1], [0.92, 1], [1, 0]]},
+         "layers": [{"id": "block", "kind": "mesh", "mesh": {"type": "box", "size": [44, 44], "depth": 44, "bevel": 4},
+                     "material": {"preset": "plastic", "color": "#ff5a36"},
+                     "body": {"bounce": 0.2, "friction": 0.5}}]},
+    ],
+}
+
+SCENES = (letters, wall, pour)
+for s in SCENES:
     for layer in s["layers"]:
         layer.setdefault("allow", ["draws_off_frame"])
 
 os.makedirs(OUT, exist_ok=True)
 if not os.path.isdir(PROJECT):
-    run("motion", "create", PROJECT, "--size", f"{W}x{H}", "--fps", "30", "--duration", "9")
-ops = [{"op": "remove", "id": s["id"]} for s in (letters, wall)]
+    run("motion", "create", PROJECT, "--size", f"{W}x{H}", "--fps", "30", "--duration", "14")
 ops_file = os.path.join(OUT, "ops.json")
 # Replace the scenes of an earlier run.
 info = json.loads(run("motion", "info", PROJECT))
 have = [s["id"] for s in info.get("scenes", [])]
-ops = [{"op": "remove", "id": i} for i in have] + [{"op": "add_scene", "scene": s} for s in (letters, wall)]
+ops = [{"op": "remove", "id": i} for i in have] + [{"op": "add_scene", "scene": s} for s in SCENES]
 json.dump({"ops": ops}, open(ops_file, "w"))
 run("motion", "apply", PROJECT, ops_file)
 
@@ -134,7 +160,8 @@ for s in baked["scenes"]:
     print(f"{s['scene']}: {s['status']}, {s.get('bodies')} bodies, {s.get('steps')} steps in {s.get('seconds')} s, {s.get('bytes')} bytes; "
           f"{s.get('events_total')} touches, the hard ones: " + ", ".join(f"{e['a']}×{e['b']} at {e['t']} s" for e in hits[:6]))
 print(run("motion", "check", PROJECT, BACKEND))
-for scene, times in (("letters", [0.4, 0.9, 1.4, 1.9, 2.3, 2.6, 3.0, 3.6, 4.3]), ("wall", [4.6, 5.3, 5.8, 6.1, 6.3, 6.6, 7.0, 7.8, 8.9])):
+for scene, times in (("letters", [0.4, 0.9, 1.4, 1.9, 2.3, 2.6, 3.0, 3.6, 4.3]), ("wall", [4.6, 5.3, 5.8, 6.1, 6.3, 6.6, 7.0, 7.8, 8.9]),
+                     ("pour", [9.3, 9.8, 10.3, 10.8, 11.5, 12.2, 12.9, 13.5, 13.95])):
     sheet = os.path.join(OUT, f"{scene}.png")
     run("motion", "snapshot", PROJECT, BACKEND, "--sheet", "--at", ",".join(str(t) for t in times), "-o", sheet)
     print("wrote", sheet)

@@ -48,12 +48,20 @@ pub struct Rig {
 /// without the body in its way, and goes as it did before bones met. A
 /// collider's `user_data` is its group, and above 32 bits its bone's
 /// index plus one.
-pub(crate) struct Groups<'a>(pub &'a [Vec<bool>], pub &'a [Vec<bool>]);
+pub(crate) struct Groups<'a>(pub &'a [Vec<bool>], pub &'a [Vec<bool>], pub &'a std::collections::BTreeSet<(u32, u32)>, pub &'a [Vec<u32>]);
 
 impl PhysicsHooks for Groups<'_> {
     fn filter_contact_pair(&self, c: &PairFilterContext) -> Option<SolverFlags> {
         let (a, b) = (c.colliders[c.collider1].user_data, c.colliders[c.collider2].user_data);
         let (ga, gb) = (a as u32, b as u32);
+        if !self.2.is_empty() {
+            if let (Some(x), Some(y)) = (c.rigid_body1, c.rigid_body2) {
+                let (x, y) = (x.into_raw_parts().0, y.into_raw_parts().0);
+                if self.2.contains(&(x.min(y), x.max(y))) {
+                    return None;
+                }
+            }
+        }
         if ga == 0 || ga != gb {
             return Some(SolverFlags::default());
         }
@@ -64,7 +72,9 @@ impl PhysicsHooks for Groups<'_> {
             return None;
         }
         let free = |i: usize| self.1.get(ga as usize - 1).and_then(|f| f.get(i - 1)).copied().unwrap_or(false);
-        (!free(ia) && !free(ib)).then_some(SolverFlags::default())
+        // (Or one that passes through the other alone.)
+        let slips = |i: usize, o: usize| self.3.get(ga as usize - 1).and_then(|s| s.get(i - 1)).copied() == Some(o as u32);
+        (!free(ia) && !free(ib) && !slips(ia, ib) && !slips(ib, ia)).then_some(SolverFlags::default())
     }
 }
 
@@ -184,6 +194,7 @@ impl World {
             }
             self.touch.push(may);
             self.free.push(vec![false; n]);
+            self.slip.push(vec![0; n]);
         }
     }
 

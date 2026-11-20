@@ -49,6 +49,18 @@ fn scene(root: Value, ragdoll: Value, sim: Value, seconds: f64) -> Project {
     let mut r = ragdoll;
     r["id"] = json!("doll");
     r["root"] = json!("hips");
+    // (These takes were made, and pinned, when a bone no entry named took
+    // 40° and 20°: said outright here, where the names would now give a
+    // human's. `human` asks for those.)
+    match r.get("human").and_then(Value::as_bool) {
+        Some(_) => {
+            r.as_object_mut().unwrap().remove("human");
+        }
+        None => match r.get_mut("limits").and_then(Value::as_array_mut) {
+            Some(l) => l.push(json!({"bone": ""})),
+            None => r["limits"] = json!([{"bone": ""}]),
+        },
+    }
     sim["ragdolls"] = json!([r]);
     if sim.get("ground").is_none() {
         sim["ground"] = json!({"y": 850});
@@ -156,6 +168,85 @@ fn joints_bend_no_further_than_their_limits() {
         }
         assert!(lo > -4.0, "{id} bent {lo:.1}° the wrong way");
     }
+}
+
+#[test]
+fn limits_come_from_the_bones_names_where_none_are_given() {
+    // No limits given: knees and elbows are hinges about the axles a
+    // hand gives this figure (shins [-1, 0, 0], forearms [1, 0, 0]: it
+    // faces the viewer), the rest swing and twist as a human's.
+    let hits = json!([{"at": 0.1, "bone": "head", "velocity": [900, -500, 300]}, {"at": 0.6, "bone": "foot_l", "velocity": [-1200, -900, -400]}]);
+    let mut p = scene(json!({}), json!({"human": true, "hits": hits}), json!({}), 4.0);
+    let (input, errors) = Compiled::new(&p).sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    let bones = &input.ragdolls[0].bones;
+    let of = |id: &str| &bones[BONES.iter().position(|b| *b == id).unwrap()];
+    let near = |a: Option<[f64; 3]>, b: [f64; 3]| a.is_some_and(|a| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-9));
+    for side in ["l", "r"] {
+        assert!(near(of(&format!("shin_{side}")).hinge, [-1.0, 0.0, 0.0]) && of(&format!("shin_{side}")).swing == 140.0, "{:?}", of(&format!("shin_{side}")).hinge);
+        assert!(near(of(&format!("fore_{side}")).hinge, [1.0, 0.0, 0.0]) && of(&format!("fore_{side}")).swing == 140.0, "{:?}", of(&format!("fore_{side}")).hinge);
+        assert_eq!((of(&format!("thigh_{side}")).swing, of(&format!("thigh_{side}")).twist, of(&format!("thigh_{side}")).hinge), (70.0, 25.0, None));
+        assert_eq!((of(&format!("upper_{side}")).swing, of(&format!("upper_{side}")).twist), (100.0, 60.0));
+        assert_eq!((of(&format!("foot_{side}")).swing, of(&format!("hand_{side}")).swing), (35.0, 50.0));
+    }
+    assert_eq!((of("head").swing, of("head").twist, of("spine").swing, of("chest").twist), (35.0, 40.0, 25.0, 20.0));
+    // An entry given stands before the names, and one for "" takes the rest.
+    let given = scene(json!({}), json!({"human": true, "limits": [{"bone": "shin", "swing": 90, "hinge": [0, 0, 1]}, {"bone": "", "swing": 12}]}), json!({}), 1.0);
+    let (other, _) = Compiled::new(&given).sim_input(0, None);
+    assert!(near(other.ragdolls[0].bones[11].hinge, [0.0, 0.0, 1.0]) && other.ragdolls[0].bones[11].swing == 90.0 && other.ragdolls[0].bones[3].swing == 12.0 && other.ragdolls[0].bones[5].hinge.is_none());
+    // Facing the other way, knees and elbows fold the other way.
+    let turned = scene(json!({}), json!({"human": true, "facing": [0, 1]}), json!({}), 1.0);
+    let (other, _) = Compiled::new(&turned).sim_input(0, None);
+    assert!(near(other.ragdolls[0].bones[11].hinge, [1.0, 0.0, 0.0]) && near(other.ragdolls[0].bones[5].hinge, [-1.0, 0.0, 0.0]));
+    // Thrown as hard as the figure with limits by hand: no joint past
+    // its range, knees back only and elbows forward only, about their axles.
+    let bake = baked(&mut p);
+    let n = bake.tracks[0].samples.len();
+    for (b, id) in BONES.iter().enumerate().skip(1) {
+        let mut most = 0.0f64;
+        let (mut lo, mut hi) = (0.0f64, 0.0f64);
+        for k in 0..n {
+            let rel = quat_mul(pose(&bake, PARENT[b], k).inverse().q, pose(&bake, id, k).q);
+            most = most.max(apart(rel, bones[b].bind));
+            if bones[b].hinge.is_some() {
+                // (The bind is the identity here: the turn about x, and what is not about x.)
+                let about_x = 2.0 * rel[0].atan2(rel[3]).to_degrees();
+                (lo, hi) = (lo.min(about_x), hi.max(about_x));
+                let off_axis = (rel[1] * rel[1] + rel[2] * rel[2]).sqrt().asin().to_degrees() * 2.0;
+                assert!(off_axis < 4.0, "{id} turned {off_axis:.1}° off its axle at sample {k}");
+            }
+        }
+        let allowed = (bones[b].swing.powi(2) * if bones[b].hinge.is_some() { 1.0 } else { 2.0 } + if bones[b].hinge.is_some() { 0.0 } else { bones[b].twist.powi(2) }).sqrt() + 6.0;
+        assert!(most <= allowed, "{id} bent {most:.1}° (its limits allow {allowed:.1}°)");
+        // (A shin's axle is −x: it folds back by turning the other way about x.)
+        match *id {
+            "shin_l" | "shin_r" => assert!(hi < 4.0 && lo > -144.0, "{id} bent {lo:.1}°..{hi:.1}° about its axle"),
+            "fore_l" | "fore_r" => assert!(lo > -4.0 && hi < 144.0, "{id} bent {lo:.1}°..{hi:.1}° about its axle"),
+            _ => {}
+        }
+    }
+    // Limp and shoved a little at the hips, forward or back: how far a
+    // knee folds on the way down, and when the hips are down.
+    let fold = |human: bool, shove: f64| {
+        let doll = json!({"hits": [{"at": 0.05, "bone": "hips", "velocity": [0, 0, shove]}]});
+        let mut doll = doll;
+        if human {
+            doll["human"] = json!(true);
+        }
+        let mut p = scene(json!({}), doll, json!({}), 3.0);
+        let bake = baked(&mut p);
+        let n = bake.tracks[0].samples.len();
+        let knee = (0..n).map(|k| apart(quat_mul(pose(&bake, "thigh_l", k).inverse().q, pose(&bake, "shin_l", k).q), [0.0, 0.0, 0.0, 1.0])).fold(0.0, f64::max);
+        let down = (0..n).find(|&k| pose(&bake, "hips", k).p[1] > 740.0).map_or(f64::NAN, |k| k as f64 / 30.0);
+        (knee, down)
+    };
+    for shove in [-150.0, 150.0] {
+        let ((human, t_human), (stiff, t_stiff)) = (fold(true, shove), fold(false, shove));
+        // (As measured: 140° and down at 0.9 s shoved forward, 1.4 s
+        // shoved back; 57° and 2.1 s with 40° joints, which is the plank.)
+        assert!(human > 120.0 && stiff < 70.0 && t_human < t_stiff - 0.5, "shoved {shove} px/s: a knee folds {human:.0}° with a human's limits (hips down at {t_human:.2} s), {stiff:.0}° with 40° joints ({t_stiff:.2} s)");
+    }
+    assert_eq!(crate::behaviour_tests::pin(&bake), (57712, 16705265968754114252), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]
@@ -287,6 +378,10 @@ fn arm_thrown(self_collide: bool) -> (Bake, lahza_motion_core::sim::SimInput) {
     let bake = (*baked(&mut p)).clone();
     p.bakes.clear();
     (bake, Compiled::new(&p).sim_input(0, None).0)
+}
+
+pub(crate) fn overlap_of(bake: &Bake, input: &lahza_motion_core::sim::SimInput, a: &str, b: &str) -> (f64, usize) {
+    overlap(bake, input, a, b)
 }
 
 /// How far the two bones' capsules are into each other at their worst
