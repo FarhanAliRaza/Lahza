@@ -190,6 +190,21 @@ fn measure_sky_visibility() {
     eprintln!("against the traced picture: {:.1} dB with sky visibility, {:.1} dB without", psnr(&a, &t), psnr(&b, &t));
 }
 
+/// A table (a top on four legs) over the floor before the wall, under the
+/// default lights.
+fn table() -> Project {
+    let leg = |id: &str, x: i32, z: i32| json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [8, 50], "depth": 8}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [x, 105], "z": z}});
+    let mut p = project(json!([
+        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"}, "transform": {"position": [160, 130], "rotation_x": 90}},
+        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"}, "transform": {"position": [160, 0], "z": 160}},
+        {"id": "top", "kind": "mesh", "mesh": {"type": "box", "size": [150, 8], "depth": 90}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [160, 76]}},
+        leg("a", 92, -38), leg("b", 228, -38), leg("c", 92, 38), leg("d", 228, 38)
+    ]));
+    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
+    p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+    p
+}
+
 /// Not a test (`--ignored --nocapture`): under a table (a top on four
 /// legs over the floor, the default lights), where the traced picture has
 /// the light that comes back off the floor and the legs more than once:
@@ -200,15 +215,7 @@ fn measure_under_a_table() {
     if tracer(1).is_none() {
         return;
     }
-    let leg = |id: &str, x: i32, z: i32| json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [8, 50], "depth": 8}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [x, 105], "z": z}});
-    let mut p = project(json!([
-        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"}, "transform": {"position": [160, 130], "rotation_x": 90}},
-        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"}, "transform": {"position": [160, 0], "z": 160}},
-        {"id": "top", "kind": "mesh", "mesh": {"type": "box", "size": [150, 8], "depth": 90}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [160, 76]}},
-        leg("a", 92, -38), leg("b", 228, -38), leg("c", 92, 38), leg("d", 228, 38)
-    ]));
-    p.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
-    p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
+    let p = table();
     let c = Compiled::new(&p);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     let (a, b, t) = (raster(true, false).render(&c, 0.0), raster(false, false).render(&c, 0.0), tracer(64).unwrap().render(&c, 0.0));
@@ -442,9 +449,9 @@ fn cards_and_see_through_meshes_hide_the_sky() {
 
 /// Not a test (`--ignored --nocapture`): what a third return of the
 /// light would add. Sky visibility has the environment's light, what
-/// comes back from the surfaces a point sees (lit as if open) and what
-/// those take back in turn; the traced picture at 2, 3, 4 and 6 bounces
-/// has one return more each time. The room lit by the environment and
+/// comes back from the surfaces a point sees and what those take back
+/// in turn (a guess beyond: pt.wgsl `SKY_REST`); the traced picture at 2,
+/// 3, 4 and 6 bounces has one return more each time. The room lit by the environment and
 /// the table under the default lights: the whole picture's brightness
 /// and the darkest floor (under the ball; under the table), in levels.
 #[test]
@@ -453,24 +460,16 @@ fn measure_a_third_return() {
     if tracer(1).is_none() {
         return;
     }
-    let leg = |id: &str, x: i32, z: i32| json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [8, 50], "depth": 8}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [x, 105], "z": z}});
-    let mut table = project(json!([
-        {"id": "floor", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 900]}, "material": {"preset": "matte", "color": "#d8d0c0"}, "transform": {"position": [160, 130], "rotation_x": 90}},
-        {"id": "wall", "kind": "mesh", "mesh": {"type": "plane", "size": [900, 500]}, "material": {"preset": "matte", "color": "#c8d0d8"}, "transform": {"position": [160, 0], "z": 160}},
-        {"id": "top", "kind": "mesh", "mesh": {"type": "box", "size": [150, 8], "depth": 90}, "material": {"preset": "matte", "color": "#b08050"}, "transform": {"position": [160, 76]}},
-        leg("a", 92, -38), leg("b", 228, -38), leg("c", 92, 38), leg("d", 228, 38)
-    ]));
-    table.scenes[0].camera = serde_json::from_value(json!({"orbit": [0, 12]})).unwrap();
-    table.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "soft"})).unwrap());
     let allow = std::env::var_os("LAHZA_MOTION_SOFTWARE_GPU").is_some();
     let mean = |img: &RgbaImage| img.pixels().map(|p| p.0[0] as f64 + p.0[1] as f64 + p.0[2] as f64).sum::<f64>() / (img.width() * img.height() * 3) as f64;
-    for (name, p, spot) in [("the room", room(Some(json!([{"type": "ambient", "intensity": 0.2}]))), (99, 129)), ("the table", table, (160, 125))] {
+    for (name, p, spot) in [("the room", room(Some(json!([{"type": "ambient", "intensity": 0.2}]))), (99, 129)), ("the table", table(), (160, 125))] {
         let c = Compiled::new(&p);
         assert!(c.errors.is_empty(), "{:?}", c.errors);
         let sky = raster(true, false).render(&c, 0.0);
         eprintln!("{name}: sky visibility {:.1} over the picture, {:.1} at the dark floor", mean(&sky), around(&sky, spot.0, spot.1, 4));
         let mut before: Option<RgbaImage> = None;
-        for bounces in [2u32, 3, 4, 5, 6] {
+        // (LAHZA_SKY_ONLY: not the traced frames, which take minutes.)
+        for bounces in [2u32, 3, 4, 5, 6].into_iter().filter(|_| std::env::var_os("LAHZA_SKY_ONLY").is_none()) {
             let mut r = Renderer::new(None, RenderOptions { backend: Backend::Gpu, allow_software_gpu: allow, path: Some(crate::pt::TraceOptions { spp: 256, bounces, ..Default::default() }), ..Default::default() });
             let img = r.render(&c, 0.0);
             let more = before.as_ref().map(|b| (mean(&img) - mean(b), around(&img, spot.0, spot.1, 4) - around(b, spot.0, spot.1, 4)));
@@ -554,4 +553,81 @@ fn a_volume_hides_the_sky_by_its_density() {
     assert!(seen[1] < seen[0] - 1.0 && seen[2] < seen[1] - 4.0, "the denser, the darker: {seen:?}");
     assert!(seen[3] < seen[0] - 2.0 && seen[3] > seen[2], "a cloud's holes let more through: {seen:?}");
     assert!(seen[4] < seen[0] - 8.0, "a filled wireframe hides the sky: {seen:?}");
+}
+
+/// What a sky's ray ends on is lit by what it sees itself, not as if it
+/// had the whole environment: one ray more goes on from it, and a last
+/// one says whether that one's end is open. Under a table the floor is
+/// lit by the top's underside, which the floor around lights and the
+/// picture does not show; the open floor before a wall has the sky's own
+/// light along its open rays. Both as the traced picture has them, on
+/// the GPU and on the CPU alike.
+#[test]
+fn a_rays_end_is_lit_by_what_it_sees() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let on_cpu = |c: &Compiled| Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(c, 0.0);
+    let apart = |a: &RgbaImage, b: &RgbaImage| a.pixels().zip(b.pixels()).filter(|(p, q)| (0..4).any(|k| p.0[k].abs_diff(q.0[k]) > 3)).count() as f64 / (a.width() * a.height()) as f64;
+    // Under the table, the default lights.
+    let c = Compiled::new(&table());
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let (a, b, t) = (raster(true, false).render(&c, 0.0), raster(false, false).render(&c, 0.0), tracer(64).unwrap().render(&c, 0.0));
+    let (at, _) = (110..210i32).flat_map(|x| (100..150i32).map(move |y| (x, y))).map(|at| (at, around(&t, at.0, at.1, 4))).fold(((0, 0), f64::MAX), |m, v| if v.1 < m.1 { v } else { m });
+    let (ours, plain, traced) = (around(&a, at.0, at.1, 4), around(&b, at.0, at.1, 4), around(&t, at.0, at.1, 4));
+    let ours_cpu = on_cpu(&c);
+    eprintln!("under the table at {at:?}: {ours:.0} with sky visibility, {plain:.0} plain, {traced:.0} traced; {:.1} dB from traced, {:.1} dB plain; GPU against CPU {:.2}% of px more than 3 levels apart", psnr(&a, &t), psnr(&b, &t), apart(&a, &ours_cpu) * 100.0);
+    // (Lit as if it had the whole environment and with what the picture
+    // shows for the second return, it was 173 for the traced 184.)
+    assert!((ours - traced).abs() < 9.0 && plain > traced + 25.0, "{ours:.0} for {traced:.0} (plain {plain:.0})");
+    assert!(psnr(&a, &t) > 33.0, "{:.1} dB", psnr(&a, &t));
+    assert!(apart(&a, &ours_cpu) < 0.01);
+    // The room under an environment without lobes: the open floor and the
+    // wall, and the whole picture's brightness.
+    let mut p = room(Some(json!([{"type": "ambient", "intensity": 0.2}])));
+    p.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#d9d9d9", "horizon": "#bfbfbf", "ground": "#808080"})).unwrap());
+    let c = Compiled::new(&p);
+    let (a, t) = (raster(true, false).render(&c, 0.0), tracer(64).unwrap().render(&c, 0.0));
+    let mean = |img: &RgbaImage| img.pixels().map(|p| p.0[0] as f64 + p.0[1] as f64 + p.0[2] as f64).sum::<f64>() / (img.width() * img.height() * 3) as f64;
+    let (floor, wall) = ((around(&a, 40, 165, 4), around(&t, 40, 165, 4)), (around(&a, 60, 30, 4), around(&t, 60, 30, 4)));
+    let ours_cpu = on_cpu(&c);
+    eprintln!("no lobes: the open floor {:.0} for the traced {:.0}, the wall {:.0} for {:.0}, the picture {:.1} for {:.1}, {:.1} dB; GPU against CPU {:.2}%", floor.0, floor.1, wall.0, wall.1, mean(&a), mean(&t), psnr(&a, &t), apart(&a, &ours_cpu) * 100.0);
+    // (It was 180 for 184, 169 for 172, and 34.3 dB with the rays' ends
+    // lit whole and nothing along the open rays.)
+    assert!((floor.0 - floor.1).abs() < 4.0 && (wall.0 - wall.1).abs() < 5.0, "{floor:?}, {wall:?}");
+    assert!((mean(&a) / mean(&t) - 1.0).abs() < 0.02 && psnr(&a, &t) > 34.5, "{:.1} for {:.1}, {:.1} dB", mean(&a), mean(&t), psnr(&a, &t));
+    assert!(apart(&a, &ours_cpu) < 0.01);
+}
+
+/// Not a test (`--ignored --nocapture`): sky visibility on the GPU and on
+/// the CPU against the traced frame (64 paths), in four scenes: the room
+/// lit by the soft environment (a lobe overhead), by one without lobes,
+/// and under the default lights; and the table. dB from the traced
+/// picture, the mean brightness, and the darkest floor (under the ball;
+/// under the table) and an open floor, in levels of 255.
+#[test]
+#[ignore]
+fn measure_against_traced() {
+    if tracer(1).is_none() {
+        return;
+    }
+    let ambient = || Some(json!([{"type": "ambient", "intensity": 0.2}]));
+    let mut even = room(ambient());
+    even.scenes[0].environment = Some(serde_json::from_value(json!({"preset": "none", "sky": "#d9d9d9", "horizon": "#bfbfbf", "ground": "#808080"})).unwrap());
+    let mean = |img: &RgbaImage| img.pixels().map(|p| p.0[0] as f64 + p.0[1] as f64 + p.0[2] as f64).sum::<f64>() / (img.width() * img.height() * 3) as f64;
+    for (name, p, dark) in [("the room", room(ambient()), (99, 129)), ("the room, no lobes", even, (99, 129)), ("the room, default lights", room(None), (99, 129)), ("the table", table(), (169, 123))] {
+        let c = Compiled::new(&p);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let t = tracer(64).unwrap().render(&c, 0.0);
+        let plain = raster(false, false).render(&c, 0.0);
+        let on_gpu = raster(true, false).render(&c, 0.0);
+        let on_cpu = Renderer::new(None, RenderOptions { backend: Backend::Cpu, sky: true, ..Default::default() }).render(&c, 0.0);
+        let tag = name.replace([' ', ','], "-");
+        keep(&format!("against-{tag}-traced"), &t);
+        keep(&format!("against-{tag}-sky"), &on_gpu);
+        eprintln!("{name}: traced {:.1} over the picture, {:.0} at the dark floor, {:.0} at the open floor", mean(&t), around(&t, dark.0, dark.1, 4), around(&t, 40, 165, 4));
+        for (which, img) in [("plain", &plain), ("sky visibility, GPU", &on_gpu), ("sky visibility, CPU", &on_cpu)] {
+            eprintln!("    {which}: {:.1} dB, {:.1} over the picture, {:.0} at the dark floor, {:.0} at the open floor", psnr(img, &t), mean(img), around(img, dark.0, dark.1, 4), around(img, 40, 165, 4));
+        }
+    }
 }

@@ -3149,9 +3149,19 @@ pub(crate) fn env_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
     if m[lb][2] > 0.5 {
         return env_image_diffuse(m, lb, n);
     }
+    fadd(env_even(m, lb, n), env_lobes_diffuse(m, lb, n))
+}
+
+/// Of `env_diffuse` without an image: the sky, horizon and ground.
+pub(crate) fn env_even(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
     let up = -n[1];
     let (sky, horizon, ground) = (f3(m[lb + 4]), f3(m[lb + 5]), f3(m[lb + 6]));
-    let mut c = if up >= 0.0 { fmix(horizon, sky, smoothstep(0.0, 1.6, up)) } else { fmix(horizon, ground, smoothstep(0.0, 1.2, -up)) };
+    if up >= 0.0 { fmix(horizon, sky, smoothstep(0.0, 1.6, up)) } else { fmix(horizon, ground, smoothstep(0.0, 1.2, -up)) }
+}
+
+/// And the lobes.
+pub(crate) fn env_lobes_diffuse(m: &[[f32; 4]], lb: usize, n: F3) -> F3 {
+    let mut c = [0.0f32; 3];
     let lights = m[lb][0] as usize;
     let lobes = m[lb][1] as usize;
     let first = lb + 7 + lights * LROWS;
@@ -4129,10 +4139,20 @@ fn shade_tri(prim: &Prim, m: &[[f32; 4]], groups: &[[f32; 4]], images: &[u32], t
     let mut env_d = env_diffuse(m, lb, nw);
     let mut sky_spec = 1.0;
     let mut sky_back = [0.0f32; 3];
-    if let Some((open, part, back)) = sky {
-        env_d = fmul(env_diffuse(m, lb, to_world(m, lb, fnorm(fmix(open, n, part)))), part);
+    if let Some((open, part, back, lobes)) = sky {
+        if m[lb][2] > 0.5 {
+            env_d = fmul(env_diffuse(m, lb, to_world(m, lb, fnorm(fmix(open, n, part)))), part);
+            sky_back = back;
+        } else {
+            // (The sky, horizon and ground came with the rays, in `back`,
+            // for the surface without its detail: by how the detail turns
+            // it. The lobes by what the rays found open of them.)
+            env_d = fmul(env_lobes_diffuse(m, lb, nw), lobes);
+            let lum = |c: F3| c[0] + c[1] + c[2];
+            let turn = (lum(env_even(m, lb, nw)) / lum(env_even(m, lb, to_world(m, lb, ns))).max(1e-6)).min(2.0);
+            sky_back = fmul(back, turn);
+        }
         sky_spec = ((n_v + part).powf((-16.0 * rough - 1.0).exp2()) - 1.0 + part).clamp(0.0, 1.0);
-        sky_back = back;
     }
     d_light = fadd(d_light, fmul(fmul3(diffuse, fadd(env_d, sky_back)), coat));
     let spec_env = fmul(fmul3(fmul3(env(m, lb, rw, rough), fadd(fmul(f0, ab[0]), fmul(f82, f90 * ab[1]))), comp), sky_spec);

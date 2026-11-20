@@ -2657,40 +2657,43 @@ fn visible(id: vec3<u32>, py: u32, w: u32) {
     b_tmp[i * 2u + 1u] = vec4<f32>(alpha / 4.0, deep.x / max(deep.y, 1.0), deep.z / max(deep.w, 1.0), vis);
 }
 
-// What a matte surface facing world direction n gets of the sky, the
-// horizon, the ground and the lobes, or of an environment image (the
-// raster's `env_diffuse` in motion.wgsl).
-fn sky_diffuse(n: vec3<f32>) -> vec3<f32> {
-    if b_light[0].z > 0.5 {
-        // An environment image: its diffuse level, as the raster looks
-        // it up (for sky visibility `b_env` holds the raster's rows:
-        // [levels, the diffuse level's offset, its width and height]).
-        let d = b_env[0];
-        let w = u32(d.z);
-        let h = u32(d.w);
-        let at = u32(d.y);
-        if w == 0u || h == 0u || at + w * h > arrayLength(&b_env) { return vec3<f32>(0.0); }
-        let uv = env_uv(n);
-        let x = uv.x * f32(w) - 0.5;
-        let y = clamp(uv.y * f32(h) - 0.5, 0.0, f32(h - 1u));
-        let xf = floor(x);
-        let fx = x - xf;
-        let y0 = u32(floor(y));
-        let y1 = min(y0 + 1u, h - 1u);
-        let fy = y - floor(y);
-        let x0 = u32(i32(xf) + i32(w)) % w;
-        let x1 = (x0 + 1u) % w;
-        let a = mix(b_env[at + y0 * w + x0].xyz, b_env[at + y0 * w + x1].xyz, fx);
-        let b = mix(b_env[at + y1 * w + x0].xyz, b_env[at + y1 * w + x1].xyz, fx);
-        return mix(a, b, fy) * b_light[0].w;
-    }
+// An environment image's light on a matte surface facing world direction
+// n: its diffuse level, as the raster looks it up (for sky visibility
+// `b_env` holds the raster's rows: [levels, the diffuse level's offset,
+// its width and height]).
+fn sky_image(n: vec3<f32>) -> vec3<f32> {
+    let d = b_env[0];
+    let w = u32(d.z);
+    let h = u32(d.w);
+    let at = u32(d.y);
+    if w == 0u || h == 0u || at + w * h > arrayLength(&b_env) { return vec3<f32>(0.0); }
+    let uv = env_uv(n);
+    let x = uv.x * f32(w) - 0.5;
+    let y = clamp(uv.y * f32(h) - 0.5, 0.0, f32(h - 1u));
+    let xf = floor(x);
+    let fx = x - xf;
+    let y0 = u32(floor(y));
+    let y1 = min(y0 + 1u, h - 1u);
+    let fy = y - floor(y);
+    let x0 = u32(i32(xf) + i32(w)) % w;
+    let x1 = (x0 + 1u) % w;
+    let a = mix(b_env[at + y0 * w + x0].xyz, b_env[at + y0 * w + x1].xyz, fx);
+    let b = mix(b_env[at + y1 * w + x0].xyz, b_env[at + y1 * w + x1].xyz, fx);
+    return mix(a, b, fy) * b_light[0].w;
+}
+
+// Without an image: what a matte surface facing world direction n gets
+// of the sky, the horizon and the ground (the raster's `env_even` in
+// motion.wgsl).
+fn sky_even_on(n: vec3<f32>) -> vec3<f32> {
     let up = -n.y;
-    var c: vec3<f32>;
-    if up >= 0.0 {
-        c = mix(b_light[5].xyz, b_light[4].xyz, smoothstep(0.0, 1.6, up));
-    } else {
-        c = mix(b_light[5].xyz, b_light[6].xyz, smoothstep(0.0, 1.2, -up));
-    }
+    if up >= 0.0 { return mix(b_light[5].xyz, b_light[4].xyz, smoothstep(0.0, 1.6, up)); }
+    return mix(b_light[5].xyz, b_light[6].xyz, smoothstep(0.0, 1.2, -up));
+}
+
+// And of the lobes (the raster's `env_lobes_diffuse`).
+fn sky_lobes_on(n: vec3<f32>) -> vec3<f32> {
+    var c = vec3<f32>(0.0);
     let lobes = u32(b_light[0].y);
     let first = 7u + u32(b_light[0].x) * LROWS;
     for (var i = 0u; i < lobes; i++) {
@@ -2712,6 +2715,36 @@ fn sky_diffuse(n: vec3<f32>) -> vec3<f32> {
         c = c + b_light[first + i * 2u + 1u].xyz * (e * 2.0 * rl * (1.0 - em2l));
     }
     return c;
+}
+
+// The sky, horizon and ground toward camera direction d as they are (the
+// tracer's `env_smooth`, less the ambient lights): what an open ray of
+// the sky's brings. Nothing with an image (its light is looked up where
+// the rays' light is used).
+fn sky_even(d: vec3<f32>) -> vec3<f32> {
+    if b_light[0].z > 0.5 { return vec3<f32>(0.0); }
+    let up = -to_world(d).y;
+    if up >= 0.0 { return mix(b_light[5].xyz, b_light[4].xyz, smoothstep(0.0, 0.6, up)); }
+    return mix(b_light[5].xyz, b_light[6].xyz, smoothstep(0.0, 0.2, -up));
+}
+
+// How much the lobes weigh toward camera direction d (`all`: every
+// direction, their sum): the sky's rays find how much of that weight is
+// open, which is how much of the lobes a surface has.
+fn sky_lobes(d: vec3<f32>, all: bool) -> f32 {
+    if b_light[0].z > 0.5 { return 0.0; }
+    let w = to_world(d);
+    var sum = 0.0;
+    let lobes = u32(b_light[0].y);
+    let first = 7u + u32(b_light[0].x) * LROWS;
+    for (var i = 0u; i < lobes; i++) {
+        let l = b_light[first + i * 2u];
+        let c = b_light[first + i * 2u + 1u];
+        var k = 1.0;
+        if !all { k = exp((dot(w, l.xyz) - 1.0) / max(l.w * l.w, 1e-6)); }
+        sum += (c.x + c.y + c.z) * k;
+    }
+    return sum;
 }
 
 // Whether something that hides the sky stands between `o` and `tmax`
@@ -2737,19 +2770,27 @@ fn sky_shadowed(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> bool {
 }
 
 // The light a surface the sky's ray ends on sends back: its base colour
-// (less what is metal) under the sky, horizon and ground, the ambient
-// lights and each other light from its middle (a shadow by one ray; an
-// area light as a point), and what it emits. Plain on purpose: the CPU
-// casts the same rays and has to find the same light (sky_cpu.rs).
-fn sky_lit(h: Hit) -> vec3<f32> {
-    var l = sky_diffuse(to_world(h.n));
+// (less what is metal) under what it sees itself (`seen`: the light
+// along one ray more from it, and how far that ray is open: the lobes,
+// an environment image and the ambient lights by that much), and under
+// each other light from its middle (a shadow by one ray; an area light
+// as a point), and what it emits. Plain on purpose: the CPU casts the
+// same rays and has to find the same light (sky_cpu.rs).
+fn sky_lit(h: Hit, seen: vec4<f32>) -> vec3<f32> {
+    let open = seen.w;
+    var l = seen.xyz;
+    if b_light[0].z > 0.5 {
+        l += sky_image(to_world(h.n)) * open;
+    } else {
+        l += sky_lobes_on(to_world(h.n)) * open;
+    }
     let lights = u32(b_light[0].x);
     for (var i = 0u; i < lights; i++) {
         let row = b_light[7u + i * LROWS];
         let col = b_light[7u + i * LROWS + 1u];
         let kind = u32(row.w);
         if kind == 2u {
-            l += col.xyz;
+            l += col.xyz * open;
             continue;
         }
         var to = normalize(row.xyz);
@@ -2778,35 +2819,63 @@ fn sky_flat(h: Hit) -> vec4<f32> {
     return vec4<f32>(0.0);
 }
 
-// The texel of the sky's group that camera-space point p is seen in, and
-// one more (0: outside the picture, or behind the camera).
-fn sky_texel(p: vec3<f32>) -> u32 {
-    if p.z <= 1e-3 { return 0u; }
-    let c = vec3<f32>(u.cam.x * p.x / p.z + u.cam.y, u.cam.x * p.y / p.z + u.cam.z, 1.0);
-    let tq = vec3<f32>(dot(u.root0.xyz, c), dot(u.root1.xyz, c), dot(u.root2.xyz, c));
-    let x = floor((tq.x / tq.z - u.place.x) / u.place.z);
-    let y = floor((tq.y / tq.z - u.place.y) / u.place.w);
-    if x < 0.0 || y < 0.0 || x >= f32(u.size.x) || y >= f32(u.size.y) { return 0u; }
-    return u32(y) * u.size.x + u32(x) + 1u;
+// The ray that goes on from the surface ray `j` of a texel ended on, of
+// a fixed set as the first (spread by the cosine about that surface);
+// `again`: the one after that. w 0: under the true surface.
+fn sky_turn(h: Hit, j: f32, again: bool) -> vec4<f32> {
+    var k = vec4<f32>(0.7548777, 0.5698403, 0.5, 0.25);
+    if again { k = vec4<f32>(0.8191725, 0.6710436, 0.25, 0.75); }
+    let u1 = fract(j * k.x + k.z);
+    let phi = 2.0 * PI * fract(j * k.y + k.w);
+    let r = sqrt(u1);
+    let d = normalize(basis(h.n) * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(1.0 - u1)));
+    if dot(d, h.g) <= 0.02 { return vec4<f32>(0.0); }
+    return vec4<f32>(d, 1.0);
 }
 
-// The light that comes back a second time: what the surfaces a texel's
-// rays ended on themselves get back from their surroundings, where the
-// picture shows them (the texel the ray's end is seen in, at its depth:
-// `sky` left both, and the mean base colour of what the rays hit). It is
-// that texel's own first light back, as `sky` found it.
-fn sky_second(j: u32) -> vec3<f32> {
-    let kd = b_guides[j * 4u + 2u].xyz;
-    let at = b_guides[j * 4u + 3u];
-    let deep = b_tmp[j * 2u + 1u];
-    var sum = vec3<f32>(0.0);
-    for (var k = 0u; k < 4u; k++) {
-        if at[k] < 0.5 { continue; }
-        let t = u32(at[k]) - 1u;
-        if abs(b_hdr[t * 2u].w - deep[k]) > 0.02 * deep[k] + 0.5 { continue; }
-        sum += b_tmp[t * 2u].xyz;
+// What the surface ray `j` of a texel ended on sees itself, by one ray
+// more from it: the sky's light along it and how far it is open (w), or
+// the light of what it ends on. That one is lit by whether a last ray
+// from it is open; one that is not counts as SKY_REST of the
+// environment, for all the light that would still come back from there
+// (against traced frames, `sky_tests::measure_against_traced`: with
+// nothing for it the pictures are darker than traced, with the whole
+// environment the places where things touch are brighter).
+// The surface a ray ends on is seldom in the picture where this matters
+// (a ball's underside over the floor, a table's over its shadow), so its
+// own texel cannot be asked.
+const SKY_REST: f32 = 0.5;
+fn sky_onward(h: Hit, j: f32, rng: ptr<function, Rng>) -> vec4<f32> {
+    let turn = sky_turn(h, j, false);
+    if turn.w < 0.5 { return vec4<f32>(0.0); }
+    let d = turn.xyz;
+    let o = offset(h, h.g);
+    let far = cast_ray(o, d, 1e30, rng);
+    var through = 1.0;
+    if F_VOLUME {
+        var reach = 1e30;
+        if far.found { reach = far.t; }
+        through = sky_through(o, d, reach);
     }
-    return kd * sum / f32(max(u.size.w, 1u));
+    if !far.found { return vec4<f32>(sky_even(d), 1.0) * through; }
+    if far.card {
+        let c = far.card_color;
+        return vec4<f32>(vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w)) * through, 0.0);
+    }
+    let flat = sky_flat(far);
+    if flat.w > 0.5 { return vec4<f32>(flat.xyz * through, 0.0); }
+    var seen = vec4<f32>(0.0, 0.0, 0.0, SKY_REST);
+    if b_light[0].z <= 0.5 { seen = vec4<f32>(sky_even_on(to_world(far.n)), 1.0) * SKY_REST; }
+    let last = sky_turn(far, j, true);
+    if last.w > 0.5 {
+        let o2 = offset(far, far.g);
+        if !sky_shadowed(o2, last.xyz, 1e30) {
+            var open = 1.0;
+            if F_VOLUME { open = sky_through(o2, last.xyz, 1e30); }
+            seen = vec4<f32>(sky_even(last.xyz), 1.0) * open;
+        }
+    }
+    return vec4<f32>(sky_lit(far, seen) * through, 0.0);
 }
 
 // The camera ray through the middle of texel (x, y).
@@ -2830,13 +2899,25 @@ fn texel_dir(x: f32, y: f32) -> vec3<f32> {
 // its picture covers more than half.
 // A ray that is not open ends on a surface, and that surface sends light
 // back: its own colour under the lights (their shadows by rays) and under
-// the environment (`sky_lit`). One bounce: without it
-// every face that looks at another loses the light the environment's
-// ground and horizon stood for, and the picture is darker than traced.
+// the environment as far as it sees it, and under the light of what it
+// sees instead (`sky_lit`, `sky_onward`: one ray more from each ray's
+// end, and a last one for whether that end is open). Two returns:
+// without the first every face that looks at another loses the light
+// the environment's ground and horizon stood for, and the picture is
+// darker than traced; without the second a ray's end either has the
+// whole sky (too bright where things touch) or none of what its
+// surroundings send it (too dark under a table).
+// An open ray brings the sky's, horizon's or ground's own light along it
+// (not with an image), so that light is what the open rays found and not
+// a fit about their mean direction, which took ground light for a floor
+// beside a wall and hid a lobe overhead by what a wall hides sideways.
+// The lobes: how much of their weight the rays found open.
 // Into `b_hdr`: the open rays' directions (camera space) summed, over the
 // rays, with the camera depth; and the surface's own plane (its true
 // normal, as two numbers, and where it lies) with the open part. Into
-// `b_tmp`: the light that comes back, over the rays.
+// `b_tmp`: the light that comes, over the rays (the sky's own through
+// the open rays and what comes back from the others), and the lobes'
+// weight along the open rays and along all.
 // A unit direction as two numbers (octahedral), and back.
 fn oct_encode(n: vec3<f32>) -> vec2<f32> {
     let o = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
@@ -2864,9 +2945,7 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
     var open = vec4<f32>(0.0);
     var plane = vec4<f32>(0.0);
     var back = vec3<f32>(0.0);
-    var mean_kd = vec3<f32>(0.0);
-    var ends = vec4<f32>(0.0);
-    var deep = vec4<f32>(0.0);
+    var lobe = vec2<f32>(0.0);
     if h.found && !h.card {
         {
             let rays = max(u.size.w, 1u);
@@ -2876,7 +2955,6 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
             let o = offset(h, h.g);
             var sum = vec3<f32>(0.0);
             var n = 0.0;
-            var kd = vec4<f32>(0.0);
             for (var k = 0u; k < rays; k++) {
                 let j = f32(k * 16u + place);
                 let u1 = (j + 0.5) / total;
@@ -2894,14 +2972,18 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
                     if far.found { reach = far.t; }
                     through = sky_through(o, d, reach);
                 }
+                let lobes = sky_lobes(d, false);
+                lobe.y += lobes;
                 if !far.found {
                     sum += d * through;
                     n += through;
+                    back += sky_even(d) * through;
+                    lobe.x += lobes * through;
                     continue;
                 }
                 if far.card {
                     // A card is a flat picture: its colour comes back as
-                    // it is (not lit, so nothing a second time).
+                    // it is (not lit).
                     let c = far.card_color;
                     back += vec3<f32>(decode(c.x / c.w), decode(c.y / c.w), decode(c.z / c.w)) * through;
                     continue;
@@ -2911,16 +2993,10 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
                     back += flat.xyz * through;
                     continue;
                 }
-                back += sky_lit(far) * through;
-                // (For the second time the light comes back: `sky_second`.)
-                kd += vec4<f32>(b_mat[far.mat].xyz * (1.0 - b_mat[far.mat + 1u].x), 1.0);
-                if k < 4u {
-                    ends[k] = f32(sky_texel(far.p));
-                    deep[k] = far.p.z;
-                }
+                back += sky_lit(far, sky_onward(far, j, &rng)) * through;
             }
             back /= f32(rays);
-            if kd.w > 0.0 { mean_kd = kd.xyz / kd.w; }
+            lobe /= f32(rays);
             open = vec4<f32>(sum / f32(rays), dir.z * h.t);
             plane = vec4<f32>(oct_encode(h.g), dot(h.g, h.p), n / f32(rays));
         }
@@ -2928,9 +3004,7 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
     b_hdr[i * 2u] = open;
     b_hdr[i * 2u + 1u] = plane;
     b_tmp[i * 2u] = vec4<f32>(back, 0.0);
-    b_tmp[i * 2u + 1u] = deep;
-    b_guides[i * 4u + 2u] = vec4<f32>(mean_kd, 0.0);
-    b_guides[i * 4u + 3u] = ends;
+    b_tmp[i * 2u + 1u] = vec4<f32>(lobe, 0.0, 0.0);
 }
 
 // The sixteen texels of `sky` that together have every ray's point, as
@@ -2943,11 +3017,15 @@ fn sky(id: vec3<u32>, py: u32, w: u32) {
 // answer changes from one point to the next: on a large flat thing these
 // show as blotches. So the first pass leaves its values in `b_guides`, and
 // a second (`u.denoise.x` texels apart, the same tent on the same plane)
-// smooths them. Into the group: the mean open direction (as two numbers),
+// smooths them, less across a change of the open part (a tenth of it
+// takes a tap's weight to 1 / e: where things touch the dark is narrow
+// and an even tent spread it; on a flat thing the open part hardly
+// changes). Into the group: the mean open direction (as two numbers),
 // the open part, and the camera depth (0: no surface); and, in as many
-// texels after those, the light that comes back; and in as many after
-// these the surface's own plane (its true normal as two numbers, and where
-// it lies), by which the raster's lookup tells surfaces apart (`sky_at`).
+// texels after those, the light that comes (`sky`) with what is open of
+// the lobes (with an image: the open part); and in as many after these
+// the surface's own plane (its true normal as two numbers, and where it
+// lies), by which the raster's lookup tells surfaces apart (`sky_at`).
 @compute @workgroup_size(8, 8, 1)
 fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     let w = u.size.x;
@@ -2968,6 +3046,7 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     let n0 = oct_decode(g.xy);
     var sums: array<vec4<f32>, 16>;
     var backs: array<vec3<f32>, 16>;
+    var lobes: array<vec2<f32>, 16>;
     var weights: array<f32, 16>;
     for (var dy = -2; dy <= 2; dy++) {
         for (var dx = -2; dx <= 2; dx++) {
@@ -2985,33 +3064,48 @@ fn sky_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             if abs(dx) == 2 { wt *= 0.5; }
             if abs(dy) == 2 { wt *= 0.5; }
             if step > 0 {
+                wt *= exp(-abs(b_guides[j * 4u].w - b_guides[i * 4u].w) / 0.1);
                 sums[0] += b_guides[j * 4u] * wt;
                 backs[0] += b_guides[j * 4u + 1u].xyz * wt;
+                lobes[0] += b_guides[j * 4u + 2u].xy * wt;
                 weights[0] += wt;
                 continue;
             }
             let place = (u32(y) % 4u) * 4u + u32(x) % 4u;
             sums[place] += vec4<f32>(cj.xyz, gj.w) * wt;
-            backs[place] += (b_tmp[j * 2u].xyz + sky_second(j)) * wt;
+            backs[place] += b_tmp[j * 2u].xyz * wt;
+            lobes[place] += b_tmp[j * 2u + 1u].xy * wt;
             weights[place] += wt;
         }
     }
     var sum = vec4<f32>(0.0);
     var back = vec3<f32>(0.0);
+    var lobe = vec2<f32>(0.0);
     var weight = 0.0;
     for (var k = 0u; k < 16u; k++) {
         if weights[k] > 0.0 {
             sum += sums[k] / weights[k];
             back += backs[k] / weights[k];
+            lobe += lobes[k] / weights[k];
             weight += 1.0;
         }
     }
+    lobe = lobe / max(weight, 1e-6);
     if step == 0 {
         b_guides[i * 4u] = sum / max(weight, 1e-6);
         b_guides[i * 4u + 1u] = vec4<f32>(back / max(weight, 1e-6), 0.0);
+        b_guides[i * 4u + 2u] = vec4<f32>(lobe, 0.0, 0.0);
         return;
     }
-    b_groups[u.size.z + w * h + i] = vec4<f32>(back / max(weight, 1e-6), 0.0);
+    // The lobes by what was open of their weight; where the rays hardly
+    // met them (a narrow sun), by the open part.
+    let part = sum.w / max(weight, 1e-6);
+    var seen = part;
+    if b_light[0].z <= 0.5 {
+        let least = 0.02 * sky_lobes(vec3<f32>(0.0), true);
+        seen = (lobe.x + least * part) / max(lobe.y + least, 1e-6);
+    }
+    b_groups[u.size.z + w * h + i] = vec4<f32>(back / max(weight, 1e-6), seen);
     b_groups[u.size.z + 2u * w * h + i] = vec4<f32>(g.xyz, 0.0);
     var toward = n0;
     if dot(sum.xyz, sum.xyz) > 1e-8 { toward = normalize(sum.xyz); }

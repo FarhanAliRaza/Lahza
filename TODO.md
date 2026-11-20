@@ -587,9 +587,10 @@ it). What follows is for a card where it is not quick enough.
   (`SKY_RAYS`), spread by the cosine, toward points of one fixed set: a
   texel has those of its place in a 4 x 4 tile, so sixteen texels
   together have 64 directions (pt.wgsl `sky`). An open ray adds its
-  direction; one that ends on a surface adds that surface's light: its
-  colour under the lights (shadows by rays) and under the environment
-  (its sky, horizon, ground and lobes, or its image's diffuse level). `sky_filter` makes the sixteen one value over the texels on
+  direction and the sky's light along it; one that ends on a surface
+  adds that surface's light: its colour under the lights (shadows by
+  rays) and under what it sees itself (one ray more from it: see "What a
+  ray ends on", below). `sky_filter` makes the sixteen one value over the texels on
   the same plane, each place of the tile weighing the same, and smooths
   that once more two texels apart: each texel has every direction but
   each from another point near it, and its value went in steps that
@@ -598,10 +599,12 @@ it). What follows is for a card where it is not quick enough.
   0.8; now 0.7, and the test holds it there). The group
   holds, a texel, the mean open direction, the open part and the depth,
   and the light that comes back. The raster's shading reads it by depth
-  (motion.wgsl `sky_at`): `env_diffuse` along the open direction times
-  the open part, ambient lights times it, what is mirrored of the
-  environment less by it (Lagarde's fit), and the light that comes back
-  added to the diffuse light.
+  (motion.wgsl `sky_at`): the light the rays brought (the sky's own
+  through the open ones and what came back from the others) added to the
+  diffuse light, the lobes times what is open of them, ambient lights
+  times the open part, what is mirrored of the environment less by it
+  (Lagarde's fit); with an environment image, `env_diffuse` along the
+  open direction times the open part.
   Nothing is drawn by lot from frame to frame and nothing is kept from
   the frame before: a raster frame is cached by its lists and drawn in
   any order, so the same frame has to be the same picture (tested).
@@ -625,10 +628,11 @@ it). What follows is for a card where it is not quick enough.
     two filter passes, all in f32 as the shader, and the CPU's shading
     reads the group as `sky_at` does. For the two to find the same light
     back, that light is one plain rule on both sides (`sky_lit`: the
-    surface's base colour, less what is metal, under the environment
-    with its lobes or its image, the ambient lights, and each other
-    light from its middle with a shadow by one ray; an area light as a
-    point), not the tracer's full material and soft lights as at first.
+    surface's base colour, less what is metal, under what its own ray
+    brings, the lobes or the image and the ambient lights by how far
+    that ray is open, and each other light from its middle with a
+    shadow by one ray; an area light as a point), not the tracer's full
+    material and soft lights as at first.
     GPU against CPU on software Vulkan, as the other tests of the two
     measure it: no pixel more than one level apart in the test's scene
     (lit by the environment, and with an environment image). A mesh the
@@ -781,32 +785,89 @@ What is left:
   47: the same doubling, on a slower run); the CPU at 1080 x 608 329 ms
   against 118, the rays 125 ms and the two filter passes 30 to 47 ms
   (they were 129 and 22 to 29).
-- **The light's second return** is in, from the same rays and no more
-  of them: where the picture shows the surface a ray ended on (the texel
-  its end is seen in, at its depth), that texel's own first light back,
-  times the mean base colour of what the rays hit, is added (pt.wgsl
-  `sky_second`, the same in `sky_cpu.rs`; GPU and CPU still within a
-  level). It closes about a third of the gap (4% to 3%, 8% to 6% under
-  the table).
-  *A third return: measured, not to be added.* The traced picture with
-  one bounce more each time (`sky_tests::measure_a_third_return`,
-  `--ignored`, 256 paths; the room lit by the environment, the table
-  under the default lights; levels of 255 over the whole picture and at
-  the darkest floor): from 2 bounces to 3, +3.9 and +6.0 (the room),
-  +1.1 and +7.0 (the table); from 3 to 4, +1.0 and +1.7, +0.3 and +1.7;
-  from 4 to 5, +0.3 and +1.4, +0.1 and +0.8; from 5 to 6 under half a
-  level. Whichever of these a third return is, it is a level over the
-  picture and under two at the darkest place, where sky visibility is
-  already 14 levels off the traced picture the other way (148 for 134
-  under the ball: what a ray ends on is lit as if it saw the whole
-  environment; 180 for 194 under the table).
+- **What a ray ends on is lit by what it sees itself: done** (it was lit
+  as if it had the whole environment, which the session before measured
+  as the largest error left: 148 for the traced 134 under the ball, 180
+  for 194 under the table). Each ray that ends on a lit surface goes on
+  from there once more, by the cosine, in a direction of a fixed set
+  (pt.wgsl `sky_turn`, `sky_onward`; the same in `sky_cpu.rs`): open, it
+  brings the sky's light along it; else the light of what it ends on,
+  and that one is lit by whether a last ray from it is open (a shadow
+  ray). A last ray that is not open counts as half the environment
+  (`SKY_REST`), for all the light that would still come back.
+  The plan had been to keep each ray's light apart and ask the texel
+  its end is seen in (one more buffer row, no ray). Not done, by what
+  the scenes show: the ends that matter are not in the picture (the
+  ball's underside over the floor; the table top's underside, which the
+  floor around it lights and which lights the floor under it). The
+  second return that did go by the picture (`sky_second`) is gone with
+  its two buffer rows: the ray has it, for surfaces the picture does not
+  show too.
+  And the measure showed that most of what the room was off by was not
+  at the rays' ends at all. The open sky's own light was the raster's
+  fit about the mean open direction, times the open part: a floor
+  beside a wall took the ground's dark light (the mean direction leans
+  from the wall, and the fit about it reaches under the horizon), and a
+  lobe overhead was hidden by what a wall hides sideways (the open floor
+  before the wall 210 for the traced 221). Now an open ray brings the
+  sky's, horizon's or ground's own light along it, with the light back
+  (the group's second row; the raster turns it by how a surface's detail
+  turns the fit), and the lobes go by how much of their weight the rays
+  found open (that row's fourth number; a narrow lobe the rays hardly
+  meet, by the open part). An environment image is as before: its
+  diffuse level about the mean open direction, times the open part.
+  The second filter pass smooths less across a change of the open part
+  (where things touch the dark is narrow, and the even tent spread it).
+  Measured against the traced frame, 64 paths, 320 x 180, software
+  Vulkan and the CPU, which give the same numbers to the last digit
+  shown (`sky_tests::measure_against_traced`, `--ignored`; before, from
+  the same scenes at the commit before):
+
+  | | dB from traced | the picture | the dark floor | the open floor |
+  |---|---|---|---|---|
+  | the room, soft environment: traced | | 204.8 | 133 | 221 |
+  | before | 29.7 | 198.8 | 148 | 210 |
+  | now | 30.8 | 199.3 | 141 | 218 |
+  | the room, no lobes: traced | | 171.8 | 115 | 184 |
+  | before (the ends lit whole, no second return) | 34.3 | 169.5 | 124 | 180 |
+  | now | 35.8 | 169.9 | 120 | 183 |
+  | the room, default lights: traced | | 244.1 | 209 | 252 |
+  | now | 36.1 | 242.0 | 202 | 251 |
+  | the table, default lights: traced | | 238.5 | 184 | 251 |
+  | before | 32.5 | 234.5 | 173 | 249 |
+  | now | 34.4 | 235.4 | 177 | 251 |
+
+  (The room under the default lights at 480 x 270: 37.0 dB before, 38.0
+  now.) Tried on the way, on the CPU against the same traced frames: the
+  ends lit by whether one ray from them is open and nothing else, 21.9 dB
+  in the room and 27.8 under the table (the light the blocked rays stood
+  for is gone); the second end lit as if open, 30.6 and 34.9 dB but the
+  dark floor under the ball 148; with nothing beyond a last ray that is
+  not open, 29.8 and 33.8 dB; half, as kept, 30.7 and 34.4 dB.
+  What is left of the dark floor under the ball (141 for 133) is the
+  filter's width, two passes of a 5 x 5 tent at half size: with the
+  second pass even it was 146.
+  The cost: on software Vulkan at 480 x 270 a frame takes 137 ms against
+  64 without (117 against 66 at the commit before, in this container:
+  the trace 119 ms a frame for 78); the CPU at 1080 x 608, four cores,
+  416 ms against 128 without. Tested:
+  `sky_tests::a_rays_end_is_lit_by_what_it_sees` (the floor under the
+  table within 9 levels of traced, the open floor and the wall without
+  lobes within 4 and 5, GPU against CPU).
+  *A third return* (`sky_tests::measure_a_third_return`, `--ignored`,
+  256 paths): the traced picture from 2 bounces to 3, +3.9 over the
+  picture and +6.0 at the darkest floor (the room), +1.1 and +7.0 (the
+  table); from 3 to 4, +1.0 and +1.7, +0.3 and +1.7; from 4 to 5, +0.3
+  and +1.4, +0.1 and +0.8; from 5 to 6 under half a level. The rays now
+  have the third (the last ray, where open) and `SKY_REST` stands for
+  the rest.
   The method's limits, which more rays in the picture's plane do not
-  lift (the fast mode has none of them): a surface the picture does not
-  show sends nothing back a second time; the environment at what a ray
-  ends on is taken whole; a surface or a card hides all of a ray or none
-  (the step at one half: only volumes take a share); nothing is
-  mirrored of other things. A mesh the GPU generates in its pool is not
-  in the CPU's rays, as it is not in the CPU's frame at all.
+  lift (the fast mode has none of them): a surface or a card hides all
+  of a ray or none (the step at one half: only volumes take a share);
+  nothing is mirrored of other things; an environment image's light is
+  its diffuse level about the mean open direction. A mesh the GPU
+  generates in its pool is not in the CPU's rays, as it is not in the
+  CPU's frame at all.
 
 Not to do: light probes placed through the scene (irradiance volumes,
 DDGI). They suit large scenes that stand still; these are small and

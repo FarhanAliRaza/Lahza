@@ -792,16 +792,22 @@ fn env_light(lb: u32, d: vec3<f32>, r: f32) -> vec3<f32> {
 // small bright lobes (the sun) light as much as they do traced.
 fn env_diffuse(lb: u32, n: vec3<f32>) -> vec3<f32> {
     if b_mesh[lb].z > 0.5 { return env_image_diffuse(lb, n); }
+    return env_even(lb, n) + env_lobes_diffuse(lb, n);
+}
+
+// Of `env_diffuse` without an image: the sky, horizon and ground.
+fn env_even(lb: u32, n: vec3<f32>) -> vec3<f32> {
     let up = -n.y;
     let sky = b_mesh[lb + 4u].xyz;
     let horizon = b_mesh[lb + 5u].xyz;
     let ground = b_mesh[lb + 6u].xyz;
-    var c: vec3<f32>;
-    if up >= 0.0 {
-        c = mix(horizon, sky, smoothstep(0.0, 1.6, up));
-    } else {
-        c = mix(horizon, ground, smoothstep(0.0, 1.2, -up));
-    }
+    if up >= 0.0 { return mix(horizon, sky, smoothstep(0.0, 1.6, up)); }
+    return mix(horizon, ground, smoothstep(0.0, 1.2, -up));
+}
+
+// And the lobes.
+fn env_lobes_diffuse(lb: u32, n: vec3<f32>) -> vec3<f32> {
+    var c = vec3<f32>(0.0);
     let lights = u32(b_mesh[lb].x);
     let lobes = u32(b_mesh[lb].y);
     let first = lb + 7u + lights * LROWS;
@@ -1720,8 +1726,10 @@ fn oct_decode(e: vec2<f32>) -> vec3<f32> {
 
 // How much of the sky the surface at target point q, camera point p, sees
 // (`open.w`; below 0: not known, the whole sky as before), from where
-// (`open.xyz`, camera space), and the light that comes back from what it
-// sees instead (`back`): the list's sky visibility, which the path tracer's rays
+// (`open.xyz`, camera space), the light that comes from the sky, horizon
+// and ground through the open rays (not with an image) and back from what
+// it sees instead (`back`), and what is open of the lobes (`lobes`): the
+// list's sky visibility, which the path tracer's rays
 // found at half the target's size (pt.wgsl `sky`; its group is named in
 // the light block's two spare floats). Of the nine texels around q, those
 // that show this surface, the nearer to q the more: a texel's surface is
@@ -1732,7 +1740,7 @@ fn oct_decode(e: vec2<f32>) -> vec3<f32> {
 // depths. At an edge with none, the texel whose plane is nearest; but a
 // see-through batch then has the whole sky as before (the texels behind
 // it are of other things).
-struct Sky { open: vec4<f32>, back: vec3<f32> }
+struct Sky { open: vec4<f32>, back: vec3<f32>, lobes: f32 }
 fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky {
     var none: Sky;
     none.open = vec4<f32>(0.0, 0.0, 0.0, -1.0);
@@ -1747,15 +1755,15 @@ fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky
     let g = c * 0.5 - 0.5;
     let g0 = floor(g + 0.5);
     var sum = vec4<f32>(0.0);
-    var back = vec3<f32>(0.0);
+    var back = vec4<f32>(0.0);
     var weight = 0.0;
     var near = vec4<f32>(0.0, 0.0, 0.0, 1e30);
-    var near_back = vec3<f32>(0.0);
+    var near_back = vec4<f32>(0.0);
     for (var k = 0; k < 9; k++) {
         let at = g0 + vec2<f32>(f32(k % 3 - 1), f32(k / 3 - 1));
         let t = group_at(off, w, h, i32(at.x), i32(at.y));
         if t.w <= 0.0 { continue; }
-        let b = group_at(off + w * h, w, h, i32(at.x), i32(at.y)).xyz;
+        let b = group_at(off + w * h, w, h, i32(at.x), i32(at.y));
         let plane = group_at(off + 2 * w * h, w, h, i32(at.x), i32(at.y));
         let nt = oct_decode(plane.xy);
         let away = abs(dot(nt, p) - plane.z) / (0.01 * p.z + 0.5) + max(0.9 - dot(nt, gn), 0.0) * 10.0;
@@ -1774,11 +1782,13 @@ fn sky_at(prim: Prim, lb: u32, q: vec2<f32>, p: vec3<f32>, gn: vec3<f32>) -> Sky
     if weight <= 1e-3 {
         if own { return none; }
         s.open = vec4<f32>(oct_decode(near.xy), clamp(near.z, 0.0, 1.0));
-        s.back = near_back;
+        s.back = near_back.xyz;
+        s.lobes = clamp(near_back.w, 0.0, 1.0);
         return s;
     }
     s.open = vec4<f32>(normalize(sum.xyz), clamp(sum.w / weight, 0.0, 1.0));
-    s.back = back / weight;
+    s.back = back.xyz / weight;
+    s.lobes = clamp(back.w / weight, 0.0, 1.0);
     return s;
 }
 
@@ -2256,11 +2266,24 @@ fn shade_tri(prim: Prim, tri: u32, q: vec2<f32>, occ: f32, compact: bool) -> vec
     // the more so the rougher the surface and the more it is seen head-on
     // (Lagarde and de Rousiers' fit).
     var sky_spec = 1.0;
+    var sky_back = vec3<f32>(0.0);
     if sky.w >= 0.0 {
-        env_d = env_diffuse(lb, to_world(lb, normalize(mix(sky.xyz, n, sky_part)))) * sky_part;
+        if b_mesh[lb].z > 0.5 {
+            env_d = env_diffuse(lb, to_world(lb, normalize(mix(sky.xyz, n, sky_part)))) * sky_part;
+            sky_back = sky_seen.back;
+        } else {
+            // The sky, horizon and ground came with the rays (in the
+            // light back), for the surface without its detail: by how
+            // the detail turns it. The lobes by what the rays found open
+            // of them.
+            env_d = env_lobes_diffuse(lb, nw) * sky_seen.lobes;
+            let detail = env_even(lb, nw);
+            let plain = env_even(lb, to_world(lb, ns));
+            sky_back = sky_seen.back * min((detail.x + detail.y + detail.z) / max(plain.x + plain.y + plain.z, 1e-6), 2.0);
+        }
         sky_spec = clamp(pow(n_v + sky_part, exp2(-16.0 * rough - 1.0)) - 1.0 + sky_part, 0.0, 1.0);
     }
-    d_light = d_light + (diffuse * (env_d + sky_seen.back)) * coat;
+    d_light = d_light + (diffuse * (env_d + sky_back)) * coat;
     let spec_env = env_light(lb, rw, rough) * (f0 * ab.x + f82 * (f90 * ab.y)) * comp * sky_spec;
     s_light = s_light + spec_env * coat;
     if e_sheen > 0.0 {
