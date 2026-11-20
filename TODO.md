@@ -290,6 +290,54 @@ targets are refused), so every part below is new. In the order to build:
    export bears is to be measured; thousands would be pictures of agents
    (impostors), not meshes.
 
+## Directing an agent from the editor
+
+Not started. To say in the editor what is wanted ("add five seconds of …
+here", "this one should look like …", "something is wrong with this one"),
+see the agent at work, and scrub what it made. "Generated" here is motion
+the agent builds with the engine's tools; a clip from a video model would
+be something else to connect.
+
+Already here:
+- An agent's edits appear live: the editor polls the project's folder
+  (`motion_editor.rs`, every 30 ticks) and reloads.
+- One history: each edit is an entry with its author and its inverse
+  (`io.rs` `HistoryEntry`), so undo works on what an agent did.
+- The editor knows what is pointed at: the selected layer (`selected`),
+  its box (`selection_bounds`) and the playhead.
+- The agent can look: `snapshot`, `review`.
+
+To build, in this order (1 to 4 with one selected layer already cover
+"fix this one"):
+1. **A prompt box in the motion editor.** It has no text input; the app
+   has one elsewhere (`text_field.rs`).
+2. **Starting an agent from the app.** First: Claude Code without its
+   terminal, as a child process on `lahza mcp`, its steps read as they
+   come (a stream of JSON). Behind one small interface, so another client
+   or a loop of our own (an API key, the `Toolbox` in process) can take
+   its place. It needs Claude Code installed and signed in: say so where
+   it is not.
+3. **What goes with the words.** The selected layer's id, the playhead,
+   the scene, and a snapshot of the frame as it is, so "this one" needs no
+   describing. A follow-up continues the same conversation.
+4. **A panel for the agent at work.** Each step as it happens (what was
+   added, what was checked, what is being drawn), what it said at the end,
+   and a stop button that ends the child.
+5. **Undo for a whole request.** An agent makes many edits a request and
+   each is its own entry: entries need the request they belong to, and
+   one undo takes them all back.
+6. **More than one thing selected.** A span of time ("five seconds from
+   here") and several layers; the editor holds one layer.
+
+To settle first:
+- **Editing while the agent works.** Nothing was found that keeps the
+  editor and the server from writing the folder at once (both number
+  history entries from what is there). Either the editor only reads while
+  a request runs, or the writes are guarded.
+- **How long it takes.** A scene of five seconds is many calls: tens of
+  seconds to minutes (not measured). The live reload shows it being put
+  together; the panel should say what is left where that is known.
+
 ## Slang
 
 - **To compile once with slangc.** These were written where slangc could
