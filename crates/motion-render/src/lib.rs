@@ -24,6 +24,7 @@ pub mod pt;
 pub mod model;
 mod ngx;
 mod oidn;
+mod sky_cpu;
 mod mesh_gen;
 mod pool;
 pub mod raster;
@@ -77,8 +78,8 @@ pub struct RenderOptions {
     pub profile: bool,
     /// Rasterised meshes take the environment's light by how much of the
     /// sky each point sees (rays against the path tracer's structures,
-    /// `pt::TraceOptions::sky`). Only on a GPU with ray queries: elsewhere,
-    /// and on the CPU, the frame is drawn as without it.
+    /// `pt::TraceOptions::sky`; the CPU casts the same rays itself,
+    /// `sky_cpu`). A GPU without ray queries draws the frame as without it.
     pub sky: bool,
 }
 
@@ -653,7 +654,9 @@ impl Renderer {
     fn build_lists(&mut self, states: &[FrameState], trace: Option<pt::TraceOptions>) -> Vec<DisplayList> {
         let scale = self.options.scale;
         let compact = self.gpu.as_ref().is_some_and(|g| g.has_vis());
-        let sky = self.options.sky && self.gpu.as_ref().is_some_and(|g| g.can_trace());
+        // (The GPU's rays, or the CPU's own; a GPU without rays draws as
+        // without.)
+        let sky = self.options.sky && self.gpu.as_ref().is_none_or(|g| g.can_trace());
         states
             .iter()
             .map(|s| {
@@ -680,6 +683,15 @@ impl Renderer {
             for g in &list.groups {
                 if let Some(i) = g.shader {
                     shader::paint_cpu(&list.shaders[i as usize], g, groups, self.threads);
+                    continue;
+                }
+                // Sky visibility: the CPU's own rays (a traced picture
+                // is not drawn here: such lists are built rasterised).
+                if let Some(t) = g.trace.and_then(|i| list.traces.get(i as usize)).filter(|t| t.options.sky) {
+                    let (w, h) = (g.target.width as usize, g.target.height as usize / 2);
+                    if let Some(out) = groups.get_mut(g.offset as usize..g.offset as usize + w * h * 2) {
+                        sky_cpu::fill(t, w, h, out, self.threads);
+                    }
                     continue;
                 }
                 let n = (g.target.width * g.target.height) as usize;
