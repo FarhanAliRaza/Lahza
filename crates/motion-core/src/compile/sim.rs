@@ -480,11 +480,15 @@ impl Compiled {
                 rest,
                 pushes,
                 group: 0,
+                apart: Vec::new(),
             });
         }
         // Joints.
         let index = |id: &str| input.bodies.iter().position(|b| b.id == id);
         let start_pose = |b: usize| decompose(found[b].worlds[1]).0;
+        #[allow(clippy::type_complexity)]
+        let mut chains: Vec<(String, usize, Option<usize>, [f64; 3], [f64; 3], [f64; 3], [f64; 3], f64, usize, f64, Option<f64>)> = Vec::new();
+        let mut prev_half = [0.0; 3];
         for (n, j) in set.joints.iter().enumerate() {
             let name = j.id.clone().unwrap_or_else(|| format!("joint{n}"));
             let what = format!("{}.simulation.joints.{n}", scene.id);
@@ -541,7 +545,68 @@ impl Compiled {
                 damping: m.damping,
                 max_force: m.max_force,
             });
-            input.joints.push(JointInput { id: name, kind: j.kind, a, b, anchor_a, anchor_b, axis_a, axis_b, limits: j.limits, swing: j.swing, twist: j.twist, length: j.length.unwrap_or(apart), stiffness: j.stiffness, damping: j.damping, motor, collide: j.collide });
+            let length = j.length.unwrap_or(apart);
+            if j.links > 0 {
+                if j.kind != JointKind::Rope {
+                    errors.push(format!("{what}.links: only a rope is made of links"));
+                } else if j.links > 256 {
+                    errors.push(format!("{what}.links: {} is more than a rope takes (256)", j.links));
+                } else {
+                    let radius = j.radius.or_else(|| rope_radius(&scene.layers, j)).unwrap_or(4.0).max(0.1);
+                    chains.push((name.clone(), a, b, anchor_a, anchor_b, world_anchor, world_b, length, j.links as usize, radius, j.mass));
+                }
+            }
+            input.joints.push(JointInput { id: name, kind: j.kind, a, b, anchor_a, anchor_b, axis_a, axis_b, limits: j.limits, swing: j.swing, twist: j.twist, length, stiffness: j.stiffness, damping: j.damping, motor, collide: j.collide });
+        }
+        // A rope of links: capsules end to end along the line (or the
+        // hang) between its ends, a ball joint between each two and at
+        // both ends. The rope joint stays: it is what bears the load.
+        let g = set.gravity;
+        let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        let down = if gl > 1e-9 { g.map(|v| v / gl) } else { [0.0, 1.0, 0.0] };
+        for (name, a, b, anchor_a, anchor_b, from, to, length, links, radius, mass) in chains {
+            let points = rope_points(from, to, length, down, links);
+            let first = input.bodies.len();
+            for k in 0..links {
+                let (p, q) = (points[k], points[k + 1]);
+                let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+                let pose = Pose { p: [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0], q: crate::sim::quat_y_to(d.map(|v| v / l)) };
+                input.bodies.push(BodyInput {
+                    id: format!("{name}/{k}"),
+                    kind: BodyKind::Dynamic,
+                    colliders: vec![ColliderInput { shape: ShapeInput::Capsule { radius, half: (l / 2.0 - radius).max(0.0) }, local: Mat4::IDENTITY }],
+                    mass: mass.map(|m| m / links as f64),
+                    density: 1.0,
+                    friction: 0.6,
+                    bounce: 0.0,
+                    // (A cord's own stiffness: without it the links jitter.)
+                    damping: 0.2,
+                    spin_damping: 1.0,
+                    velocity: [0.0; 3],
+                    spin: [0.0; 3],
+                    ccd: false,
+                    release: 0,
+                    keyed: vec![pose],
+                    before: pose,
+                    rest: Mat4::IDENTITY,
+                    pushes: Vec::new(),
+                    group: 0,
+                    apart: std::iter::once(a).chain(b).collect(),
+                });
+                let half = [0.0, l / 2.0, 0.0];
+                let top = [0.0, -l / 2.0, 0.0];
+                let ball = |id: String, a: usize, b: Option<usize>, anchor_a: [f64; 3], anchor_b: [f64; 3]| JointInput { id, kind: JointKind::Ball, a, b, anchor_a, anchor_b, axis_a: [0.0, 1.0, 0.0], axis_b: [0.0, 1.0, 0.0], limits: None, swing: None, twist: None, length: 0.0, stiffness: 0.0, damping: 0.0, motor: None, collide: false };
+                // Its upper end to the link before (the first: to `a`).
+                match k {
+                    0 => input.joints.push(ball(format!("{name}/a"), first, Some(a), top, anchor_a)),
+                    _ => input.joints.push(ball(format!("{name}/{k}"), first + k, Some(first + k - 1), top, prev_half)),
+                }
+                prev_half = half;
+                if k + 1 == links {
+                    input.joints.push(ball(format!("{name}/b"), first + k, b, half, anchor_b));
+                }
+            }
         }
         for (b, at) in set.blasts.iter().zip(&sim.blasts) {
             input.blasts.push(BlastInput { at: *at, origin: b.origin, speed: b.speed, radius: b.radius });
@@ -581,7 +646,11 @@ pub(super) struct CRope {
     /// Content time of the simulation's start.
     start: f64,
     /// The world's end when there is no `b`, and the length at the start.
-    began: std::sync::OnceLock<([f64; 3], f64)>,
+    began: std::sync::OnceLock<([f64; 3], f64, Vec<f64>)>,
+    /// A rope of links: the bake and its links' tracks, end to end from `a`.
+    links: Option<(Arc<Bake>, Vec<usize>)>,
+    /// Content time less this is the timeline's.
+    shift: f64,
 }
 
 /// How many pieces a rope is drawn in.
@@ -590,8 +659,10 @@ const PIECES: usize = 12;
 /// Binds the joints that are drawn to their layers (layers of the scene
 /// itself, as their bodies are).
 pub(super) fn bind_ropes(layers: &mut [CLayer], sim: &CSim, shift: f64) {
-    for j in &sim.settings.joints {
+    for (n, j) in sim.settings.joints.iter().enumerate() {
         let Some(draw) = &j.draw else { continue };
+        let name = j.id.clone().unwrap_or_else(|| format!("joint{n}"));
+        let links = sim.bake.as_ref().filter(|_| j.links > 0).and_then(|b| Some((b.clone(), (0..j.links).map(|k| b.track(&format!("{name}/{k}"))).collect::<Option<Vec<usize>>>()?)));
         let at = |id: &str| layers.iter().position(|l| &*l.id == id);
         let (Some(rope), Some(a)) = (at(draw), at(&j.a)) else { continue };
         let b = j.b.as_deref().and_then(at);
@@ -601,8 +672,65 @@ pub(super) fn bind_ropes(layers: &mut [CLayer], sim: &CSim, shift: f64) {
         let g = sim.settings.gravity;
         let l = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
         let down = if l > 1e-9 { g.map(|v| v / l) } else { [0.0, 1.0, 0.0] };
-        layers[rope].rope = Some(Box::new(CRope { a, b, anchor: j.anchor, anchor_b: j.anchor_b, length: j.length, hangs: j.kind == JointKind::Rope, down, start: sim.start + shift, began: std::sync::OnceLock::new() }));
+        layers[rope].rope = Some(Box::new(CRope { a, b, anchor: j.anchor, anchor_b: j.anchor_b, length: j.length, hangs: j.kind == JointKind::Rope, down, start: sim.start + shift, began: std::sync::OnceLock::new(), links, shift }));
     }
+}
+
+/// The drawn layer's radius, for a rope of links that gives none.
+fn rope_radius(layers: &[CLayer], j: &crate::sim::Joint) -> Option<f64> {
+    let draw = j.draw.as_ref()?;
+    match &layers.iter().find(|l| &*l.id == draw.as_str())?.kind {
+        CKind::Mesh(m) => m.across(),
+        _ => None,
+    }
+}
+
+/// `links + 1` points along a rope `length` long from `a` to `b`: evenly
+/// along the line when it is taut, along the parabola it hangs in when
+/// slack.
+fn rope_points(a: [f64; 3], b: [f64; 3], length: f64, down: [f64; 3], links: usize) -> Vec<[f64; 3]> {
+    let apart = (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt();
+    let sag = crate::sim::rope_sag(length, apart);
+    let at = |s: f64| -> [f64; 3] { std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s + down[k] * sag * 4.0 * s * (1.0 - s)) };
+    if sag <= 0.5 {
+        return (0..=links).map(|k| at(k as f64 / links as f64)).collect();
+    }
+    // Even steps along the curve, by its length.
+    const FINE: usize = 512;
+    let fine: Vec<[f64; 3]> = (0..=FINE).map(|i| at(i as f64 / FINE as f64)).collect();
+    let mut along = vec![0.0; FINE + 1];
+    for i in 1..=FINE {
+        along[i] = along[i - 1] + (0..3).map(|k| (fine[i][k] - fine[i - 1][k]).powi(2)).sum::<f64>().sqrt();
+    }
+    let total = along[FINE];
+    let mut out = Vec::with_capacity(links + 1);
+    let mut i = 1;
+    for k in 0..=links {
+        let want = total * k as f64 / links as f64;
+        while i < FINE && along[i] < want {
+            i += 1;
+        }
+        let f = if along[i] > along[i - 1] { ((want - along[i - 1]) / (along[i] - along[i - 1])).clamp(0.0, 1.0) } else { 0.0 };
+        out.push(std::array::from_fn(|c| fine[i - 1][c] + (fine[i][c] - fine[i - 1][c]) * f));
+    }
+    out
+}
+
+/// The layer's y along the line from `p` to `q`, its x and z across it,
+/// stretched to reach (`long`: the mesh's own length).
+fn piece(p: [f64; 3], q: [f64; 3], long: f64) -> Option<Mat4> {
+    let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if l < 1e-9 {
+        return None;
+    }
+    let y = d.map(|v| v / l);
+    let other = if y[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let x = unit3([other[1] * y[2] - other[2] * y[1], other[2] * y[0] - other[0] * y[2], other[0] * y[1] - other[1] * y[0]]);
+    let z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    let s = l / long;
+    let m = [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0];
+    Some(Mat4([x[0], y[0] * s, z[0], m[0], x[1], y[1] * s, z[1], m[1], x[2], y[2] * s, z[2], m[2], 0.0, 0.0, 0.0, 1.0]))
 }
 
 /// What is wrong with a joint's `draw`, if anything.
@@ -641,7 +769,7 @@ impl CRope {
             let v = m.apply(p[0], p[1], p[2]);
             [v[0], v[1], v[2]]
         };
-        let (began_b, began_len) = *self.began.get_or_init(|| {
+        let (began_b, began_len, halves) = self.began.get_or_init(|| {
             // Where the bodies' keys have the ends at the simulation's start.
             let keyed = Space { keyed: true, ..*space };
             let mut fresh = vec![None; layers.len()];
@@ -650,51 +778,48 @@ impl CRope {
                 Some(b) => point(keyed.world.then(layer_matrix(layers, b, self.start, inherited, &keyed, &mut fresh)), self.anchor_b.unwrap_or([0.0; 3])),
                 None => self.anchor_b.unwrap_or(a),
             };
-            (b, (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt())
+            // Half each link's length: they start laid end to end from `a`.
+            let mut halves = Vec::new();
+            if let Some((bake, tracks)) = &self.links {
+                let mut end = a;
+                for &t in tracks {
+                    let Some(s) = bake.tracks[t].samples.first() else { break };
+                    let c = [s[0] as f64, s[1] as f64, s[2] as f64];
+                    halves.push((0..3).map(|k| (c[k] - end[k]).powi(2)).sum::<f64>().sqrt());
+                    end = std::array::from_fn(|k| 2.0 * c[k] - end[k]);
+                }
+            }
+            (b, (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt(), halves)
         });
+        let (began_b, began_len) = (*began_b, *began_len);
         let a = point(space.world.then(layer_matrix(layers, self.a, tc, inherited, space, cache)), self.anchor);
         let b = match self.b {
             Some(b) => point(space.world.then(layer_matrix(layers, b, tc, inherited, space, cache)), self.anchor_b.unwrap_or([0.0; 3])),
             None => began_b,
         };
         let apart = (0..3).map(|k| (b[k] - a[k]).powi(2)).sum::<f64>().sqrt();
-        // The sag of a parabola as long as the rope between ends this far
-        // apart (found by halving: its length grows with its sag).
-        let length = self.length.unwrap_or(began_len);
-        let long_with = |sag: f64| {
-            let a = 4.0 * sag / apart.max(1e-9);
-            if a < 1e-9 { apart } else { apart * (0.5 * (1.0 + a * a).sqrt() + crate::dm::ln(a + (1.0 + a * a).sqrt()) / (2.0 * a)) }
-        };
-        let sag = if self.hangs && length > apart {
-            let (mut lo, mut hi) = (0.0, length / 2.0);
-            for _ in 0..40 {
-                let mid = (lo + hi) / 2.0;
-                if long_with(mid) < length { lo = mid } else { hi = mid }
+        // A rope of links: from joint to joint, as the bake has its links.
+        if let (Some((bake, tracks)), false) = (&self.links, space.keyed) {
+            let x = bake.position(tc - self.shift);
+            let ends: Vec<([f64; 3], [f64; 3])> = tracks.iter().zip(halves).filter_map(|(&t, &half)| {
+                let pose = bake.tracks[t].pose(x)?;
+                Some((pose.apply([0.0, -half, 0.0]), pose.apply([0.0, half, 0.0])))
+            }).collect();
+            if ends.len() == tracks.len() && !ends.is_empty() {
+                let mut joints = Vec::with_capacity(ends.len() + 1);
+                joints.push(a);
+                for w in ends.windows(2) {
+                    joints.push(std::array::from_fn(|k| (w[0].1[k] + w[1].0[k]) / 2.0));
+                }
+                joints.push(b);
+                return joints.windows(2).filter_map(|w| piece(w[0], w[1], long)).collect();
             }
-            lo
-        } else {
-            0.0
-        };
+        }
+        let length = self.length.unwrap_or(began_len);
+        let sag = if self.hangs { crate::sim::rope_sag(length, apart) } else { 0.0 };
         let pieces = if sag > 0.5 { PIECES } else { 1 };
         let at = |s: f64| -> [f64; 3] { std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s + self.down[k] * sag * 4.0 * s * (1.0 - s)) };
-        (0..pieces)
-            .filter_map(|i| {
-                let (p, q) = (at(i as f64 / pieces as f64), at((i + 1) as f64 / pieces as f64));
-                let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
-                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                if l < 1e-9 {
-                    return None;
-                }
-                // The layer's y along the piece, its x and z across it.
-                let y = d.map(|v| v / l);
-                let other = if y[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
-                let x = unit3([other[1] * y[2] - other[2] * y[1], other[2] * y[0] - other[0] * y[2], other[0] * y[1] - other[1] * y[0]]);
-                let z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
-                let s = l / long;
-                let m = [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0];
-                Some(Mat4([x[0], y[0] * s, z[0], m[0], x[1], y[1] * s, z[1], m[1], x[2], y[2] * s, z[2], m[2], 0.0, 0.0, 0.0, 1.0]))
-            })
-            .collect()
+        (0..pieces).filter_map(|i| piece(at(i as f64 / pieces as f64), at((i + 1) as f64 / pieces as f64), long)).collect()
     }
 }
 

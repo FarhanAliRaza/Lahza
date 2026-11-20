@@ -89,7 +89,9 @@ wall = {
     "environment": {"preset": "night", "intensity": 0.8},
     "simulation": {"joints": [
         # The ball hangs from a point above the wall by a rope.
-        {"id": "rope", "type": "rope", "a": "wrecker", "b": None, "anchor_b": [W / 2 - 60, 60, 0], "length": 440, "draw": "cord"},
+        {"id": "rope", "type": "rope", "a": "wrecker", "b": None, "anchor_b": [W / 2 - 60, 60, 0], "length": 440, "draw": "cord",
+         # Sixteen bodies end to end: it swings, and lies on what it meets.
+         "links": 16},
     ]},
     "layers": [dict(floor(), id="floor2", material={"preset": "matte", "color": "#2a3040"})] + [
         {"id": f"b{r}-{c}", "kind": "mesh",

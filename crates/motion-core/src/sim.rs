@@ -92,6 +92,9 @@ fn is_rate(v: &f64) -> bool {
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
 fn is_zero_f(v: &f64) -> bool {
     *v == 0.0
 }
@@ -340,6 +343,17 @@ pub struct Joint {
     /// anchor, a rope in pieces that hang by the slack it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<String>,
+    /// Rope: made of this many bodies (capsules jointed end to end, baked
+    /// as `<joint>/<n>`) that swing, whip and lie on what is between its
+    /// ends. 0: no bodies, a curve drawn between the ends (cheap).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub links: u32,
+    /// Rope with `links`: its radius, px (default: the drawn layer's, else
+    /// 4), and its mass in all, kg (default: as water).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mass: Option<f64>,
 }
 
 fn axis_z() -> [f64; 3] {
@@ -813,6 +827,37 @@ fn norm(v: [f64; 3]) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
+/// The turn that takes y to `d` (unit).
+pub fn quat_y_to(d: [f64; 3]) -> [f64; 4] {
+    let c = d[1];
+    if c < -1.0 + 1e-9 {
+        return [1.0, 0.0, 0.0, 0.0];
+    }
+    let axis = cross([0.0, 1.0, 0.0], d);
+    let q = [axis[0], axis[1], axis[2], 1.0 + c];
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    q.map(|v| v / n)
+}
+
+/// How far a rope `length` long sags between ends `apart` from each
+/// other: the depth of the parabola as long as it (found by halving: its
+/// length grows with its sag). 0 when it is taut.
+pub fn rope_sag(length: f64, apart: f64) -> f64 {
+    if length <= apart {
+        return 0.0;
+    }
+    let long_with = |sag: f64| {
+        let a = 4.0 * sag / apart.max(1e-9);
+        if a < 1e-9 { apart } else { apart * (0.5 * (1.0 + a * a).sqrt() + crate::dm::ln(a + (1.0 + a * a).sqrt()) / (2.0 * a)) }
+    };
+    let (mut lo, mut hi) = (0.0, length / 2.0);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if long_with(mid) < length { lo = mid } else { hi = mid }
+    }
+    lo
+}
+
 /// A rotation matrix's quaternion (columns `c`: orthonormal, right-handed).
 fn quat_from_columns(c: [[f64; 3]; 3]) -> [f64; 4] {
     // m[r][k] = c[k][r].
@@ -1257,6 +1302,8 @@ pub struct BodyInput {
     /// Bodies of one group (a ragdoll's bones) never collide with the
     /// bone they are jointed to; 0 is no group.
     pub group: u32,
+    /// Bodies it never touches (a rope's link: the two it is tied to).
+    pub apart: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1533,6 +1580,11 @@ impl SimInput {
                 h.fs(&p.velocity);
                 h.fs(&p.spin);
                 h.opt(p.point.as_ref().map(|v| &v[..]));
+            }
+            // (Only where there are any: older bakes keep their hash.)
+            if !b.apart.is_empty() {
+                h.str("apart");
+                h.fs(&b.apart.iter().map(|&i| i as f64).collect::<Vec<_>>());
             }
         }
         h.u64(self.joints.len() as u64);

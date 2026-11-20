@@ -432,3 +432,99 @@ fn every_copy_of_an_instancer_is_a_body_of_its_own() {
     assert!(e.contains("brick.body: a layer inside an emitter"), "{e}");
     assert_eq!(crate::behaviour_tests::pin(&bake), (25353, 2539571057427851888), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
+
+/// A ball on 400 px of rope tied at (600, 200), let go level with the tie;
+/// a bar across its swing when `bar`.
+fn roped(links: u32, bar: bool, mass: f64) -> Project {
+    let mut layers = vec![
+        json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "transform": {"position": [1000, 200]}, "body": {"mass": mass}}),
+        json!({"id": "cord", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 4, "height": 50}, "transform": {"position": [100, 900]}}),
+    ];
+    if bar {
+        layers.push(json!({"id": "bar", "kind": "mesh", "mesh": {"type": "cylinder", "radius": 20, "height": 300}, "transform": {"position": [600, 400], "rotation_x": 90}, "body": {"type": "fixed"}}));
+    }
+    project(json!({"id": "s1", "simulation": {"joints": [{"id": "rope", "type": "rope", "a": "ball", "anchor_b": [600, 200, 0], "length": 400, "draw": "cord", "links": links}]}, "layers": layers}), 4.0)
+}
+
+#[test]
+fn a_rope_of_links_swings_and_lies_on_what_it_meets() {
+    use lahza_motion_core::compile::Content;
+    let tie = [600.0, 200.0, 0.0];
+    let far = |a: [f64; 3], b: [f64; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+    // What a take was: the rope's length joint to joint at its longest,
+    // how deep a link's middle got into the bar, and the ball's path.
+    let take = |links: u32, bar: bool, mass: f64| {
+        let mut p = roped(links, bar, mass);
+        let bake = baked(&mut p);
+        let n = bake.tracks[0].samples.len();
+        let pt = |id: &str, k: usize| {
+            let s = at(&bake, id, k);
+            [s[0] as f64, s[1] as f64, s[2] as f64]
+        };
+        let (mut longest, mut inside) = (0.0f64, f64::MIN);
+        for k in 0..n {
+            // (Link 0 is at the ball; a link's middle to the next's is a
+            // link's length when the joint between them holds.)
+            let mut long = 25.0;
+            let mut prev = pt("ball", k);
+            for l in 0..links {
+                let c = pt(&format!("rope/{l}"), k);
+                if l > 0 {
+                    long += far(prev, c);
+                }
+                prev = c;
+                inside = inside.max(24.0 - (c[0] - 600.0).hypot(c[1] - 400.0));
+            }
+            longest = longest.max(long);
+            assert!(far(pt("ball", k), tie) < 401.0, "the rope let the ball {:.1} px from its tie", far(pt("ball", k), tie));
+        }
+        let ball: Vec<[f64; 3]> = (0..n).map(|k| pt("ball", k)).collect();
+        (p, bake, longest, inside, ball)
+    };
+    // Nothing in its way: it swings through to the other side, and the
+    // links stay end to end (the rope is 400 px; 16 links of 25).
+    let (p, bake, longest, _, ball) = take(16, false, 5.0);
+    assert!(ball.iter().any(|b| b[0] < 300.0), "it swings to the left of its tie");
+    assert!(longest < 404.0, "its links came apart: {longest:.1} px joint to joint");
+    // It is drawn link by link, from the ball to the tie, each piece
+    // beginning where the last ended.
+    let c = Compiled::new(&p);
+    for t in [0.0, 0.5, 1.3] {
+        let frame = c.frame(t);
+        let pieces: Vec<([f64; 3], [f64; 3])> = frame.layers.iter().filter(|l| l.id.starts_with("cord")).map(|l| {
+            let Content::Mesh(m) = &l.content else { panic!() };
+            let w = m.world.0;
+            ([w[3], w[7], w[11]], [w[1] * 25.0, w[5] * 25.0, w[9] * 25.0])
+        }).collect();
+        assert_eq!(pieces.len(), 16);
+        let m = bake.world(bake.track("ball").unwrap(), t).unwrap().0;
+        let (begin, end): ([f64; 3], [f64; 3]) = (std::array::from_fn(|k| pieces[0].0[k] - pieces[0].1[k]), std::array::from_fn(|k| pieces[15].0[k] + pieces[15].1[k]));
+        assert!(far(begin, [m[3], m[7], m[11]]) < 1e-6 && far(end, tie) < 1e-6, "at {t}: from {begin:?} to {end:?}");
+        for w in pieces.windows(2) {
+            let (end, begin): ([f64; 3], [f64; 3]) = (std::array::from_fn(|k| w[0].0[k] + w[0].1[k]), std::array::from_fn(|k| w[1].0[k] - w[1].1[k]));
+            assert!(far(end, begin) < 1e-6);
+        }
+        // A link's piece lies on its link (the middle link, mid-swing).
+        let link = bake.world(bake.track("rope/8").unwrap(), t).unwrap().0;
+        assert!(far(pieces[8].0, [link[3], link[7], link[11]]) < 2.0, "at {t}");
+    }
+    // A bar across its swing, 200 px under the tie: the rope lies on it
+    // and the ball is wound round it, where the drawn curve (no links)
+    // swings on through.
+    let (_, wound, longest, inside, ball) = take(16, true, 5.0);
+    assert!(inside < 1.0, "a link is {inside:.1} px inside the bar");
+    assert!(longest < 404.0, "{longest:.1}");
+    let end = ball[ball.len() - 1];
+    assert!(far(end, [600.0, 400.0, 0.0]) < 120.0 && ball[45..].iter().all(|b| b[0] > 450.0), "the ball ends at {end:?}");
+    let through = baked(&mut roped(0, true, 5.0));
+    assert!(through.tracks.len() == 1 && through.tracks[0].samples.iter().any(|s| s[0] < 300.0));
+    // A heavier ball presses the rope into the bar: 50 kg by 2 px, 500 kg
+    // by 12 (a link is light beside it, and the solver's passes are few).
+    let (_, _, _, inside, _) = take(16, true, 50.0);
+    assert!(inside < 4.0, "{inside:.1}");
+    // Only ropes have links.
+    let mut spring = serde_json::to_value(&roped(4, false, 5.0).scenes[0]).unwrap();
+    spring["simulation"]["joints"][0]["type"] = json!("spring");
+    assert!(Compiled::new(&project(spring, 1.0)).sim_input(0, None).1.join("\n").contains("joints.0.links: only a rope is made of links"));
+    assert_eq!(crate::behaviour_tests::pin(&wound), (61580, 11416658259355396517), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}

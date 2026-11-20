@@ -48,12 +48,20 @@ pub struct Rig {
 /// without the body in its way, and goes as it did before bones met. A
 /// collider's `user_data` is its group, and above 32 bits its bone's
 /// index plus one.
-pub(crate) struct Groups<'a>(pub &'a [Vec<bool>], pub &'a [Vec<bool>]);
+pub(crate) struct Groups<'a>(pub &'a [Vec<bool>], pub &'a [Vec<bool>], pub &'a std::collections::BTreeSet<(u32, u32)>);
 
 impl PhysicsHooks for Groups<'_> {
     fn filter_contact_pair(&self, c: &PairFilterContext) -> Option<SolverFlags> {
         let (a, b) = (c.colliders[c.collider1].user_data, c.colliders[c.collider2].user_data);
         let (ga, gb) = (a as u32, b as u32);
+        if !self.2.is_empty() {
+            if let (Some(x), Some(y)) = (c.rigid_body1, c.rigid_body2) {
+                let (x, y) = (x.into_raw_parts().0, y.into_raw_parts().0);
+                if self.2.contains(&(x.min(y), x.max(y))) {
+                    return None;
+                }
+            }
+        }
         if ga == 0 || ga != gb {
             return Some(SolverFlags::default());
         }

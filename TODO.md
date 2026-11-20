@@ -766,16 +766,30 @@ ONNX Runtime is x86-64 only. Not run: a real ARM machine. In the order built:
      `body` inside one is a body a copy, `<layer>#<n>` in the bake, in
      joints and in events; tested: a tipped grid of six bricks falls as
      six and is drawn where the bake has each; pinned).
+   - A rope of links (`joints[].links`: that many capsules end to end,
+     a ball joint between each two and at both ends, baked as
+     `<joint>/<n>` and drawn joint to joint with the `draw` layer; the
+     curve without `links` stays the cheap choice). The rope joint is
+     kept beside the chain and bears the load, so what hangs is never
+     farther than the rope is long; links never touch the two bodies the
+     rope is tied to, and scenes with one take 12 solver passes. Tested:
+     a 5 kg ball on 400 px of rope in 16 links swings through and its
+     links stay end to end (under 404 px joint to joint); with a bar
+     across its swing the rope lies on the bar and the ball is wound
+     round it (no link's middle more than 1 px inside the bar), where
+     the drawn curve swings on through. A heavier ball presses the rope
+     into the bar: 2 px at 50 kg, 12 px at 500 kg (a link is light
+     beside it). Pinned. `tumble.py`'s wall uses it (looked at: it sags
+     a little by its own weight while held, bends on the brick it meets
+     and whips after the hit); 16 links add nothing that shows to the
+     bake's time (48 bodies, 0.25 s).
    - Left, needing what is not here: Slang-generated meshes as
      colliders (their points come from `slangc`, which this machine has
      not; the code path is the hull of a generated mesh, untried).
    - Left, not done (nothing outside is needed, only the work): a box
      landing flat at speed tips a degree or two before settling
      (rapier's contact solver; more iterations do not change it, and
-     another solver was not tried). A drawn rope hangs still: its slack
-     does not swing or whip, and it passes through what is between its
-     ends (it is a curve drawn between two bodies, not a chain of them).
-     No bodies inside an emitter (its particles come and go) nor two
+     another solver was not tried). No bodies inside an emitter (its particles come and go) nor two
      instancers deep; a ragdoll's or a crowd's layers cannot be copies.
 2. **Skeletons and skinning: done.**
    - `model_import` keeps a glTF skin: a joint node is a comp like any

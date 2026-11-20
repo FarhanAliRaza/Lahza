@@ -76,6 +76,9 @@ pub struct World {
     pub(crate) before: Vec<Vector>,
     /// Pairs of bodies touching after the last step (for first touches).
     touching: std::collections::BTreeSet<(u32, u32)>,
+    /// Pairs of bodies (by handle) that never touch: a rope's links and
+    /// what it is tied to.
+    pub(crate) apart: std::collections::BTreeSet<(u32, u32)>,
     pub events: Vec<SimEvent>,
 }
 
@@ -158,8 +161,8 @@ impl World {
         let mut w = PhysicsWorld::default();
         w.gravity = v3(input.gravity, 1.0);
         w.integration_parameters.dt = dt as f32;
-        // Chains of joints (a spine, a leg) want more passes to hold.
-        if !input.ragdolls.is_empty() {
+        // Chains of joints (a spine, a leg, a rope) want more passes to hold.
+        if !input.ragdolls.is_empty() || input.bodies.iter().any(|b| !b.apart.is_empty()) {
             w.integration_parameters.num_solver_iterations = 12;
         }
         let anchor = w.insert_body(RigidBodyBuilder::fixed());
@@ -199,7 +202,7 @@ impl World {
             };
             for mut c in made {
                 c.set_density(density);
-                if b.group != 0 {
+                if b.group != 0 || !b.apart.is_empty() {
                     c.user_data = b.group as u128;
                     c.set_active_hooks(ActiveHooks::FILTER_CONTACT_PAIRS);
                 }
@@ -212,7 +215,14 @@ impl World {
             handles.push(h);
             released.push(b.kind == BodyKind::Dynamic && b.release == 0);
         }
-        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), touch: Vec::new(), free: Vec::new(), before: Vec::new(), touching: Default::default(), events: Vec::new() };
+        let mut apart = std::collections::BTreeSet::new();
+        for (i, b) in input.bodies.iter().enumerate() {
+            for &o in &b.apart {
+                let (x, y) = (handles[i].into_raw_parts().0, handles[o].into_raw_parts().0);
+                apart.insert((x.min(y), x.max(y)));
+            }
+        }
+        let mut world = World { w, unit, handles, anchor, ground, released, joints: Vec::new(), dt, rigs: Vec::new(), touch: Vec::new(), free: Vec::new(), before: Vec::new(), touching: Default::default(), apart, events: Vec::new() };
         for (i, b) in input.bodies.iter().enumerate() {
             if world.released[i] {
                 world.release(input, i, b);
@@ -390,7 +400,7 @@ impl World {
     pub fn step(&mut self, input: &SimInput, t: f64) {
         let before: Vec<Vector> = self.handles.iter().map(|h| self.w.bodies[*h].linvel()).collect();
         self.before = before.clone();
-        self.w.step_with_events(&crate::ragdoll::Groups(&self.touch, &self.free), &());
+        self.w.step_with_events(&crate::ragdoll::Groups(&self.touch, &self.free, &self.apart), &());
         let mut now = std::collections::BTreeSet::new();
         let index = |h: Option<RigidBodyHandle>| h.and_then(|h| self.handles.iter().position(|x| *x == h).map(|i| i as u32 + 1).or((Some(h) == self.ground).then_some(0)));
         for pair in self.w.contact_pairs() {
@@ -400,7 +410,9 @@ impl World {
             let (a, b) = (index(self.w.colliders[pair.collider1].parent()), index(self.w.colliders[pair.collider2].parent()));
             if let (Some(a), Some(b)) = (a, b) {
                 let group = |i: u32| if i == 0 { 0 } else { input.bodies[i as usize - 1].group };
-                if a != b && (group(a) == 0 || group(a) != group(b)) {
+                // (A rope's links on each other are no event.)
+                let link = |i: u32| i != 0 && !input.bodies[i as usize - 1].apart.is_empty();
+                if a != b && (group(a) == 0 || group(a) != group(b)) && !(link(a) && link(b)) {
                     now.insert((a.min(b), a.max(b)));
                 }
             }
@@ -433,7 +445,7 @@ impl World {
         w.impulse_joints = self.w.impulse_joints.clone();
         w.multibody_joints = self.w.multibody_joints.clone();
         w.ccd_solver = self.w.ccd_solver.clone();
-        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), touch: self.touch.clone(), free: self.free.clone(), before: self.before.clone(), touching: self.touching.clone(), events: Vec::new() }
+        World { w, unit: self.unit, handles: self.handles.clone(), anchor: self.anchor, ground: self.ground, released: self.released.clone(), joints: self.joints.clone(), dt: self.dt, rigs: self.rigs.clone(), touch: self.touch.clone(), free: self.free.clone(), before: self.before.clone(), touching: self.touching.clone(), apart: self.apart.clone(), events: Vec::new() }
     }
 
     /// Body `i`'s pose now, px.

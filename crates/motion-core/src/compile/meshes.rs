@@ -1084,6 +1084,16 @@ impl CMesh {
         matches!(self.shape, CMeshShape::Cylinder(..) | CMeshShape::Capsule(..) | CMeshShape::Box(..))
     }
 
+    /// A cylinder's or capsule's radius, half a box's width: how thick a
+    /// rope drawn with it is (at the layer's start).
+    pub(super) fn across(&self) -> Option<f64> {
+        match &self.params_at(0.0, 1.0).shape {
+            MeshShape::Cylinder { radius, .. } | MeshShape::Capsule { radius, .. } => Some(*radius),
+            MeshShape::Box { size, .. } => Some(size[0] / 2.0),
+            _ => None,
+        }
+    }
+
     pub(super) fn params_at(&self, t: f64, screen: f64) -> Arc<MeshParams> {
         let path = |(paths, index): &(Vec<Arc<str>>, Prop<f64>)| path_morph(paths, index.at(t));
         let shape = match &self.shape {
