@@ -864,7 +864,11 @@ coordinating session. In the order built:
      by a force, not a leg that swings; getting up is a pose sequence
      under an outside force, not a body that finds its feet (its feet
      stay where they lay and it is drawn over them; it does not step to
-     them), and it gets up the one way, front down;
+     them). It gets up from its front, or from its back (`way`: it sits
+     up over its folded legs; from all four falls with `near` on the
+     standing test figure, pinned), but from its back it is less sure:
+     in `ragdoll.py`'s `sit` scene, on the walking clip, it stands at
+     5.2 s and falls backwards again at 7.0 s;
      no behaviour looks where it is going. Feet and hands are found by
      bone name (`foot`, `hand`, `head`).
 5. **Directing it: done as far as the tools go.** Intent is written on

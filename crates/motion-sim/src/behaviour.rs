@@ -121,6 +121,8 @@ struct Rise {
     up: [f64; 4],
     /// Newton-seconds the outside force has pushed up with so far.
     lifted: f64,
+    /// It gets up from its back (no roll first).
+    on_back: bool,
 }
 
 fn arms_aimed(drive: &Drive, aimed: &[Option<[f64; 4]>], bone: usize) -> bool {
@@ -313,10 +315,19 @@ impl Brain {
                         if len(vel) < 0.3 * stand {
                             let since = *self.still_since.get_or_insert(t);
                             if t - since >= param(b, "wait", 0.8) {
-                                // Up again it faces the way its head lies.
-                                let lying = unit(flat(trunk)).unwrap_or(quat_rotate(stood.q, stood.front));
+                                // Which way up: from its front (rolling onto it
+                                // first), from its back (sitting up), or
+                                // whichever it lies nearer.
+                                let on_back = match b.params.get("way").and_then(|w| w.as_str()) {
+                                    Some("back") => true,
+                                    Some("near") => dot(quat_rotate(hips.q, stood.front), up) > 0.0,
+                                    _ => false,
+                                };
+                                // Up again it faces the way its head lies
+                                // (from its back: the way its feet do).
+                                let lying = unit(flat(trunk)).map(|v| if on_back { mul(v, -1.0) } else { v }).unwrap_or(quat_rotate(stood.q, stood.front));
                                 let faced = unit(flat(quat_rotate(stood.q, stood.front))).unwrap_or(lying);
-                                self.rising = Some(Rise { start: t, q: hips.q, low: dot(sub(hips.p, support), up), up: quat_mul(arc(faced, lying), stood.q), lifted: 0.0 });
+                                self.rising = Some(Rise { start: t, q: hips.q, low: dot(sub(hips.p, support), up), up: quat_mul(arc(faced, lying), stood.q), lifted: 0.0, on_back });
                                 self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "get_up".into(), a: r.id.clone(), b: String::new(), speed: 0.0 });
                             }
                         } else {
@@ -339,7 +350,8 @@ impl Brain {
                         let down = mul(up, -1.0);
                         let front = quat_rotate(hips.q, stood.front);
                         // Onto its front first (a quarter of the time at most).
-                        let rolling = f < 0.25 && dot(front, down) < 0.6 && dot(trunk, up).abs() < 0.7;
+                        let (toward, side_up) = if rise.on_back { (up, dot(front, up)) } else { (down, dot(front, down)) };
+                        let rolling = f < 0.25 && side_up < 0.6 && dot(trunk, up).abs() < 0.7;
                         // Then: pushed up and folded by 0.6, standing by 1.
                         let (push, stand_up) = if rolling { (0.0, 0.0) } else { (smooth((f - 0.2) / 0.35), smooth((f - 0.55) / 0.45)) };
                         let rb = &mut world.w.bodies[world.handles[r.bones[0].body]];
@@ -349,8 +361,8 @@ impl Brain {
                         let inertia = mass * lever * lever * 0.2;
                         let torque = if rolling {
                             // About its length, the short way round to face down.
-                            let way = dot(cross(front, down), trunk);
-                            let side = if way.abs() < 0.05 && dot(front, down) < 0.0 { 1.0 } else { way.signum() };
+                            let way = dot(cross(front, toward), trunk);
+                            let side = if way.abs() < 0.05 && side_up < 0.0 { 1.0 } else { way.signum() };
                             mul(trunk, (side * 14.0 - dot(spin, trunk) * 4.0) * inertia)
                         } else {
                             // Toward upright by the time it stands.

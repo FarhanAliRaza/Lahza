@@ -579,7 +579,8 @@ pub enum BehaviourKind {
     /// seconds it rolls onto its front, pushes up, draws its legs under
     /// it and stands, in `time` seconds. An outside force on its hips of
     /// at most `help` × its weight (and the torque that would make)
-    /// lifts and rights it. Params: `wait`, `time`, `help`.
+    /// lifts and rights it. Params: `wait`, `time`, `help`, `way`
+    /// ("front", "back": it sits up instead, or "near").
     GetUp,
 }
 

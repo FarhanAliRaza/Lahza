@@ -13,6 +13,8 @@ it walking on the spot until a ball strikes it at 0.87 s:
            about the head as the ball comes
   rise   — balance and get_up: knocked flat by a blow to the chest, it
            lies still, rolls onto its front, pushes up and stands
+  sit    — the same, getting up from its back (`way: back`): it sits up
+           over its folded legs and stands
 
 then bakes, checks, and writes a contact sheet per scene (the CPU renderer
 unless GPU=1). RENDER=1 writes an MP4 too.
@@ -96,6 +98,9 @@ SCENES = [
     ("rise", {"strength": 1, "behaviours": [{"type": "balance"}, {"type": "get_up"}],
               "hits": [{"at": 1.05, "bone": "chest", "velocity": [-1400, 0, 0]}]},
      9.0, (0.9, 1.3, 1.8, 3.0, 3.6, 4.0, 4.4, 4.8, 5.2, 5.6, 6.2, 8.5)),
+    ("sit", {"strength": 1, "behaviours": [{"type": "balance"}, {"type": "get_up", "params": {"way": "back"}}],
+             "hits": [{"at": 1.05, "bone": "chest", "velocity": [-1400, 0, 0]}]},
+     9.0, (1.8, 3.0, 3.4, 3.8, 4.2, 4.6, 5.0, 5.4, 6.2, 8.5)),
 ]
 
 os.makedirs(OUT, exist_ok=True)
