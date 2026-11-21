@@ -817,6 +817,24 @@ pub struct CrowdGuard {
     /// default: every bone). Leave the legs out and they walk on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bones: Vec<String>,
+    /// More poses, each for what comes from its own side: an agent takes
+    /// the one whose `from` is nearest where the thing comes from (`pose`
+    /// itself is for what comes from ahead). A duck for what comes from
+    /// behind, a lean and a look for each side: the head is a bone like
+    /// the rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poses: Vec<GuardPose>,
+}
+
+/// One of a guard's poses: the character at `pose` (a time of its own
+/// keys), for a thing that comes from `from` degrees round from straight
+/// ahead of the agent, to its right (90: from its right, 180: behind).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardPose {
+    pub pose: TimeRef,
+    #[serde(default)]
+    pub from: f64,
 }
 
 /// How a crowd's agents are made ragdolls (`Ragdoll`'s fields of the same
@@ -1096,7 +1114,8 @@ pub struct HerdTrack {
     pub down: Vec<u32>,
     pub slot: Vec<u32>,
     /// Per sample, per agent, when the crowd has a guard: how far it has
-    /// taken its guard's pose (0..1). Empty otherwise.
+    /// taken its guard's pose (0..1), plus twice which of the guard's
+    /// poses it is (0: the first). Empty otherwise.
     pub guard: Vec<f32>,
     /// When one got up again, or a ragdoll of the pool was used twice:
     /// every fall as (agent, the sample from which it is down, the sample
@@ -1118,13 +1137,26 @@ impl HerdTrack {
 
     /// How far agent `k` has its guard up at sample position `x` (0..1).
     pub fn guard_at(&self, k: usize, x: f64) -> f64 {
+        self.guard_of(k, x).1
+    }
+
+    /// Which of its guard's poses agent `k` has at sample position `x`,
+    /// and how far up (0..1).
+    pub fn guard_of(&self, k: usize, x: f64) -> (usize, f64) {
         let n = self.count as usize;
-        let Some(last) = (self.guard.len() / n.max(1)).checked_sub(1) else { return 0.0 };
+        let Some(last) = (self.guard.len() / n.max(1)).checked_sub(1) else { return (0, 0.0) };
         let x = x.clamp(0.0, last as f64);
         let i = (x.floor() as usize).min(last);
         let j = (i + 1).min(last);
-        let (a, b) = (self.guard[i * n + k] as f64, self.guard[j * n + k] as f64);
-        a + (b - a) * (x - i as f64)
+        // (A sample is twice the pose and how far: 0..1, 2..3, …)
+        let split = |v: f32| {
+            let pose = ((v as f64 / 2.0).floor().max(0.0)) as usize;
+            (pose, v as f64 - 2.0 * pose as f64)
+        };
+        let ((pa, a), (pb, b)) = (split(self.guard[i * n + k]), split(self.guard[j * n + k]));
+        // (A pose is changed only with the guard down: one side of a change is 0.)
+        let pose = if a > 0.0 { pa } else { pb };
+        (pose, a + (b - a) * (x - i as f64))
     }
 
     pub fn len(&self) -> usize {
@@ -1645,6 +1677,11 @@ pub struct CrowdInput {
     /// place in the agent's frame in the guard's pose, and whether the
     /// pose takes it (one knocked down with its guard up falls from it).
     pub guard_pose: Vec<(Pose, bool)>,
+    /// A guard's other poses: where each is for a thing coming from
+    /// (radians round from ahead, to the agent's right), and each as
+    /// `guard_pose`.
+    pub guard_from: Vec<f64>,
+    pub guard_more: Vec<Vec<(Pose, bool)>>,
 }
 
 /// Everything a bake is made from: the document's simulation resolved to
@@ -1894,6 +1931,14 @@ impl SimInput {
             if let Some(ahead) = c.guard {
                 h.str("guard");
                 h.f(ahead);
+            }
+            if !c.guard_from.is_empty() {
+                h.str("guard poses");
+                h.fs(&c.guard_from);
+                for (p, takes) in c.guard_more.iter().flatten() {
+                    h.pose(p);
+                    h.u64(*takes as u64);
+                }
             }
             if !c.guard_pose.is_empty() {
                 h.str("guard pose");

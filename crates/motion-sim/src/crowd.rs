@@ -32,8 +32,10 @@ struct Agent {
     /// (none: straight there), and the body it last stepped aside from.
     path: Vec<[f64; 2]>,
     dodged: Option<usize>,
-    /// How far its guard is up (0..1), and until when it holds it.
+    /// How far its guard is up (0..1), which of its guard's poses it
+    /// is, and until when it holds it.
     guard: f64,
+    pose: usize,
     wary: f64,
     /// In a try ahead: too far from what is tried to matter; it stands.
     idle: bool,
@@ -399,6 +401,7 @@ impl Herd {
                     path: Vec::new(),
                     dodged: None,
                     guard: 0.0,
+                    pose: 0,
                     wary: f64::NEG_INFINITY,
                     idle: false,
                     now,
@@ -434,7 +437,7 @@ impl Herd {
         let agents = self.agents.iter().zip(&input.crowds).map(|(herd, c)| {
             let range = 2.0 * (2.2 * c.speed * horizon + 8.0 * c.radius);
             herd.iter().map(|a| Agent {
-                at: a.at, vel: a.vel, heading: a.heading, speed: a.speed, walked: a.walked, phase: a.phase, down: a.down, fell: a.fell, fall: a.fall, proxy: a.proxy, path: a.path.clone(), dodged: a.dodged, guard: a.guard, wary: a.wary,
+                at: a.at, vel: a.vel, heading: a.heading, speed: a.speed, walked: a.walked, phase: a.phase, down: a.down, fell: a.fell, fall: a.fall, proxy: a.proxy, path: a.path.clone(), dodged: a.dodged, guard: a.guard, pose: a.pose, wary: a.wary,
                 idle: a.idle || near.is_some_and(|near| !near.iter().any(|p| len2([p[0] - a.at[0], p[1] - a.at[1]]) < range)),
                 now: a.now, next: a.next,
                 track: Track { id: String::new(), from: 0, rest: a.track.rest, samples: Vec::new(), clock: Vec::new() },
@@ -553,7 +556,7 @@ impl Herd {
                 } else if c.instanced {
                     self.rows[n].push([a.now.p[0] as f32, a.now.p[2] as f32, turn(c, k, a.heading) as f32, Self::clock(c, a) as f32]);
                     if c.guard.is_some() {
-                        self.guards[n].push(a.guard as f32);
+                        self.guards[n].push((2 * a.pose) as f32 + a.guard as f32);
                     }
                 } else {
                     a.track.samples.push(sample_of(&a.now));
@@ -669,6 +672,9 @@ impl Herd {
                 // guard's time: its guard goes up.)
                 let ahead = c.guard.unwrap_or(0.0);
                 let mut threatened = false;
+                // (The soonest of them, and where it comes from: round
+                // from ahead to the agent's right.)
+                let mut soonest: Option<(f64, f64)> = None;
                 if c.dodge > 0.0 || ahead > 0.0 {
                     for b in blocks.iter().chain(&lying).filter(|b| !b.fixed) {
                         let rel = [b.vel[0] - a.vel[0], b.vel[1], b.vel[2] - a.vel[1]];
@@ -692,6 +698,10 @@ impl Herd {
                             continue;
                         }
                         threatened |= when <= ahead;
+                        if when <= ahead && soonest.is_none_or(|s| when < s.0) {
+                            let right = [-a.heading[1], a.heading[0]];
+                            soonest = Some((when, libm::atan2(p[0] * right[0] + p[1] * right[1], p[0] * a.heading[0] + p[1] * a.heading[1])));
+                        }
                         if when > c.dodge {
                             continue;
                         }
@@ -713,6 +723,15 @@ impl Herd {
                 if c.guard.is_some() {
                     if threatened {
                         a.wary = t + 0.5;
+                    }
+                    // With its guard down it takes the pose for where
+                    // the thing comes from: the nearest round.
+                    if let (Some((_, from)), true) = (soonest, a.guard <= 0.0) {
+                        let off = |at: f64| {
+                            let d = (from - at).rem_euclid(std::f64::consts::TAU);
+                            d.min(std::f64::consts::TAU - d)
+                        };
+                        a.pose = (0..=c.guard_from.len()).min_by(|x, y| off(if *x == 0 { 0.0 } else { c.guard_from[*x - 1] }).total_cmp(&off(if *y == 0 { 0.0 } else { c.guard_from[*y - 1] }))).unwrap_or(0);
                     }
                     a.guard = if t < a.wary { (a.guard + dt / 0.16).min(1.0) } else { (a.guard - dt / 0.5).max(0.0) };
                 }
@@ -915,11 +934,12 @@ impl Herd {
                 between(&l[i], &l[(i + 1).min(l.len() - 1)], at - i as f64)
             }).collect();
             let mut stand: Vec<Pose> = walk.clone();
-            if c.instanced && agent.guard > 0.0 && c.guard_pose.len() == bones.len() {
+            let guard = if agent.pose == 0 { Some(&c.guard_pose) } else { c.guard_more.get(agent.pose - 1) }.filter(|g| g.len() == bones.len());
+            if let (true, true, Some(guard)) = (c.instanced, agent.guard > 0.0, guard) {
                 for b in 0..bones.len() {
-                    let (pose, takes) = &c.guard_pose[b];
+                    let (pose, takes) = &guard[b];
                     stand[b] = match (bones[b].parent.filter(|p| *p < b), *takes) {
-                        (Some(p), true) => stand[p].then(&between(&walk[p].inverse().then(&walk[b]), &c.guard_pose[p].0.inverse().then(pose), agent.guard)),
+                        (Some(p), true) => stand[p].then(&between(&walk[p].inverse().then(&walk[b]), &guard[p].0.inverse().then(pose), agent.guard)),
                         (Some(p), false) => stand[p].then(&walk[p].inverse().then(&walk[b])),
                         (None, true) => between(&walk[b], pose, agent.guard),
                         (None, false) => walk[b],

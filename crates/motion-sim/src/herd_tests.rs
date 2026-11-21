@@ -723,3 +723,51 @@ fn one_knocked_down_with_its_guard_up_falls_from_that_pose() {
     assert!(up.is_some_and(|g| g > 0.99) && (angle - 90.0).abs() < 4.0, "its guard {up:?} up, its spine {angle:.0}° from its hips as it is let go");
     assert_eq!(crate::behaviour_tests::pin(&guarded), (36989, 3641593593800269882), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
+
+#[test]
+fn a_guard_has_a_pose_for_where_the_thing_comes_from() {
+    // The guard test's character with two poses keyed: its spine a
+    // quarter round one way at 3.25 s, the other way at 3.9 s (the second
+    // for what comes from behind). They stand in a row and face −z. One
+    // ball comes at instance 3 from before it, one at instance 1 from
+    // behind it.
+    let mut a = agent(0, 300.0, 0.0);
+    let spine = &mut a["layers"][0]["layers"][0];
+    spine["transform"]["rotation"] = json!({"keys": [{"at": 2, "v": 0}, {"at": 3.2, "v": 90, "ease": "linear"}, {"at": 3.3, "v": 90}, {"at": 3.9, "v": -90, "ease": "linear"}]});
+    spine["layers"].as_array_mut().unwrap().push(json!({"id": "a0-arm", "kind": "mesh", "mesh": {"type": "box", "size": [10, 60], "depth": 10}, "transform": {"position": [0, -30]}}));
+    let ball = |id: &str, x: f64, z: f64| json!({"id": id, "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [x, 720], "z": z}, "body": {"mass": 30, "velocity": [0, -120, -1500.0 * z.signum()]}});
+    let starts: Vec<Value> = (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect();
+    let c = json!({"id": "walkers", "character": "a0", "starts": starts, "goals": starts, "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0, "dodge": 0,
+        "guard": {"pose": 3.25, "ahead": 1.0, "bones": ["a0-spine"], "poses": [{"pose": 3.9, "from": 180}]}});
+    let mut p = project(json!({"id": "s1", "simulation": {"crowds": [c]}, "layers": [floor(), a, ball("front", 540.0, -900.0), ball("back", 380.0, 900.0)]}), 4.0);
+    let bake = baked(&mut p);
+    let h = &bake.herds[0];
+    // Each has its guard up as its ball comes, in its own pose; the
+    // others never.
+    assert!(h.guard_of(3, 10.0).0 == 0 && h.guard_of(3, 10.0).1 > 0.99 && h.guard_of(1, 10.0).0 == 1 && h.guard_of(1, 10.0).1 > 0.99, "{:?} {:?}", h.guard_of(3, 10.0), h.guard_of(1, 10.0));
+    assert!((0..h.len()).all(|k| [0, 2, 4, 5].iter().all(|&i| h.guard[k * 6 + i] == 0.0)));
+    // (Between samples, rising: the pose is the one it rises into.)
+    assert!(h.guard_of(1, 0.5).0 == 1 && h.guard_of(1, 0.5).1 > 0.0 && h.guard_of(1, 0.5).1 < 0.6);
+    assert_eq!(Bake::from_bytes(&bake.to_bytes()).unwrap(), *bake);
+    // Drawn: at a third of a second the two arms lie a quarter round,
+    // one to each side; the other four stand.
+    let c = Compiled::new(&p);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let frame = c.frame(10.0 / 30.0);
+    let mut found = Vec::new();
+    states(&frame.layers, "a0-arm", &mut found);
+    let ups: Vec<(f64, f64)> = found.iter().map(|l| match &l.content {
+        Content::Mesh(m) => (m.world.0[1], m.world.0[5]),
+        _ => panic!(),
+    }).collect();
+    let (one, other): (Vec<&(f64, f64)>, Vec<&(f64, f64)>) = ups.iter().filter(|u| u.1.abs() < 1e-6).partition(|u| u.0 > 0.0);
+    assert!(ups.len() == 6 && one.len() == 1 && other.len() == 1 && ups.iter().filter(|u| (u.1 - 1.0).abs() < 1e-9).count() == 4, "{ups:?}");
+    // A pose outside the scene is said, by its place in the list.
+    let mut bad = serde_json::to_value(&p.scenes[0]).unwrap();
+    bad["simulation"]["crowds"][0]["guard"]["poses"][0]["pose"] = json!(50.0);
+    p.scenes[0] = serde_json::from_value(bad).unwrap();
+    p.bakes.clear();
+    let e = Compiled::new(&p).sim_input(0, None).1.join("\n");
+    assert!(e.contains("guard.pose: 50 s is outside the scene"), "{e}");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (22151, 1910075015392301404), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
