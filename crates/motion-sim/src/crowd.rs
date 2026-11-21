@@ -65,6 +65,34 @@ struct Block {
     hi: [f64; 3],
     vel: [f64; 3],
     fixed: bool,
+    /// Its box is not its outline on the level (a wall at an angle, a
+    /// hull, a mesh): its colliders are asked where it is.
+    shaped: bool,
+}
+
+/// How far the level point `p` is from block `b`'s outline, and the
+/// nearest point of it: of its box, or (`shaped`) of its colliders, asked
+/// at three and at seven tenths of the agents' height. Inside it: 0.
+fn outline(world: &World, b: &Block, p: [f64; 2], feet: f64, height: f64) -> (f64, [f64; 2]) {
+    if !b.shaped {
+        let n = [p[0].clamp(b.lo[0], b.hi[0]), p[1].clamp(b.lo[2], b.hi[2])];
+        return (len2([p[0] - n[0], p[1] - n[1]]), n);
+    }
+    let u = world.unit;
+    let mut best = (f64::INFINITY, p);
+    for &c in world.w.bodies[world.handles[b.body]].colliders() {
+        let col = &world.w.colliders[c];
+        for at in [0.3, 0.7] {
+            let from = [p[0], feet - at * height, p[1]];
+            let proj = col.shape().project_point(col.position(), v3(from, 1.0 / u), true);
+            let n = [proj.point.x as f64 * u, proj.point.z as f64 * u];
+            let d = if proj.is_inside { 0.0 } else { len2([p[0] - n[0], p[1] - n[1]]).max((proj.point.y as f64 * u - from[1]).abs()) };
+            if d < best.0 {
+                best = (d, n);
+            }
+        }
+    }
+    best
 }
 
 fn self_places(places: &[[f64; 2]]) -> ([f64; 2], [f64; 2]) {
@@ -92,7 +120,8 @@ struct Ground {
 
 impl Ground {
     /// Covers the agents, their goals and what stands, with room round them.
-    fn new(c: &CrowdInput, places: &([f64; 2], [f64; 2]), standing: &[&Block]) -> Ground {
+    /// `far`: how far a level point is from a block's outline.
+    fn new(c: &CrowdInput, places: &([f64; 2], [f64; 2]), standing: &[&Block], far: &dyn Fn(&Block, [f64; 2]) -> f64) -> Ground {
         let (mut lo, mut hi) = *places;
         let cover = |lo: &mut [f64; 2], hi: &mut [f64; 2], p: [f64; 2]| {
             for k in 0..2 {
@@ -101,8 +130,13 @@ impl Ground {
             }
         };
         c.agents.iter().for_each(|a| cover(&mut lo, &mut hi, a.goal));
-        // (What moves is no wall: it is stepped aside from, or pushed off.)
-        let still: Vec<&&Block> = standing.iter().filter(|b| b.fixed || (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt() < 20.0).collect();
+        // What stands still is a wall. What moves slower than an agent
+        // walks is one too, over where it will be in the second a way is
+        // kept for: its box drawn out along its way. (What moves faster
+        // is no wall: it is stepped aside from, or pushed off.)
+        let speed = |b: &Block| (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt();
+        let swept: Vec<Block> = standing.iter().filter(|b| !b.fixed && speed(b) >= 20.0 && speed(b) < c.speed).map(|b| Block { body: b.body, lo: [b.lo[0] + b.vel[0].min(0.0), b.lo[1], b.lo[2] + b.vel[2].min(0.0)], hi: [b.hi[0] + b.vel[0].max(0.0), b.hi[1], b.hi[2] + b.vel[2].max(0.0)], vel: b.vel, fixed: false, shaped: false }).collect();
+        let still: Vec<&Block> = standing.iter().copied().filter(|b| b.fixed || speed(b) < 20.0).chain(&swept).collect();
         // (A floor-sized thing does not make the ground floor-sized.)
         let (walked_lo, walked_hi) = (lo, hi);
         for b in &still {
@@ -122,7 +156,7 @@ impl Ground {
                 for i in x.0 as isize..=x.1 {
                     // (By the square's middle.)
                     let (cx, cz) = (lo[0] + (i as f64 + 0.5) * cell, lo[1] + (j as f64 + 0.5) * cell);
-                    if cx > b.lo[0] - grow && cx < b.hi[0] + grow && cz > b.lo[2] - grow && cz < b.hi[2] + grow {
+                    if cx > b.lo[0] - grow && cx < b.hi[0] + grow && cz > b.lo[2] - grow && cz < b.hi[2] + grow && (!b.shaped || far(b, [cx, cz]) < grow) {
                         shut[j as usize * w + i as usize] = true;
                     }
                 }
@@ -379,13 +413,55 @@ impl Herd {
                     hi[k] = hi[k].max(aabb.maxs[k] as f64 * u);
                 }
             }
+            // (A box on the axes, or a round thing standing, is its box;
+            // a box turned, a hull, a mesh is not.)
+            let shaped = rb.colliders().iter().any(|&c| {
+                let col = &world.w.colliders[c];
+                match col.shape().as_cuboid() {
+                    Some(cuboid) => {
+                        let e = col.compute_aabb().half_extents();
+                        (e.x * e.y * e.z) as f64 > 1.02 * (cuboid.half_extents.x * cuboid.half_extents.y * cuboid.half_extents.z) as f64
+                    }
+                    None => !matches!(col.shape().shape_type(), ShapeType::Ball | ShapeType::Capsule | ShapeType::Cylinder | ShapeType::Cone),
+                }
+            });
             if lo[0] <= hi[0] {
                 let v = rb.linvel();
-                blocks.push(Block { body: b, lo, hi, vel: [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], fixed: body.kind == lahza_motion_core::sim::BodyKind::Fixed });
+                blocks.push(Block { body: b, lo, hi, vel: [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], fixed: body.kind == lahza_motion_core::sim::BodyKind::Fixed, shaped });
             }
         }
+        // And who lies or is falling: each one down as the box of its
+        // bones, whatever its height (a wall to plan round once it lies).
+        // (Every crowd's fallen are in every crowd's way.)
+        let mut lying: Vec<Block> = Vec::new();
+        for (n, c) in input.crowds.iter().enumerate() {
+            for (k, a) in self.agents[n].iter().enumerate() {
+                let ragdoll = if c.instanced { self.slots.get(n).and_then(|s| c.pool.get(*s.get(k)? as usize)).copied() } else { c.agents[k].ragdoll };
+                let (Some(_), Some(r)) = (a.down, ragdoll) else { continue };
+                let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+                for bone in &input.ragdolls[r].bones {
+                    for &col in world.w.bodies[world.handles[bone.body]].colliders() {
+                        let aabb = world.w.colliders[col].compute_aabb();
+                        for x in 0..3 {
+                            lo[x] = lo[x].min(aabb.mins[x] as f64 * u);
+                            hi[x] = hi[x].max(aabb.maxs[x] as f64 * u);
+                        }
+                    }
+                }
+                let root = input.ragdolls[r].bones[0].body;
+                let v = world.w.bodies[world.handles[root]].linvel();
+                if lo[0] <= hi[0] {
+                    lying.push(Block { body: root, lo, hi, vel: [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], fixed: false, shaped: false });
+                }
+            }
+        }
+
         for (n, c) in input.crowds.iter().enumerate() {
             let places: Vec<[f64; 2]> = self.agents[n].iter().map(|a| a.at).collect();
+            let headings: Vec<[f64; 2]> = self.agents[n].iter().map(|a| a.heading).collect();
+            let vels: Vec<[f64; 2]> = self.agents[n].iter().map(|a| a.vel).collect();
+            // (Who is where it was going, or down: it will not make room.)
+            let settled: Vec<bool> = self.agents[n].iter().enumerate().map(|(k, a)| a.down.is_some() || len2([c.agents[k].goal[0] - a.at[0], c.agents[k].goal[1] - a.at[1]]) <= c.radius * 0.25).collect();
             // Who is near whom: the agents by the square they stand in
             // (three radii a side, as far as one pushes another).
             let reach = 3.0 * c.radius;
@@ -399,7 +475,8 @@ impl Herd {
             // walk (worked out when the first of them needs it).
             let Some(feet) = c.agents.first().map(|a| a.start.p[1]) else { continue };
             // (y is down: a head is at feet − height.)
-            let standing: Vec<&Block> = blocks.iter().filter(|b| b.hi[1] > feet - c.height && b.lo[1] < feet - 0.2 * c.height).collect();
+            let standing: Vec<&Block> = blocks.iter().filter(|b| b.hi[1] > feet - c.height && b.lo[1] < feet - 0.2 * c.height).chain(&lying).collect();
+            let off_of = |b: &Block, p: [f64; 2]| outline(world, b, p, feet, c.height).0;
             let mut ground: Option<Ground> = None;
             let gravity = input.gravity[1] * u;
             for (k, a) in self.agents[n].iter_mut().enumerate() {
@@ -423,7 +500,7 @@ impl Herd {
                 // Where to head: the goal, or round what stands across the way.
                 let mut toward = goal;
                 if c.plan && !arrived && !standing.is_empty() {
-                    let ground = ground.get_or_insert_with(|| Ground::new(c, &self_places(&places), &standing));
+                    let ground = ground.get_or_insert_with(|| Ground::new(c, &self_places(&places), &standing, &off_of));
                     if ground.sight(a.at, goal) {
                         a.path.clear();
                     } else {
@@ -442,46 +519,78 @@ impl Herd {
                 let way = len2(to);
                 // Slowing over its last two radii.
                 let slow = (far / (2.0 * c.radius)).min(1.0);
-                let mut want = if !arrived && way > 1e-9 { [to[0] / way * a.speed * slow, to[1] / way * a.speed * slow] } else { [0.0; 2] };
-                let mut push = |d: [f64; 2], reach: f64, hard: f64| {
-                    let l = len2(d);
-                    if l >= reach {
-                        return;
-                    }
-                    // Straight off it, and round it on the goal's side.
-                    let away = if l > 1e-6 { [d[0] / l, d[1] / l] } else { [a.heading[1], -a.heading[0]] };
-                    let side = [-away[1], away[0]];
-                    let s = if side[0] * to[0] + side[1] * to[1] >= 0.0 { 1.0 } else { -1.0 };
-                    let f = hard * a.speed * (reach - l) / reach;
-                    want[0] += away[0] * f + side[0] * s * f * 0.6;
-                    want[1] += away[1] * f + side[1] * s * f * 0.6;
-                };
+                // Who is near it.
+                near.clear();
                 if !arrived {
                     // (In the agents' order, whatever the squares': the sum is the same sum.)
                     let (sx, sz) = square(a.at);
-                    near.clear();
                     for dx in -1..=1 {
                         for dz in -1..=1 {
                             near.extend(squares.get(&(sx + dx, sz + dz)).into_iter().flatten());
                         }
                     }
                     near.sort_unstable();
+                }
+                // It waits for room: no faster than would close, in two
+                // fifths of a second, on the nearest agent before it that
+                // goes its way or waits itself (as fast as that one goes
+                // on, and what is between them besides), and never under a fifth
+                // of its pace (a ring of them each waiting for the next
+                // would stand for good). One that comes the other way, or
+                // has arrived, is passed, not waited for.
+                let mut pace = a.speed * slow;
+                if way > 1e-9 {
+                    let dir = [to[0] / way, to[1] / way];
+                    for &j in near.iter().filter(|&&j| j as usize != k) {
+                        let (d, h) = ([places[j as usize][0] - a.at[0], places[j as usize][1] - a.at[1]], headings[j as usize]);
+                        let (along, across) = (d[0] * dir[0] + d[1] * dir[1], (d[0] * dir[1] - d[1] * dir[0]).abs());
+                        if along > 0.0 && across < 1.6 * c.radius && h[0] * dir[0] + h[1] * dir[1] > -0.3 && !settled[j as usize] {
+                            let on = (vels[j as usize][0] * dir[0] + vels[j as usize][1] * dir[1]).max(0.0);
+                            pace = pace.min((on + (along - 2.0 * c.radius) / 0.4).max(0.2 * a.speed * slow));
+                        }
+                    }
+                }
+                let mut want = if !arrived && way > 1e-9 { [to[0] / way * pace, to[1] / way * pace] } else { [0.0; 2] };
+                // (An agent's right, as it faces.)
+                let right = [-a.heading[1], a.heading[0]];
+                let mut push = |d: [f64; 2], reach: f64, hard: f64, oncoming: bool| {
+                    let l = len2(d);
+                    if l >= reach {
+                        return;
+                    }
+                    // Straight off it, and round it on the goal's side; one
+                    // that comes the other way is passed on the right (it
+                    // keeps to its own right too: they do not dance).
+                    let away = if l > 1e-6 { [d[0] / l, d[1] / l] } else { [a.heading[1], -a.heading[0]] };
+                    let side = [-away[1], away[0]];
+                    let toward = if oncoming { right } else { to };
+                    let s = if side[0] * toward[0] + side[1] * toward[1] >= 0.0 { 1.0 } else { -1.0 };
+                    let f = hard * a.speed * (reach - l) / reach;
+                    want[0] += away[0] * f + side[0] * s * f * 0.6;
+                    want[1] += away[1] * f + side[1] * s * f * 0.6;
+                };
+                if !arrived {
                     for &j in &near {
                         if j as usize != k {
-                            push([a.at[0] - places[j as usize][0], a.at[1] - places[j as usize][1]], reach, 1.6);
+                            let h = headings[j as usize];
+                            push([a.at[0] - places[j as usize][0], a.at[1] - places[j as usize][1]], reach, 1.6, h[0] * a.heading[0] + h[1] * a.heading[1] < -0.3);
                         }
                     }
                     // Off the nearest point of each thing's outline (its
                     // middle, from inside it).
                     for b in &standing {
-                        let nearest = [a.at[0].clamp(b.lo[0], b.hi[0]), a.at[1].clamp(b.lo[2], b.hi[2])];
+                        let (off, nearest) = outline(world, b, a.at, feet, c.height);
                         let mut d = [a.at[0] - nearest[0], a.at[1] - nearest[1]];
+                        // (Off a turned thing's side, not its box's.)
+                        if b.shaped && off >= 3.0 * c.radius {
+                            continue;
+                        }
                         if len2(d) < 1e-6 {
                             d = [a.at[0] - (b.lo[0] + b.hi[0]) / 2.0, a.at[1] - (b.lo[2] + b.hi[2]) / 2.0];
                             let l = len2(d).max(1e-6);
                             d = [d[0] / l * 1e-3, d[1] / l * 1e-3];
                         }
-                        push(d, 3.0 * c.radius, 4.0);
+                        push(d, 3.0 * c.radius, 4.0, false);
                     }
                 }
                 // What is coming at it: a body that, as it flies, will be
@@ -493,7 +602,7 @@ impl Herd {
                 let ahead = c.guard.unwrap_or(0.0);
                 let mut threatened = false;
                 if c.dodge > 0.0 || ahead > 0.0 {
-                    for b in blocks.iter().filter(|b| !b.fixed) {
+                    for b in blocks.iter().chain(&lying).filter(|b| !b.fixed) {
                         let rel = [b.vel[0] - a.vel[0], b.vel[1], b.vel[2] - a.vel[1]];
                         if (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt() < c.knock {
                             continue;
@@ -557,6 +666,62 @@ impl Herd {
                     let (s, co) = (libm::sin(step), libm::cos(step));
                     a.heading = [h[0] * co - h[1] * s, h[0] * s + h[1] * co];
                 }
+            }
+            // None stands in another: two nearer than 1.7 radii are moved
+            // apart, each by half (one that is down or stands, not at
+            // all), twice over; and none is moved into what is shut. (At
+            // two radii, tried: the six of the tests, started 80 px
+            // apart, hold each other in a ball's line.)
+            let apart = 1.7 * c.radius;
+            let mut at: Vec<[f64; 2]> = self.agents[n].iter().map(|a| a.at).collect();
+            let fixed: Vec<bool> = self.agents[n].iter().map(|a| a.down.is_some() || a.idle).collect();
+            for _ in 0..2 {
+                let mut cells: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+                let cell = |p: [f64; 2]| ((p[0] / apart).floor() as i64, (p[1] / apart).floor() as i64);
+                for (j, p) in at.iter().enumerate() {
+                    cells.entry(cell(*p)).or_default().push(j as u32);
+                }
+                for i in 0..at.len() {
+                    let (cx, cz) = cell(at[i]);
+                    near.clear();
+                    for dx in -1..=1 {
+                        for dz in -1..=1 {
+                            near.extend(cells.get(&(cx + dx, cz + dz)).into_iter().flatten().filter(|&&j| (j as usize) < i));
+                        }
+                    }
+                    near.sort_unstable();
+                    for &j in &near {
+                        let j = j as usize;
+                        let d = [at[i][0] - at[j][0], at[i][1] - at[j][1]];
+                        let l = len2(d);
+                        // (By one that has arrived there is less room to
+                        // ask: goals may be set nearer than agents pass.)
+                        let apart = if settled[i] || settled[j] { 1.2 * c.radius } else { apart };
+                        if l >= apart || fixed[i] && fixed[j] {
+                            continue;
+                        }
+                        let away = if l > 1e-6 { [d[0] / l, d[1] / l] } else { [1.0, 0.0] };
+                        let (mine, its) = match (fixed[i], fixed[j]) {
+                            (false, false) => (0.5, 0.5),
+                            (false, true) => (1.0, 0.0),
+                            _ => (0.0, 1.0),
+                        };
+                        let open = |p: [f64; 2]| ground.as_ref().is_none_or(|g| g.square(p).is_none_or(|q| !g.shut[q]));
+                        let (pi, pj) = ([at[i][0] + away[0] * (apart - l) * mine, at[i][1] + away[1] * (apart - l) * mine], [at[j][0] - away[0] * (apart - l) * its, at[j][1] - away[1] * (apart - l) * its]);
+                        if open(pi) || !open(at[i]) {
+                            at[i] = pi;
+                        }
+                        if open(pj) || !open(at[j]) {
+                            at[j] = pj;
+                        }
+                    }
+                }
+            }
+            for (k, a) in self.agents[n].iter_mut().enumerate() {
+                if a.down.is_some() || a.idle {
+                    continue;
+                }
+                a.at = at[k];
                 a.next = place(c, k, a.at, a.heading);
             }
         }

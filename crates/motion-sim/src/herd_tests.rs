@@ -58,7 +58,7 @@ fn instances_of_one_character_walk_as_its_copies_did() {
     let bytes = bake.to_bytes();
     assert_eq!(Bake::from_bytes(&bytes).unwrap(), *bake);
     assert!(bytes == baked(&mut p).to_bytes());
-    assert_eq!(crate::behaviour_tests::pin(&bake), (17657, 8715268341068219897), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (17657, 10946326245003775), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // Drawn: the character is there six times, each at its agent's place
     // and its own moment of the clip (the marker is 100 px a second of
     // clip along), and not once more where its keys have it.
@@ -165,7 +165,7 @@ fn an_instance_struck_falls_as_a_ragdoll_of_the_pool() {
     for i in [0, 1, 2, 4, 5] {
         assert!(level(place(i, n - 1), [1300.0 + i as f64 * 90.0, 0.0, 260.0]) < 30.0, "agent {i}");
     }
-    assert_eq!(crate::behaviour_tests::pin(&bake), (97272, 11227731455442370143), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (97272, 10319859945345561035), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // Still drawn six times after the fall.
     let frame = Compiled::new(&p).frame(6.0);
     let mut marks = Vec::new();
@@ -244,7 +244,7 @@ fn one_knocked_down_keeps_its_limbs_swing_and_may_hold_its_pose() {
     };
     let (soft, stiff) = ((down..down + 45).map(|k| bend(&limp, k)).fold(0.0, f64::max), (down..down + 45).map(|k| bend(&held, k)).fold(0.0, f64::max));
     assert!(soft > 25.0 && stiff < 0.5 * soft, "its spine bends {soft:.0}° limp, {stiff:.0}° holding its pose");
-    assert_eq!((crate::behaviour_tests::pin(&limp), crate::behaviour_tests::pin(&held)), ((49850, 4585677346052108598), (51323, 784940492317639703)), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!((crate::behaviour_tests::pin(&limp), crate::behaviour_tests::pin(&held)), ((49695, 11188245037107290127), (49616, 10013887437959853070)), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn an_agent_raises_its_guard_at_what_is_coming_and_is_drawn_in_it() {
     let e = Compiled::new(&layered).sim_input(0, None).1.join("\n");
     assert!(e.contains("crowds.0.guard: only a crowd of instances"), "{e}");
     layered.bakes.clear();
-    assert_eq!(crate::behaviour_tests::pin(&bake), (18476, 11403343376360516901), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (18476, 4764109921858966059), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
 
 #[test]
@@ -493,4 +493,101 @@ fn a_light_that_moves_makes_new_pictures_a_step_not_a_frame() {
     let (a, b) = (Compiled::new(&p), Compiled::new(&p));
     b.frame(0.2);
     assert_eq!(a.frame(0.7).pictures, b.frame(0.7).pictures);
+}
+
+/// A doorway `door` px wide in a wall across z = 400, twelve agents on
+/// each side with their goals on the other.
+fn doorway(door: f64, crowd: Value, seconds: f64) -> Project {
+    let half = 1000.0;
+    let wall = |id: &str, x: f64| json!({"id": id, "kind": "mesh", "mesh": {"type": "box", "size": [half, 300], "depth": 40}, "transform": {"position": [x, 650], "z": 400}, "body": {"type": "fixed"}});
+    let (mut starts, mut goals) = (Vec::new(), Vec::new());
+    for side in [0.0, 1.0] {
+        for j in 0..2 {
+            for i in 0..6 {
+                let (x, z) = (300.0 + i as f64 * 80.0, 150.0 + j as f64 * 80.0);
+                let (from, to) = ([x, z + side * 500.0 - j as f64 * side * 160.0], [x, z + 500.0 - side * 500.0 - j as f64 * (1.0 - side) * 160.0]);
+                starts.push(json!(from));
+                goals.push(json!(to));
+            }
+        }
+    }
+    let mut c = json!({"starts": starts, "goals": goals});
+    for (k, v) in crowd.as_object().unwrap() {
+        c[k] = v.clone();
+    }
+    herd_scene(vec![wall("wall-l", 500.0 - door / 2.0 - half / 2.0), wall("wall-r", 500.0 + door / 2.0 + half / 2.0)], c, 1, seconds)
+}
+
+/// How many of the 24 are through the wall by sample `k`, how many
+/// within 100 px of their goals, and how near two of them ever came.
+fn through_a_doorway(door: f64, seconds: f64) -> (Vec<usize>, usize, f64, std::sync::Arc<Bake>) {
+    let mut p = doorway(door, json!({}), seconds);
+    let goals: Vec<[f64; 2]> = serde_json::from_value(serde_json::to_value(&p.scenes[0]).unwrap()["simulation"]["crowds"][0]["goals"].clone()).unwrap();
+    let bake = baked(&mut p);
+    let h = &bake.herds[0];
+    let at = |k: usize, i: usize| h.samples[k * 24 + i];
+    let through = (0..h.len()).map(|k| (0..24).filter(|&i| (at(k, i)[1] > 400.0) == (goals[i][1] > 400.0)).count()).collect();
+    let last = h.len() - 1;
+    let arrived = (0..24).filter(|&i| ((at(last, i)[0] as f64 - goals[i][0]).powi(2) + (at(last, i)[1] as f64 - goals[i][1]).powi(2)).sqrt() < 100.0).count();
+    let mut closest = f64::INFINITY;
+    for k in 0..h.len() {
+        for i in 0..24 {
+            for j in 0..i {
+                closest = closest.min(((at(k, i)[0] - at(k, j)[0]).powi(2) + (at(k, i)[1] - at(k, j)[1]).powi(2)).sqrt() as f64);
+            }
+        }
+    }
+    (through, arrived, closest, bake)
+}
+
+#[test]
+fn two_dozen_cross_in_a_doorway_and_none_stands_in_another() {
+    // Twelve on each side of a wall, their goals on the other, one door
+    // 160 px wide (an agent is 30 px round, and a way is planned 46 px
+    // off a wall: room for one at a time). They keep to the right of
+    // those who come, wait behind those who go their way, and are moved
+    // apart when nearer than 1.7 radii. (Before: all 24 were through in
+    // 5 s, two of them 2 px from each other: they went through each other.)
+    for door in [160.0, 280.0] {
+        let (through, arrived, closest, bake) = through_a_doorway(door, 25.0);
+        eprintln!("door {door}: through by 5, 10, 15, 20 s: {:?}; {arrived} within 100 px of their goals at 25 s; the closest two came {closest:.0} px", [150, 300, 450, 600].map(|k| through[k]));
+        assert!(through[450] == 24 && arrived >= 22, "door {door}: {} through at 15 s, {arrived} arrived", through[450]);
+        assert!(closest > 30.0, "door {door}: two came {closest:.0} px from each other");
+        // (A door is a queue: not all at once.)
+        assert!(through[150] < 24);
+        if door == 160.0 {
+            assert_eq!(crate::behaviour_tests::pin(&bake), (288809, 18174244763527505987), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+        }
+    }
+}
+
+#[test]
+fn those_who_walk_go_round_one_who_lies() {
+    // Instance 3 is knocked down by a ball as they set off, and lies
+    // where the three behind it in the row are to walk: their goals are
+    // set past it, in line.
+    let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [545, 700], "z": -150}, "body": {"mass": 30, "velocity": [0, 0, 1500]}});
+    let lain = |goals: Value| {
+        let mut p = herd_scene(vec![ball.clone()], json!({"ragdoll": {"mass": 60, "max": 2, "limits": [{"bone": ""}]}, "dodge": 0, "goals": goals}), 1, 14.0);
+        baked(&mut p)
+    };
+    let hips = |bake: &Bake, k: usize| at(bake, "walkers#0/a0-hips", k);
+    // The three behind it are sent 600 px along the row's line, on which
+    // it lies; the two before it walk off.
+    let from = |i: usize| [300.0 + i as f64 * 80.0, 0.0];
+    let goals: Vec<[f64; 2]> = (0..6).map(|i| if i < 3 { [from(i)[0] + 600.0, 0.0] } else { [from(i)[0], -300.0] }).collect();
+    let bake = lain(json!(goals));
+    let lies = hips(&bake, 420);
+    let h = &bake.herds[0];
+    assert!(h.down[3] < 10 && level(hips(&bake, 150), lies) < 5.0 && lies[0] > 420.0 && lies[0] < 800.0 && lies[2].abs() < 60.0, "it lies at {lies:?}");
+    for i in 0..3 {
+        let way: Vec<[f64; 3]> = (0..h.len()).map(|k| { let s = h.samples[k * 6 + i]; [s[0] as f64, 0.0, s[1] as f64] }).collect();
+        let nearest = (30..h.len()).map(|k| level(way[k], hips(&bake, k))).fold(f64::INFINITY, f64::min);
+        let end = way[h.len() - 1];
+        eprintln!("instance {i}: {nearest:.0} px from the hips of the one that lies at its nearest; ended {:.0} px from its goal", level(end, [goals[i][0], 0.0, goals[i][1]]));
+        // Past it, and never over it (its bones' box is shut ground once
+        // it lies: a way is planned round, an agent's radius off).
+        assert!(level(end, [goals[i][0], 0.0, goals[i][1]]) < 40.0 && nearest > 40.0, "instance {i} came {nearest:.0} px from its hips and ended at {end:?}");
+    }
+    assert_eq!(crate::behaviour_tests::pin(&bake), (113054, 11342613009363423641), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }

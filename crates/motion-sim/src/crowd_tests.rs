@@ -211,7 +211,7 @@ fn agents_find_their_way_round_a_wall_across_it() {
         let arrived = way.iter().position(|p| level(*p, end) < 60.0).unwrap();
         assert!(arrived < 15 * 30 && (way[..arrived.saturating_sub(60)].windows(60).map(|w| level(w[0], w[59])).fold(f64::INFINITY, f64::min) > 60.0 || slowest > 60.0), "{id} arrived at sample {arrived}");
     }
-    assert_eq!(crate::behaviour_tests::pin(&bake), (93270, 6398300622357464177), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (93270, 13572502214054943156), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     // They split: some round the left end, some round the right.
     let sides: Vec<bool> = (0..6).map(|i| path(&bake, &format!("a{i}")).iter().any(|p| p[0] > 850.0 && (p[2] - 400.0).abs() < 60.0)).collect();
     assert!(sides.iter().any(|s| *s) && sides.iter().any(|s| !*s), "{sides:?}");
@@ -249,7 +249,7 @@ fn an_agent_steps_out_of_the_way_of_what_is_thrown() {
     let dodges: Vec<_> = bake.events.iter().filter(|e| e.kind == "dodge").collect();
     assert!(dodges.iter().any(|e| e.a == "a3" && e.b == "ball" && e.speed > 1400.0), "{:?}", bake.events);
     assert!(!bake.events.iter().any(|e| e.kind == "knock"), "{:?}", bake.events.iter().filter(|e| e.kind == "knock").collect::<Vec<_>>());
-    assert_eq!(crate::behaviour_tests::pin(&bake), (27810, 5747100466678269218), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (27810, 16134866527859686987), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
     let passing = (0..120).min_by(|a, b| at(&bake, "ball", *a)[2].abs().total_cmp(&at(&bake, "ball", *b)[2].abs())).unwrap();
     let aside = (at(&bake, "a3", passing)[0] - at(&bake, "ball", passing)[0]).abs();
     assert!(aside > 56.0, "a3 is {aside:.0} px from the ball's line as it passes (sample {passing})");
@@ -270,4 +270,81 @@ fn an_agent_steps_out_of_the_way_of_what_is_thrown() {
         let b = baked(&mut crowd_scene(vec![other], json!({"goals": (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect::<Vec<_>>()}), 1, 2.0));
         assert!(!b.events.iter().any(|e| e.kind == "dodge" || e.kind == "knock"), "{:?}", b.events);
     }
+}
+
+/// How far level point `p` is from the segment `a` to `b`.
+fn off_line(p: [f64; 3], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let (d, r) = ([b[0] - a[0], b[1] - a[1]], [p[0] - a[0], p[2] - a[1]]);
+    let t = ((r[0] * d[0] + r[1] * d[1]) / (d[0] * d[0] + d[1] * d[1])).clamp(0.0, 1.0);
+    ((r[0] - d[0] * t).powi(2) + (r[1] - d[1] * t).powi(2)).sqrt()
+}
+
+#[test]
+fn a_wall_at_an_angle_shuts_its_own_ground_not_its_boxs() {
+    // The wall of the test above, turned 45° about y: its box is a
+    // square 520 px a side of which it is one diagonal.
+    let wall = json!({"id": "wall", "kind": "mesh", "mesh": {"type": "box", "size": [700, 300], "depth": 40}, "three_d": true, "transform": {"position": [500, 650], "z": 400, "rotation_y": 45}, "body": {"type": "fixed"}});
+    let line = |p: &Project| {
+        let input = Compiled::new(p).sim_input(0, None).0;
+        let w = input.bodies.iter().find(|b| b.id == "wall").unwrap().keyed[0];
+        let d = lahza_motion_core::sim::quat_rotate(w.q, [1.0, 0.0, 0.0]);
+        ([w.p[0] - 350.0 * d[0], w.p[2] - 350.0 * d[2]], [w.p[0] + 350.0 * d[0], w.p[2] + 350.0 * d[2]])
+    };
+    let probe = crowd_scene(vec![wall.clone()], json!({}), 1, 1.0);
+    let (a, b) = line(&probe);
+    assert!((a[0] - b[0]).abs() > 480.0 && (a[1] - b[1]).abs() > 480.0, "the wall runs {a:?} to {b:?}");
+    // The corner of its box on the row's side that the wall is not in:
+    // goals there, 200 px from the wall and well inside the box.
+    let east = (if a[1] < b[1] { a[0] } else { b[0] }) < 500.0;
+    let corner = [if east { 650.0 } else { 350.0 }, 250.0];
+    let goals: Vec<Value> = (0..6).map(|i| json!([corner[0] + ((i % 3) as f64 - 1.0) * 85.0, corner[1] - 60.0 + (i / 3) as f64 * 120.0])).collect();
+    let mut p = crowd_scene(vec![wall.clone()], json!({"goals": goals}), 1, 9.0);
+    let bake = baked(&mut p);
+    for i in 0..6 {
+        let way = path(&bake, &format!("a{i}"));
+        let (end, goal) = (way[way.len() - 1], [corner[0] + ((i % 3) as f64 - 1.0) * 85.0, 0.0, corner[1] - 60.0 + (i / 3) as f64 * 120.0]);
+        // (With its box for its outline these goals were in a wall: an
+        // agent stood at the box's edge, 100 px and more short.)
+        assert!(level(end, goal) < 40.0, "a{i} ended at {end:?}, {:.0} px from its goal", level(end, goal));
+    }
+    // And across it: goals on its far side, mirrored in its line. Round
+    // an end, never in it (20 px to its face; an agent is 30 px round).
+    let over = |g: [f64; 2]| if east { [g[1] + 100.0, g[0] - 100.0] } else { [900.0 - g[1], 900.0 - g[0]] };
+    let goals: Vec<[f64; 2]> = (0..6).map(|i| over([corner[0] + ((i % 3) as f64 - 1.0) * 85.0, corner[1] - 60.0 + (i / 3) as f64 * 120.0])).collect();
+    let mut p = crowd_scene(vec![wall], json!({"goals": goals}), 1, 16.0);
+    let bake = baked(&mut p);
+    for i in 0..6 {
+        let way = path(&bake, &format!("a{i}"));
+        let end = way[way.len() - 1];
+        assert!(level(end, [goals[i][0], 0.0, goals[i][1]]) < 40.0, "a{i} ended at {end:?}, its goal {:?}", goals[i]);
+        let nearest = way.iter().map(|p| off_line(*p, a, b)).fold(f64::INFINITY, f64::min);
+        assert!(nearest > 20.0 + 20.0, "a{i} came {nearest:.0} px from the wall's middle line");
+    }
+    assert_eq!(crate::behaviour_tests::pin(&bake), (93270, 4053422559475733356), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn a_way_is_planned_round_what_moves_slower_than_they_walk() {
+    // A cart 500 px long is pushed across their way at 60 px/s (they walk
+    // at 160): its box drawn out a second along its way is shut ground.
+    let cart = json!({"id": "cart", "kind": "mesh", "mesh": {"type": "box", "size": [500, 200], "depth": 60}, "body": {"type": "kinematic"},
+        "transform": {"position": {"keys": [{"at": 0, "v": [250, 700]}, {"at": 10, "v": [850, 700], "ease": "linear"}]}, "z": 400}});
+    let goals: Vec<Value> = (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 800.0])).collect();
+    let mut p = crowd_scene(vec![cart], json!({"goals": goals}), 1, 14.0);
+    let bake = baked(&mut p);
+    let mut nearest = f64::INFINITY;
+    for i in 0..6 {
+        let way = path(&bake, &format!("a{i}"));
+        let end = way[way.len() - 1];
+        assert!(level(end, [300.0 + i as f64 * 80.0, 0.0, 800.0]) < 40.0, "a{i} ended at {end:?}");
+        for (k, p) in way.iter().enumerate() {
+            // The cart's middle then; its box is 250 by 30 from it.
+            let x = 250.0 + 60.0 * (k as f64 / 30.0).min(10.0);
+            let off = ((p[0] - x).abs() - 250.0).max((p[2] - 400.0).abs() - 30.0);
+            assert!(off > 8.0, "a{i} is {off:.0} px from the cart at sample {k}: {p:?}");
+            nearest = nearest.min(off);
+        }
+    }
+    eprintln!("the nearest any came to the cart: {nearest:.0} px");
+    assert_eq!(crate::behaviour_tests::pin(&bake), (81750, 8711641015625367396), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
