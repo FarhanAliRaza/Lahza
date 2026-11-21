@@ -9,7 +9,7 @@ the short of it.
 
 Done and run here (pictures looked at; on the final merged tree, one
 thread, Mesa's software Vulkan: motion-render 198 tests pass and 29 are
-ignored (measures), motion-core 138, motion-sim 51, motion-mcp 40 and
+ignored (measures), motion-core 138, motion-sim 64, motion-mcp 40 and
 its integration tests, the app 128 and its eight window tests under
 Xvfb, which need `xdotool` for the pointer; since then `motion-sim` is
 64 with 8 ignored measures):
