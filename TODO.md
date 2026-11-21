@@ -85,7 +85,7 @@ Xvfb, which need `xdotool` for the pointer; since then `motion-sim` is
   leg (it holds 600 px/s where the carried foot holds 1400) and send a
   hand to a wall, and in its tries the agents near the figure steer; a
   crowd's agents keep apart, wait behind one another and pass on the
-  right (24 through a 160 px door in 10 s, none nearer than 35 px;
+  right (24 through a 160 px door in 15 s, none nearer than 35 px;
   they went through each other before), take a turned wall for its
   shape and a slow cart for where it will be, go round the fallen, get
   up again and walk on, share the pool's ragdolls fall after fall,
@@ -1893,9 +1893,9 @@ made on one machine. In the order built:
      the one before it that goes its way (never under a fifth of its
      pace); one that comes the other way is passed on the right.
      Measured, twelve on each side of a wall with their goals on the
-     other and one door of 160 px (room for one at a time): 15 through
-     in 5 s, all 24 in 10 s, the closest two 35 px apart; with a door
-     of 280 px 20 in 5 s. Before: all 24 through in 5 s, two of them
+     other and one door of 160 px (room for one at a time): 16 through
+     in 5 s, 23 in 10 s, all 24 in 15 s, the closest two 35 px apart;
+     with a door of 280 px 20 in 5 s and all in 10 s. Before: all 24 through in 5 s, two of them
      2 px from each other: a doorway did not jam because they walked
      through one another. Tested, pinned. `herd.py` with `DOOR=5` (80
      agents) was looked at: they come through a few at a time and fan
