@@ -8,7 +8,8 @@ round a pillar, each agent at its own moment of the walk. The nearest
 FULL (default 150) are drawn as the character, the rest as pictures of
 it. A ball is thrown through them at 2 s: they step out of its line
 (DODGE=0: they do not look, and whoever it strikes goes down as a
-ragdoll of the pool). WALL=1 stands a wall across their way. GUARD=1
+ragdoll of the pool). WALL=1 stands a wall across their way; DOOR=w
+two with a door w radii wide between them. GUARD=1
 gives the character a second pose, arms up before its face, keyed at
 7.5 s, which an agent takes while the ball is coming at it (one struck
 with it up falls from it). UP=1: those knocked down get up again and
@@ -92,6 +93,16 @@ if os.environ.get("WALL"):
         {"id": "wall", "kind": "mesh", "mesh": {"type": "box", "size": [0.4 * side, 2.2 * UNIT], "depth": 0.4 * UNIT},
          "material": {"preset": "plastic", "color": "#8a93a6"}, "transform": {"position": [W / 2 + 0.15 * side, FLOOR - 1.1 * UNIT], "z": -0.62 * side},
          "body": {"type": "fixed"}})
+if os.environ.get("DOOR"):
+    # Two walls across their way with a door between, DOOR radii wide:
+    # they wait for room and go through a few at a time.
+    door = float(os.environ["DOOR"]) * crowd["radius"]
+    for name, sign in (("wall-l", -1), ("wall-r", 1)):
+        scene["layers"].append(
+            {"id": name, "kind": "mesh", "mesh": {"type": "box", "size": [1.2 * side, 2.2 * UNIT], "depth": 0.4 * UNIT},
+             "material": {"preset": "plastic", "color": "#8a93a6"},
+             "transform": {"position": [W / 2 + 0.12 * side + sign * (door / 2 + 0.6 * side), FLOOR - 1.1 * UNIT], "z": -0.6 * side},
+             "body": {"type": "fixed"}, "allow": ["draws_off_frame"]})
 if os.environ.get("DODGE"):
     crowd["dodge"] = float(os.environ["DODGE"])
 if os.environ.get("UP"):
