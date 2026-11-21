@@ -79,13 +79,14 @@ Xvfb, which need `xdotool` for the pointer; since then `motion-sim` is
   over their pictures, pictures lit by stepped lights.
 - Since, a third round in the simulation (its section has each with its
   test, its numbers and its pins; `motion-sim` 64 tests, `motion-core`
-  138, `motion-mcp` 40, release, and `motion-sim`'s pins again with
-  glibc off its FMA and AVX paths): aimed arms go round legs and the
+  138, `motion-mcp` 40, release, and `motion-sim`'s pins again in a
+  debug build, with glibc off its FMA and AVX paths and on aarch64
+  under qemu): aimed arms go round legs and the
   other arm and an elbow swivels clear; the search may swing a step's
   leg (it holds 600 px/s where the carried foot holds 1400) and send a
   hand to a wall, and in its tries the agents near the figure steer; a
   crowd's agents keep apart, wait behind one another and pass on the
-  right (24 through a 160 px door in 10 s, none nearer than 35 px;
+  right (24 through a 160 px door in 15 s, none nearer than 35 px;
   they went through each other before), take a turned wall for its
   shape and a slow cart for where it will be, go round the fallen, get
   up again and walk on, share the pool's ragdolls fall after fall,
@@ -122,8 +123,8 @@ in), since none of it can be seen from a container:
    pictures were never drawn by the GPU or the tracer) cost there, with a
    character of real size. (A bake on another kind of CPU was run here:
    the pins hold with glibc's FMA paths off and on aarch64 under qemu;
-   a real ARM machine was not run. The third round's pins were run
-   with glibc's FMA and AVX paths off, not under qemu.)
+   a real ARM machine was not run. The second and third rounds' pins
+   were run the same two ways, and hold.)
 7. Slang: both of its points need slangc, which a cloud session cannot
    fetch.
 8. The motion blur benchmarks (shapes, and a still mesh group) and the
@@ -158,8 +159,9 @@ Not done, and why:
   GPU farm, motion capture and days: a trained policy, and with it
   footwork (a body that finds its own feet). Needing an outside model:
   an LLM that directs takes and judges them. Needing a second machine:
-  the pins of the second and third rounds baked elsewhere, a real ARM
-  machine. Not to do, by a measurement or by design (each where it is
+  the pins of the second and third rounds baked on another container's
+  CPU and on a real ARM machine (under qemu and off glibc's FMA paths
+  they hold). Not to do, by a measurement or by design (each where it is
   named): a setting for a flat landing, ragdolls as an instancer's
   copies, bones that meet while a body gets up, an arm led round what
   is outside its body, the search as what a ragdoll does unasked, more
@@ -1152,13 +1154,14 @@ elbow's bend an arm in its plan). Every other pin is as it was: what
 was added to a bake's input (a rope's links, a particle's lives,
 `vary`, a guard, named feet) is hashed only where a scene has it, and
 the takes pinned with 40° joints say them outright now that names give
-a human's. These pins were made on one machine; a second container
-of the same kind is what they were not yet baked on (needing a second
-machine).
+a human's. These pins were made on one machine (the third round
+ran them on other kinds of CPU: see below).
 
 A third round (one container, a Xeon with FMA and AVX-512; `motion-sim`
-64 tests and 8 ignored measures, release, and again with glibc kept off
-its FMA and AVX paths: every pin holds both ways) took the lines the
+64 tests and 8 ignored measures, release and debug, again with glibc
+kept off its FMA and AVX paths, and on aarch64 under `qemu-user`, where
+63 pass and the policy test fails as before: every pin, old and new,
+holds all four ways) took the lines the
 second had left: arms round legs and the other arm, an elbow's swivel,
 the search's swung step, reach and steering crowd, and for crowds
 keeping apart, waiting, passing, turned walls, slow movers, the fallen
@@ -1194,7 +1197,10 @@ was: what was added to a bake's input (a search's `swing` and `reach`,
 a crowd's `get_up`, `feet`, a guard's pose for a fall and its other
 poses) is hashed only where a scene has it, and a herd's falls are
 written only where one got up or a ragdoll fell twice. These too were
-made on one machine. In the order built:
+made on one machine, and so were the second round's, which this run
+has now on aarch64 under qemu as well; needing what is not here, a
+second physical machine: the same on another container's CPU and on a
+real ARM machine. In the order built:
 
 1. **Rigid bodies and joints: done.** `crates/motion-sim` steps
    `rapier3d` 0.36 (`enhanced-determinism`: no SIMD, no threads, libm).
@@ -1893,9 +1899,9 @@ made on one machine. In the order built:
      the one before it that goes its way (never under a fifth of its
      pace); one that comes the other way is passed on the right.
      Measured, twelve on each side of a wall with their goals on the
-     other and one door of 160 px (room for one at a time): 15 through
-     in 5 s, all 24 in 10 s, the closest two 35 px apart; with a door
-     of 280 px 20 in 5 s. Before: all 24 through in 5 s, two of them
+     other and one door of 160 px (room for one at a time): 16 through
+     in 5 s, 23 in 10 s, all 24 in 15 s, the closest two 35 px apart;
+     with a door of 280 px 20 in 5 s and all in 10 s. Before: all 24 through in 5 s, two of them
      2 px from each other: a doorway did not jam because they walked
      through one another. Tested, pinned. `herd.py` with `DOOR=5` (80
      agents) was looked at: they come through a few at a time and fan
