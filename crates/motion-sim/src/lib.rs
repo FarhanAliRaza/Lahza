@@ -47,17 +47,28 @@ pub struct Take {
     /// crowd's agents): each with its speed (px/s). In a try ahead they
     /// go on as they were going.
     pub movers: Vec<(rapier3d::prelude::RigidBodyHandle, [f64; 3])>,
+    /// And, for a take a search looks ahead in, the crowds as they are:
+    /// in a try the agents near what is tried steer on as in the take.
+    pub crowd: Option<crowd::Herd>,
     trial: bool,
 }
 
 impl Take {
     pub fn new(input: &SimInput, meshes: Meshes) -> Result<Take, String> {
-        Ok(Take { world: World::new(input, meshes)?, brains: input.ragdolls.iter().map(|r| behaviour::Brain::new(input, r)).collect(), turns: vec![None; input.ragdolls.len()], movers: Vec::new(), trial: false })
+        Ok(Take { world: World::new(input, meshes)?, brains: input.ragdolls.iter().map(|r| behaviour::Brain::new(input, r)).collect(), turns: vec![None; input.ragdolls.len()], movers: Vec::new(), crowd: None, trial: false })
     }
 
     /// A copy that goes its own way from here (a try ahead).
-    pub fn fork(&self) -> Take {
-        Take { world: self.world.fork(), brains: self.brains.clone(), turns: self.turns.clone(), movers: self.movers.clone(), trial: true }
+    pub fn fork(&self, input: &SimInput) -> Take {
+        Take { world: self.world.fork(), brains: self.brains.clone(), turns: self.turns.clone(), movers: self.movers.clone(), crowd: self.crowd.as_ref().map(|h| h.fork(input, None, 0.0)), trial: true }
+    }
+
+    /// In a try, at a sample's start: its crowds' agents steer.
+    pub fn plan_crowd(&mut self, input: &SimInput) {
+        if let Some(mut herd) = self.crowd.take() {
+            herd.plan(input, &self.world);
+            self.crowd = Some(herd);
+        }
     }
 
     /// Lets go the bodies whose release is sample `k`, where their keys
@@ -88,7 +99,9 @@ impl Take {
         let x = k as f64 + (s + 1) as f64 / n as f64;
         self.world.drive(input, x);
         self.world.push(input, t);
-        if self.trial {
+        if let (true, Some(herd)) = (self.trial, &self.crowd) {
+            herd.drive(&mut self.world, (s + 1) as f64 / n as f64);
+        } else if self.trial {
             let step = self.world.dt / self.world.unit;
             for (h, v) in &self.movers {
                 let body = &mut self.world.w.bodies[*h];
@@ -148,7 +161,7 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
                 let feet = take.brains[rig].feet().len();
                 Some(Mind::Policy(policy::Policy::load(&files(src)?, policy::observation_len(r, feet), policy::action_len(r)).map_err(|e| format!("{src}: {e}"))?))
             }
-            Some(Controller::Search { samples, horizon, every, spread }) => Some(Mind::Search(search::Search::new(*samples, *horizon, *every, *spread))),
+            Some(Controller::Search { samples, horizon, every, spread, swing, reach }) => Some(Mind::Search(search::Search::new(*samples, *horizon, *every, *spread).with(*swing, *reach))),
         });
     }
     let dynamic: Vec<usize> = (0..input.bodies.len()).filter(|&i| input.bodies[i].kind == BodyKind::Dynamic).collect();
@@ -176,6 +189,15 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
         record(&take.world, &mut tracks);
         herd.plan(input, &take.world);
         take.movers = herd.movers(input.rate);
+        // (What a search tries ahead in has the agents near it steer.)
+        let searching: Vec<(usize, f64)> = minds.iter().enumerate().filter_map(|(rig, m)| match m {
+            Some(Mind::Search(s)) if take.world.released[input.ragdolls[rig].bones[0].body] => Some((rig, s.horizon)),
+            _ => None,
+        }).collect();
+        take.crowd = (!herd.is_empty() && !searching.is_empty()).then(|| {
+            let near: Vec<[f64; 2]> = searching.iter().map(|(rig, _)| take.world.pose(input.ragdolls[*rig].bones[0].body).p).map(|p| [p[0], p[2]]).collect();
+            herd.fork(input, Some(&near), searching.iter().map(|s| s.1).fold(0.0, f64::max))
+        });
         // Once a frame, what sets the motors is asked.
         let t = input.start + k as f64 / input.rate;
         for (rig, mind) in minds.iter_mut().enumerate() {
@@ -193,10 +215,18 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
                 // it has `get_up`; the search takes it again once it stands.)
                 Some(Mind::Search(_)) if take.brains[rig].fallen.is_some() => take.turns[rig] = None,
                 Some(Mind::Search(s)) => {
+                    let held = s.held;
                     let (turns, stride) = s.decide(&take, input, rig, k, t);
                     take.turns[rig] = Some(turns);
                     if let Some(st) = stride {
-                        take.brains[rig].order_step(input, r, st.foot, st.from, st.to, st.lift, t);
+                        take.brains[rig].order_step(input, r, st.foot, st.from, st.to, st.lift, t, st.swung);
+                    }
+                    // (A hand sent to what stands by it, while the plans kept have it there.)
+                    if let Some(h) = s.held {
+                        take.brains[rig].order_reach(h.arm, h.to, t + s.every + 1e-6);
+                        if held.is_none_or(|was| was.arm != h.arm || was.body != h.body) {
+                            take.world.events.push(lahza_motion_core::sim::SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "reach".into(), a: input.bodies[r.bones[take.brains[rig].hand(h.arm)].body].id.clone(), b: input.bodies[h.body].id.clone(), speed: 0.0 });
+                        }
                     }
                 }
                 None => {}

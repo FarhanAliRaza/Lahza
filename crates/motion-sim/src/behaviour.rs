@@ -99,6 +99,9 @@ struct Step {
     start: f64,
     dur: f64,
     lift: f64,
+    /// Its leg swings it there (hip and knee turned so the ankle goes
+    /// along the step's arc); else the foot is carried by a force.
+    swung: bool,
 }
 
 /// How it stood when it was let go: its hips' height over its feet, their
@@ -170,6 +173,12 @@ pub struct Brain {
     /// Per behaviour: the arm it took, kept while it uses one (the
     /// nearer shoulder changes as the body sways).
     taken: Vec<Option<usize>>,
+    /// Per arm: a place a controller has its hand make for (px), and
+    /// until when.
+    sent: Vec<Option<(V, f64)>>,
+    /// Per arm: how far it is swivelled about the line from its shoulder
+    /// to what it is aimed at (radians).
+    swivel: Vec<f64>,
     /// Per bone: its capsule in its own frame (its ends, its radius), for
     /// the bones that are capsules.
     caps: Vec<Option<(V, V, f64)>>,
@@ -241,16 +250,26 @@ impl Brain {
         let mut rng = crate::world::Rng(input.seed ^ (which + 1).wrapping_mul(0x8cb92ba72f3d8dd7) ^ 0x7175_6972_6b);
         let v = input.vary.clamp(0.0, 1.0);
         let quirk = Quirk { late: v * (rng.signed() + 1.0) / 12.0, stride: 1.0 + v * 0.25 * rng.signed(), ready: 1.0 + v * 0.25 * rng.signed(), gain: 1.0 + v * 0.15 * rng.signed() };
-        Brain { quirk, caps, feet, arms, head: r.head.or_else(|| (0..r.bones.len()).find(|&b| has(b, "head"))), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
+        Brain { quirk, caps, feet, swivel: vec![0.0; arms.len()], sent: vec![None; arms.len()], arms, head: r.head.or_else(|| (0..r.bones.len()).find(|&b| has(b, "head"))), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
     }
 
     /// A bone's joint targets that point arm `arm` at `target` (px): the
     /// upper arm's turn against its parent, the forearm's against it.
-    fn aim(&self, world: &World, r: &RagdollInput, arm: &Arm, target: V) -> Option<([f64; 4], [f64; 4])> {
+    ///
+    /// `swivel` turns the whole arm about the line from its shoulder to
+    /// the target (radians): the hand stays, the elbow goes round.
+    fn aim(&self, world: &World, r: &RagdollInput, arm: &Arm, target: V, swivel: f64) -> Option<([f64; 4], [f64; 4])> {
+        self.solve(world, r, arm, target, swivel, 0.5).map(|s| (s.0, s.1))
+    }
+
+    /// `aim`, and where it has the elbow and the hand's middle (px).
+    /// `tip`: how far along the hand what is aimed is (a hand's middle;
+    /// a leg's ankle, 0).
+    fn solve(&self, world: &World, r: &RagdollInput, arm: &Arm, target: V, swivel: f64, tip: f64) -> Option<([f64; 4], [f64; 4], V, V)> {
         let (u, f) = (&r.bones[arm.upper], &r.bones[arm.fore]);
         let chest = world.pose(r.bones[u.parent?].body);
         let shoulder = world.pose(u.body).p;
-        let (l1, l2) = (u.length.max(1.0), (f.length + r.bones[arm.hand].length * 0.5).max(1.0));
+        let (l1, l2) = (u.length.max(1.0), (f.length + r.bones[arm.hand].length * tip).max(1.0));
         let to = sub(target, shoulder);
         let d = len(to).clamp((l1 - l2).abs() + 1.0, l1 + l2 - 1.0);
         let dir = unit(to)?;
@@ -263,12 +282,78 @@ impl Brain {
         // The elbow's axle (the forearm's hinge, else across the arm).
         let hinge = f.hinge.unwrap_or_else(|| unit(cross(f.along, [0.0, 0.0, 1.0])).unwrap_or([1.0, 0.0, 0.0]));
         let axle = quat_rotate(straight, quat_rotate(f.bind, hinge));
-        let upper = quat_mul(turn(axle, -at_shoulder), straight);
-        Some((quat_mul(conj(chest.q), upper), quat_mul(f.bind, turn(hinge, flex.min(f.swing.to_radians())))))
+        let mut upper = quat_mul(turn(axle, -at_shoulder), straight);
+        if swivel != 0.0 {
+            upper = quat_mul(turn(dir, swivel), upper);
+        }
+        let elbow = add(shoulder, mul(quat_rotate(upper, u.along), l1));
+        Some((quat_mul(conj(chest.q), upper), quat_mul(f.bind, turn(hinge, flex.min(f.swing.to_radians()))), elbow, add(shoulder, mul(dir, d))))
+    }
+
+    /// What is in an arm's way: its body's other bones that are capsules
+    /// (the trunk it hangs from first, up to the root, then the head,
+    /// then its legs and its other arm), each with its ends (px) and its
+    /// radius as the body now is.
+    fn others(&self, world: &World, r: &RagdollInput, arm: &Arm) -> Vec<(usize, V, V, f64)> {
+        let mut bones: Vec<usize> = Vec::new();
+        let mut cur = r.bones[arm.upper].parent;
+        while let Some(b) = cur {
+            bones.push(b);
+            cur = r.bones[b].parent;
+        }
+        bones.extend(self.head.filter(|h| !bones.contains(h)));
+        let rest: Vec<usize> = (0..r.bones.len()).filter(|b| ![arm.hand, arm.fore, arm.upper].contains(b) && !bones.contains(b)).collect();
+        bones.extend(rest);
+        bones.into_iter().filter_map(|b| {
+            let (a, c, radius) = self.caps[b]?;
+            let p = world.pose(r.bones[b].body);
+            Some((b, p.apply(a), p.apply(c), radius))
+        }).collect()
+    }
+
+    /// The swivel that keeps arm `k`'s elbow clear on its way to
+    /// `target`: of nine turns about the line from shoulder to target,
+    /// up to a radian either way, the one whose upper arm (past its
+    /// shoulder's third) and forearm are least into the body's other
+    /// bones; the smaller turn of two as good, and the one it has while
+    /// another is no better by a pixel. It goes there at 4 rad/s.
+    pub(crate) fn swing(&mut self, world: &World, r: &RagdollInput, k: usize, target: V, dt: f64) -> f64 {
+        let arm = self.arms[k].clone();
+        let others = self.others(world, r, &arm);
+        let chest = r.bones[arm.upper].parent;
+        let thick = self.caps[arm.fore].map_or(8.0, |c| c.2);
+        let wide = self.caps[arm.upper].map_or(thick, |c| c.2);
+        let shoulder = world.pose(r.bones[arm.upper].body).p;
+        let mut best: Option<(f64, f64)> = None;
+        for step in [0, 1, -1, 2, -2, 3, -3, 4, -4] {
+            let angle = step as f64 * 0.25;
+            let Some((_, _, elbow, hand)) = self.solve(world, r, &arm, target, angle, 0.5) else { continue };
+            let mut cost = 2.0 * angle.abs() - if (angle - self.swivel[k]).abs() < 0.13 { 1.0 } else { 0.0 };
+            for (b, p, q, radius) in &others {
+                // (What it hangs from holds its shoulder: only the
+                // forearm is kept out of that. What the hand is sent onto
+                // is not in the forearm's way at its end.)
+                if Some(*b) != chest {
+                    let from = add(shoulder, mul(sub(elbow, shoulder), 0.35));
+                    cost += (radius + wide + 2.0 - nearest(from, elbow, *p, *q).2).max(0.0);
+                }
+                let (_, _, d) = nearest(elbow, hand, *p, *q);
+                if d < nearest(hand, hand, *p, *q).2 - 3.0 {
+                    cost += (radius + thick + 2.0 - d).max(0.0);
+                }
+            }
+            if best.is_none_or(|(least, _)| cost < least - 1e-9) {
+                best = Some((cost, angle));
+            }
+        }
+        let want = best.map_or(0.0, |b| b.1);
+        self.swivel[k] += (want - self.swivel[k]).clamp(-4.0 * dt, 4.0 * dt);
+        self.swivel[k]
     }
 
     /// Where arm `arm`'s hand should make for now, to get to `target`
-    /// round its own trunk and head, not through them. `target` is first
+    /// round its own trunk and head, its legs and its other arm, not
+    /// through them. `target` is first
     /// brought out to the surface of what it lies in (a hand goes onto a
     /// chest). Then, while the straight way from the hand to it passes
     /// through the trunk (its bones' capsules, as wide again as the
@@ -279,24 +364,15 @@ impl Brain {
     /// Worked out anew each step from where the hand is, so it goes
     /// round as far as it must.
     fn route(&self, world: &World, r: &RagdollInput, arm: &Arm, target: V) -> V {
-        // (The trunk: what the arm hangs from, down to the root, and the head.)
-        let mut trunk: Vec<usize> = Vec::new();
-        let mut cur = r.bones[arm.upper].parent;
-        while let Some(b) = cur {
-            trunk.push(b);
-            cur = r.bones[b].parent;
-        }
-        trunk.extend(self.head.filter(|h| !trunk.contains(h)));
+        // (The trunk: what the arm hangs from, down to the root, and the
+        // head; then its legs and its other arm.)
+        let others = self.others(world, r, arm);
+        let trunk: Vec<usize> = others.iter().map(|o| o.0).collect();
         let thick = self.caps[arm.fore].map_or(8.0, |c| c.2);
         let shoulder = world.pose(r.bones[arm.upper].body).p;
         // (The body's front: the way it stood facing, as its root is now turned.)
         let front = self.stood.map(|s| quat_rotate(world.pose(r.bones[0].body).q, s.front));
-        trunk.retain(|&b| self.caps[b].is_some());
-        let caps: Vec<(V, V, f64)> = trunk.iter().filter_map(|&b| {
-            let (a, c, radius) = self.caps[b]?;
-            let p = world.pose(r.bones[b].body);
-            Some((p.apply(a), p.apply(c), radius))
-        }).collect();
+        let caps: Vec<(V, V, f64)> = others.iter().map(|o| (o.1, o.2, o.3)).collect();
         // The way out of a capsule from a point by it: away from its line,
         // leaning to the front and to the arm's own side.
         let out = |a: V, b: V, at: V, from: V| -> V {
@@ -540,7 +616,7 @@ impl Brain {
                                 for arm in &self.arms {
                                     let reach = r.bones[arm.upper].length + r.bones[arm.fore].length;
                                     let shoulder = world.pose(r.bones[arm.upper].body).p;
-                                    let Some((upper, fore)) = self.aim(world, r, arm, add(shoulder, mul(down, reach * (0.45 + 0.5 * push)))) else { continue };
+                                    let Some((upper, fore)) = self.aim(world, r, arm, add(shoulder, mul(down, reach * (0.45 + 0.5 * push))), 0.0) else { continue };
                                     for (bone, want) in [(arm.upper, upper), (arm.fore, fore)] {
                                         let clip = world.clip(r, bone, x).unwrap_or(r.bones[bone].bind);
                                         drive.targets[bone] = Some(blend(clip, want, press));
@@ -618,7 +694,7 @@ impl Brain {
                             let reach = param(b, "length", 0.5 * stand) * self.quirk.stride;
                             let aim = add(support, mul(error, 1.4));
                             let to = add(from, capped(flat(sub(aim, from)), reach));
-                            self.step = Some(Step { foot, from, to, start: t, dur: param(b, "time", 0.28).max(0.05), lift: 0.12 * stand });
+                            self.step = Some(Step { foot, from, to, start: t, dur: param(b, "time", 0.28).max(0.05), lift: 0.12 * stand, swung: b.params.get("swing").and_then(|v| v.as_bool()).unwrap_or(false) });
                             self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "step".into(), a: input.bodies[r.bones[foot].body].id.clone(), b: String::new(), speed: len(vel).round() });
                         }
                     }
@@ -637,13 +713,31 @@ impl Brain {
             while let (Some(p), true) = (r.bones[*leg.last().unwrap()].parent, leg.len() < 3) {
                 leg.push(p);
             }
-            let carried: f64 = leg.iter().map(|&b| r.bones[b].mass).sum();
-            let rb = &mut world.w.bodies[world.handles[r.bones[s.foot].body]];
-            let v = rb.linvel();
-            let pull = capped(mul(sub(mul(sub(want, foot_at(s.foot)), 500.0), mul([v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], 40.0)), carried / u), 5.0 * carried * g * amount);
-            rb.apply_impulse(v3(pull, dt), true);
-            for &b in &leg {
-                drive.scale[b] *= 0.3;
+            // (A leg that swings: its thigh and shin are aimed, as an arm
+            // is, so its ankle is where the step's arc has it now; no
+            // force is on the foot. The foot itself keeps the clip's turn.)
+            let aimed = if let (true, &[foot, shin, thigh]) = (s.swung, &leg[..]) {
+                let ankle = add(want, sub(world.pose(r.bones[foot].body).p, foot_at(foot)));
+                self.solve(world, r, &Arm { hand: foot, fore: shin, upper: thigh, left: false }, ankle, 0.0, 0.0).map(|(upper, fore, _, _)| [(thigh, upper), (shin, fore)])
+            } else {
+                None
+            };
+            match aimed {
+                Some(aimed) => {
+                    for (bone, want) in aimed {
+                        drive.targets[bone] = Some(want);
+                    }
+                }
+                None => {
+                    let carried: f64 = leg.iter().map(|&b| r.bones[b].mass).sum();
+                    let rb = &mut world.w.bodies[world.handles[r.bones[s.foot].body]];
+                    let v = rb.linvel();
+                    let pull = capped(mul(sub(mul(sub(want, foot_at(s.foot)), 500.0), mul([v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], 40.0)), carried / u), 5.0 * carried * g * amount);
+                    rb.apply_impulse(v3(pull, dt), true);
+                    for &b in &leg {
+                        drive.scale[b] *= 0.3;
+                    }
+                }
             }
             if f >= 1.0 {
                 self.step = None;
@@ -651,7 +745,8 @@ impl Brain {
             }
         }
         // Arms: later behaviours take an arm over earlier ones.
-        let mut arms: Vec<Option<(V, f64)>> = vec![None; self.arms.len()];
+        let mut arms: Vec<Option<(V, f64, bool)>> = vec![None; self.arms.len()];
+        let swivels = |b: &BehaviourInput| b.params.get("swivel").and_then(|v| v.as_bool()).unwrap_or(true);
         let chest_of = |a: &Arm| r.bones[a.upper].parent.map(|c| world.pose(r.bones[c].body));
         let pick = |b: &BehaviourInput, target: V, not_on: Option<usize>| -> Option<usize> {
             let free = |k: &usize| not_on.is_none_or(|bone| ![self.arms[*k].hand, self.arms[*k].fore, self.arms[*k].upper].contains(&bone));
@@ -661,6 +756,13 @@ impl Brain {
                 _ => (0..self.arms.len()).filter(free).min_by(|a, c| len(sub(world.pose(r.bones[self.arms[*a].upper].body).p, target)).total_cmp(&len(sub(world.pose(r.bones[self.arms[*c].upper].body).p, target)))),
             }
         };
+        // (A hand a controller sent somewhere: there until its time is up.)
+        for (k, sent) in self.sent.iter_mut().enumerate() {
+            match *sent {
+                Some((to, until)) if t < until && self.fallen.is_none() => arms[k] = Some((to, 1.0, true)),
+                _ => *sent = None,
+            }
+        }
         for (b, amount) in &active {
             match b.kind {
                 BehaviourKind::Guard => {
@@ -679,7 +781,7 @@ impl Brain {
                     // Comes up as the thing comes within reach of `within`.
                     let near = ((within * (2.0 - self.quirk.ready) - away) / (0.3 * within).max(1.0)).clamp(0.0, 1.0);
                     if near > 0.0 {
-                        arms[k] = Some((target, amount * near));
+                        arms[k] = Some((target, amount * near, swivels(b)));
                         (self.taken[i], using[i]) = (Some(k), true);
                     }
                 }
@@ -697,7 +799,7 @@ impl Brain {
                     (self.taken[i], using[i]) = (Some(k), true);
                     // (Up in a fifth of a second, down over the last third.)
                     let f = ((t - at) / 0.2).clamp(0.0, 1.0) * ((hold - (t - at)) / (hold / 3.0).max(1e-9)).clamp(0.0, 1.0);
-                    arms[k] = Some((target, amount * f));
+                    arms[k] = Some((target, amount * f, swivels(b)));
                 }
                 BehaviourKind::Protect => {
                     let Some(head) = self.head else { continue };
@@ -711,7 +813,7 @@ impl Brain {
                         // Each hand to its own side of the head.
                         let side = unit(sub(world.pose(r.bones[arm.upper].body).p, chest.p)).unwrap_or([0.0; 3]);
                         let across = sub(side, mul(quat_rotate(world.pose(h.body).q, h.along), dot(side, quat_rotate(world.pose(h.body).q, h.along))));
-                        arms[k] = Some((add(centre, mul(unit(across).unwrap_or(side), h.length * 0.7)), *amount));
+                        arms[k] = Some((add(centre, mul(unit(across).unwrap_or(side), h.length * 0.7)), *amount, swivels(b)));
                     }
                 }
                 BehaviourKind::Balance | BehaviourKind::Step | BehaviourKind::GetUp => {}
@@ -723,9 +825,15 @@ impl Brain {
             }
         }
         for (k, wanted) in arms.iter().enumerate() {
-            let Some((target, amount)) = wanted else { continue };
-            let arm = &self.arms[k];
-            let Some((upper, fore)) = self.aim(world, r, arm, self.route(world, r, arm, *target)) else { continue };
+            let Some((target, amount, swivels)) = wanted else {
+                self.swivel[k] = 0.0;
+                continue;
+            };
+            let arm = self.arms[k].clone();
+            let goal = self.route(world, r, &arm, *target);
+            // (The elbow is turned clear of what the forearm would lie in.)
+            let swivel = if *swivels { self.swing(world, r, k, goal, dt) } else { 0.0 };
+            let Some((upper, fore)) = self.aim(world, r, &arm, goal, swivel) else { continue };
             for (bone, want) in [(arm.upper, upper), (arm.fore, fore)] {
                 let clip = world.clip(r, bone, x).unwrap_or(r.bones[bone].bind);
                 drive.targets[bone] = Some(blend(clip, want, amount.clamp(0.0, 1.0)));
@@ -785,6 +893,29 @@ impl Brain {
         self.arms.iter().map(|a| a.upper).collect()
     }
 
+    /// Each arm's shoulder (px) and how far its hand reaches from it.
+    pub fn reaches(&self, world: &World, r: &RagdollInput) -> Vec<(V, f64)> {
+        self.arms.iter().map(|a| (world.pose(r.bones[a.upper].body).p, r.bones[a.upper].length + r.bones[a.fore].length + 0.5 * r.bones[a.hand].length)).collect()
+    }
+
+    /// Arm `arm`'s hand's bone.
+    pub fn hand(&self, arm: usize) -> usize {
+        self.arms[arm].hand
+    }
+
+    /// Where arm `arm` aimed at `target` (px) with `swivel` has its elbow
+    /// and its hand's middle.
+    pub fn elbow_and_hand(&self, world: &World, r: &RagdollInput, arm: usize, target: [f64; 3], swivel: f64) -> Option<([f64; 3], [f64; 3])> {
+        self.solve(world, r, &self.arms[arm], target, swivel, 0.5).map(|s| (s.2, s.3))
+    }
+
+    /// Has arm `arm`'s hand make for `to` (px) until `until`.
+    pub fn order_reach(&mut self, arm: usize, to: [f64; 3], until: f64) {
+        if let Some(sent) = self.sent.get_mut(arm) {
+            *sent = Some((to, until));
+        }
+    }
+
     /// Whether a step may begin at `t` (none is under way, and the last
     /// has landed).
     pub fn can_step(&self, t: f64) -> bool {
@@ -793,8 +924,10 @@ impl Brain {
 
     /// Has `foot` (a bone) stepped from `from` to `to` (px), from `t`, as
     /// the `step` behaviour steps: carried there in 0.28 s, its leg soft.
-    pub fn order_step(&mut self, input: &SimInput, r: &RagdollInput, foot: usize, from: [f64; 3], to: [f64; 3], lift: f64, t: f64) {
-        self.step = Some(Step { foot, from, to, start: t, dur: 0.28, lift });
+    /// `swung`: by its leg's own hip and knee, no force on the foot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn order_step(&mut self, input: &SimInput, r: &RagdollInput, foot: usize, from: [f64; 3], to: [f64; 3], lift: f64, t: f64, swung: bool) {
+        self.step = Some(Step { foot, from, to, start: t, dur: 0.28, lift, swung });
         self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "step".into(), a: input.bodies[r.bones[foot].body].id.clone(), b: String::new(), speed: 0.0 });
     }
 }

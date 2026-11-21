@@ -697,6 +697,14 @@ pub enum Controller {
         /// How far a try may move a target, degrees.
         #[serde(default = "search_spread")]
         spread: f64,
+        /// A step is its leg's own (hip and knee swing the foot there),
+        /// not a foot carried by a force.
+        #[serde(default, skip_serializing_if = "is_default")]
+        swing: bool,
+        /// A plan may send a hand to something that stands within its
+        /// reach on the side it is falling to.
+        #[serde(default, skip_serializing_if = "is_default")]
+        reach: bool,
     },
 }
 

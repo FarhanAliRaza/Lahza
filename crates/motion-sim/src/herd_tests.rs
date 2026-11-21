@@ -274,7 +274,7 @@ fn a_try_ahead_has_the_agents_walk_on() {
     let before: Vec<[f64; 3]> = (0..6).map(|i| place(&take, i)).collect();
     // Half a second of a try: each agent's capsule is where its speed
     // takes it (they walk at 160 px/s, a fifth either way).
-    let mut trial = take.fork();
+    let mut trial = take.fork(&input);
     for k in 30..45 {
         for s in 0..n {
             trial.step(&input, k, s);
@@ -288,6 +288,77 @@ fn a_try_ahead_has_the_agents_walk_on() {
         // The take itself is not moved by that: its agents are the crowd's to move.
         assert!(level(place(&take, i), before[i]) < 1e-9);
     }
+}
+
+#[test]
+fn in_a_try_the_agents_near_what_is_tried_steer_as_the_take_does() {
+    // The six on their way round a pillar that stands across it: over
+    // the next second each turns as it goes.
+    let pillar = json!({"id": "pillar", "kind": "mesh", "mesh": {"type": "box", "size": [160, 300], "depth": 160}, "transform": {"position": [900, 650], "z": 150}, "body": {"type": "fixed"}});
+    let p = herd_scene(vec![pillar], json!({}), 1, 4.0);
+    let (input, errors) = Compiled::new(&p).sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    let mut take = crate::Take::new(&input, &mut crate::core_meshes).unwrap();
+    let mut herd = crate::crowd::Herd::new(&input, &mut take.world);
+    let n = input.substeps as u64;
+    let walk = |take: &mut crate::Take, herd: &mut crate::crowd::Herd, from: u32, to: u32| {
+        for k in from..to {
+            herd.plan(&input, &take.world);
+            take.movers = herd.movers(input.rate);
+            for s in 0..n {
+                herd.drive(&mut take.world, (s + 1) as f64 / n as f64);
+                take.step(&input, k, s);
+            }
+        }
+    };
+    walk(&mut take, &mut herd, 0, 45);
+    herd.plan(&input, &take.world);
+    take.movers = herd.movers(input.rate);
+    let handles: Vec<_> = take.movers.iter().map(|m| m.0).collect();
+    let place = |t: &crate::Take, i: usize| {
+        let p = t.world.w.bodies[handles[i]].position().translation;
+        [p.x as f64 * t.world.unit, p.y as f64 * t.world.unit, p.z as f64 * t.world.unit]
+    };
+    let before: Vec<[f64; 3]> = (0..6).map(|i| place(&take, i)).collect();
+    let try_from = |take: &crate::Take| {
+        let mut trial = take.fork(&input);
+        for k in 45..75 {
+            if k > 45 {
+                trial.plan_crowd(&input);
+            }
+            for s in 0..n {
+                trial.step(&input, k, s);
+            }
+        }
+        trial
+    };
+    // A try that only carries them on, one whose agents steer (those
+    // within reach of a place among them), and the take itself.
+    let carried = try_from(&take);
+    take.crowd = Some(herd.fork(&input, Some(&[[before[2][0], before[2][2]]]), 1.0));
+    assert_eq!(take.crowd.as_ref().unwrap().steering(), 6);
+    let steered = try_from(&take);
+    // (One a long way from what is tried stands: it costs the try nothing.)
+    let far = herd.fork(&input, Some(&[[before[2][0] + 4000.0, before[2][2]]]), 1.0);
+    assert_eq!(far.steering(), 0);
+    let mut on = take.fork(&input);
+    on.crowd = Some(far);
+    let stood = try_from(&on);
+    // The take, a second on. (`herd` planned sample 45 already.)
+    for s in 0..n {
+        herd.drive(&mut take.world, (s + 1) as f64 / n as f64);
+        take.step(&input, 45, s);
+    }
+    walk(&mut take, &mut herd, 46, 75);
+    let mut off = 0.0f64;
+    for i in 0..6 {
+        let (real, tried, straight) = (place(&take, i), place(&steered, i), place(&carried, i));
+        assert!(level(real, tried) < 0.5, "agent {i}: the try has it at {tried:?}, the take at {real:?}");
+        assert!(level(place(&stood, i), before[i]) < 1e-6);
+        off = off.max(level(real, straight));
+    }
+    // Carried on at the speed it had, one of them is well off where it went.
+    assert!(off > 25.0, "carried straight on they are {off:.0} px from the take at most");
 }
 
 #[test]

@@ -11,7 +11,8 @@
 //! step: the foot behind, to where it is falling to or past it. The
 //! first try is always the clip as it is, the second the last choice; the
 //! rest are the last choice moved at random within `spread` degrees
-//! (arms twice that), a third of them with a step. A try is scored at its
+//! (arms twice that), a third of them with a step. In a try a crowd's agents near the body
+//! steer on as they do in the take. A try is scored at its
 //! end: fallen is worst; then how far its weight is headed past its feet,
 //! how far its trunk is over, how much height it lost, and a little for
 //! how far the targets are from the clip and for a step.
@@ -47,6 +48,20 @@ pub struct Search {
     /// How many tries run at once: the cores there are, or
     /// `LAHZA_SIM_THREADS`. The take is the same whatever it is.
     pub threads: usize,
+    /// A step is swung by its leg; a plan may send a hand to what stands.
+    swing: bool,
+    reach: bool,
+    /// The hand the plan chosen last has on something.
+    pub held: Option<Hold>,
+}
+
+/// A hand sent to something that stands: which arm, the body (its index)
+/// and the place on it (px).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hold {
+    pub arm: usize,
+    pub body: usize,
+    pub to: [f64; 3],
 }
 
 fn turn(axis: [f64; 3], angle: f64) -> [f64; 4] {
@@ -56,7 +71,12 @@ fn turn(axis: [f64; 3], angle: f64) -> [f64; 4] {
 
 impl Search {
     pub fn new(samples: u32, horizon: f64, every: f64, spread_degrees: f64) -> Search {
-        Search { samples: samples.max(1), horizon: horizon.max(0.0), every: every.max(1e-3), spread: spread_degrees.to_radians(), next: f64::NEG_INFINITY, best: [0.0; PLAN], stand: None, decisions: 0, tried_steps: 0, seconds: 0.0, threads: std::env::var("LAHZA_SIM_THREADS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())) }
+        Search { samples: samples.max(1), horizon: horizon.max(0.0), every: every.max(1e-3), spread: spread_degrees.to_radians(), next: f64::NEG_INFINITY, best: [0.0; PLAN], stand: None, decisions: 0, tried_steps: 0, seconds: 0.0, threads: std::env::var("LAHZA_SIM_THREADS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get())), swing: false, reach: false, held: None }
+    }
+
+    pub fn with(mut self, swing: bool, reach: bool) -> Search {
+        (self.swing, self.reach) = (swing, reach);
+        self
     }
 
     /// The leans as turns on top of the clip, per bone, in each bone's
@@ -127,11 +147,44 @@ impl Search {
         let l = now.heading;
         let may_step = l > 0.05 * stand.height && take.brains[rig].can_step(t);
         let foot_at = |f: usize| crate::behaviour::bone_origin(&take.world, r, f);
+        // What stands in reach of a hand on the side it is falling to:
+        // per arm, the nearest point of a fixed body that is no floor (it
+        // is a quarter of its height or more above its feet).
+        let mut holds: Vec<Hold> = Vec::new();
+        if self.reach && l > 0.05 * stand.height {
+            use rapier3d::prelude::*;
+            let u = take.world.unit;
+            let up = input.gravity.map(|g| -g / (input.gravity.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9)));
+            for (arm, (shoulder, reach)) in take.brains[rig].reaches(&take.world, r).into_iter().enumerate() {
+                let mut best: Option<(f64, Hold)> = None;
+                for (body, b) in input.bodies.iter().enumerate() {
+                    if b.kind != lahza_motion_core::sim::BodyKind::Fixed {
+                        continue;
+                    }
+                    for &c in take.world.w.bodies[take.world.handles[body]].colliders() {
+                        let col = &take.world.w.colliders[c];
+                        let p = col.shape().project_point(col.position(), Vector::new((shoulder[0] / u) as f32, (shoulder[1] / u) as f32, (shoulder[2] / u) as f32), true).point;
+                        let to = [p.x as f64 * u, p.y as f64 * u, p.z as f64 * u];
+                        let by: [f64; 3] = std::array::from_fn(|a| to[a] - shoulder[a]);
+                        let far = by.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let high: f64 = (0..3).map(|a| (to[a] - now.support[a]) * up[a]).sum();
+                        let toward: f64 = (0..3).map(|a| by[a] * now.toward[a]).sum();
+                        if far < 0.95 * reach && high > 0.25 * stand.height && toward > 0.0 && best.is_none_or(|(d, _)| far < d) {
+                            best = Some((far, Hold { arm, body, to }));
+                        }
+                    }
+                }
+                holds.extend(best.map(|b| b.1));
+            }
+        }
+        // (The hand it has on something stays there while that is in reach.)
+        let kept = self.held.and_then(|h| holds.iter().find(|x| x.arm == h.arm && x.body == h.body).copied());
+        let (swung, horizon) = (self.swing, self.horizon);
         // The plans, drawn before any is tried.
-        let plans: Vec<([f64; PLAN], Option<Stride>)> = (0..self.samples)
+        let plans: Vec<([f64; PLAN], Option<Stride>, Option<Hold>)> = (0..self.samples)
             .map(|c| match c {
-                0 => ([0.0; PLAN], None),
-                1 => (self.best, None),
+                0 => ([0.0; PLAN], None, None),
+                1 => (self.best, None, kept),
                 _ => {
                     let leans = std::array::from_fn(|a| match a {
                         0..=5 => (self.best[a] + self.spread * rng.signed()).clamp(-0.6, 0.6),
@@ -155,18 +208,23 @@ impl Search {
                         if far > 0.5 * stand.height {
                             by = by.map(|v| v * 0.5 * stand.height / far);
                         }
-                        Stride { foot, from, to: std::array::from_fn(|a| from[a] + by[a]), lift: 0.12 * stand.height }
+                        Stride { foot, from, to: std::array::from_fn(|a| from[a] + by[a]), lift: 0.12 * stand.height, swung }
                     });
-                    (leans, stride)
+                    // (A quarter of them with a hand on what stands, in turn.)
+                    let hold = (c % 4 == 3 && !holds.is_empty()).then(|| holds[(c as usize / 4) % holds.len()]).or(kept.filter(|_| c % 2 == 0));
+                    (leans, stride, hold)
                 }
             })
             .collect();
         // Each tried in a copy of the world, on every core.
-        let try_one = |(leans, stride): &([f64; PLAN], Option<Stride>)| -> (f64, u64) {
-            let mut trial = take.fork();
+        let try_one = |(leans, stride, hold): &([f64; PLAN], Option<Stride>, Option<Hold>)| -> (f64, u64) {
+            let mut trial = take.fork(input);
             trial.turns[rig] = Some(Self::turns(take, rig, r, &feet, leans));
             if let Some(s) = stride {
-                trial.brains[rig].order_step(input, r, s.foot, s.from, s.to, s.lift, t);
+                trial.brains[rig].order_step(input, r, s.foot, s.from, s.to, s.lift, t, s.swung);
+            }
+            if let Some(h) = hold {
+                trial.brains[rig].order_reach(h.arm, h.to, t + horizon);
             }
             // From this step on, through the frames' ends as the bake goes.
             let (mut kk, mut s, mut tried) = (k, 0u64, 0u64);
@@ -179,6 +237,7 @@ impl Search {
                 if s == n {
                     (kk, s) = (kk + 1, 0);
                     trial.release_due(input, kk);
+                    trial.plan_crowd(input);
                 }
                 tried += 1;
             }
@@ -215,6 +274,7 @@ impl Search {
         // The first of the least cost.
         let chosen = (0..plans.len()).fold(0, |best, c| if results[c].0 < results[best].0 { c } else { best });
         self.best = plans[chosen].0;
+        self.held = plans[chosen].2;
         self.seconds += began.elapsed().as_secs_f64();
         (Self::turns(take, rig, r, &feet, &self.best), plans[chosen].1)
     }
@@ -227,4 +287,5 @@ pub struct Stride {
     pub from: [f64; 3],
     pub to: [f64; 3],
     pub lift: f64,
+    pub swung: bool,
 }

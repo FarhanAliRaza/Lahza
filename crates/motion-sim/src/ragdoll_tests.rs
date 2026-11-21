@@ -380,6 +380,10 @@ fn arm_thrown(self_collide: bool) -> (Bake, lahza_motion_core::sim::SimInput) {
     (bake, Compiled::new(&p).sim_input(0, None).0)
 }
 
+pub(crate) fn between_of(p1: [f64; 3], q1: [f64; 3], p2: [f64; 3], q2: [f64; 3]) -> f64 {
+    between(p1, q1, p2, q2)
+}
+
 pub(crate) fn overlap_of(bake: &Bake, input: &lahza_motion_core::sim::SimInput, a: &str, b: &str) -> (f64, usize) {
     overlap(bake, input, a, b)
 }

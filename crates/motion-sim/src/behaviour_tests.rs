@@ -357,6 +357,158 @@ fn arms_in_trunk(behaviours: Value, hits: Value, ball: Option<Value>) -> (Bake, 
     (bake, worst)
 }
 
+fn limb_takes() -> Vec<(&'static str, Value, Value, Option<Value>)> {
+    let ball = |x: f64, y: f64| json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20}, "body": {"type": "kinematic"},
+        "transform": {"position": {"keys": [{"at": 0.3, "v": [x + 500.0 * (x - 960.0).signum(), y]}, {"at": 1.2, "v": [x, y], "ease": "linear"}]}}});
+    let mut takes = arm_takes();
+    takes.extend([
+        ("reach its own thigh", json!([{"type": "reach", "params": {"hand": "left"}}]), json!([{"at": 0.5, "bone": "thigh_l", "velocity": [0, 0, 100]}]), None),
+        ("reach the other hand", json!([{"type": "reach"}]), json!([{"at": 0.5, "bone": "hand_r", "velocity": [0, 0, 100]}]), None),
+        ("reach the other upper arm", json!([{"type": "reach"}]), json!([{"at": 0.5, "bone": "upper_r", "velocity": [0, 0, 100]}]), None),
+        ("reach a shin", json!([{"type": "reach", "params": {"hand": "right"}}]), json!([{"at": 0.5, "bone": "shin_r", "velocity": [0, 0, 60]}]), None),
+        ("guard low across with the left", json!([{"type": "guard", "params": {"target": "ball", "hand": "left"}}]), json!([]), Some(ball(1070.0, 620.0))),
+        ("guard behind with the right", json!([{"type": "guard", "params": {"target": [900, 520, 160], "hand": "right", "within": 4000}}]), json!([]), None),
+    ]);
+    takes
+}
+
+/// Where each of `limb_takes` sends its hand, at sample `k`.
+fn sent_to(bake: &Bake, name: &str, k: usize) -> (&'static str, [f64; 3]) {
+    match name {
+        "protect" => ("l", pose(bake, "head", k).apply([0.0, -24.0, 0.0])),
+        "reach the chest" => ("l", pose(bake, "chest", k).apply([0.0, -40.0, 0.0])),
+        "reach the other forearm" => ("l", pose(bake, "fore_r", k).apply([0.0, 35.0, 0.0])),
+        "reach the far thigh with the left" => ("l", pose(bake, "thigh_r", k).apply([0.0, 55.0, 0.0])),
+        "guard across with the left" => ("l", [1090.0, 470.0, 0.0]),
+        "guard across with the right" => ("r", [830.0, 470.0, 0.0]),
+        "reach its own thigh" => ("l", pose(bake, "thigh_l", k).apply([0.0, 55.0, 0.0])),
+        "reach the other hand" => ("l", pose(bake, "hand_r", k).apply([0.0, 21.0, 0.0])),
+        "reach the other upper arm" => ("l", pose(bake, "upper_r", k).apply([0.0, 37.0, 0.0])),
+        "reach a shin" => ("r", pose(bake, "shin_r", k).apply([0.0, 52.0, 0.0])),
+        "guard low across with the left" => ("l", [1070.0, 620.0, 0.0]),
+        _ => ("r", [900.0, 520.0, 160.0]),
+    }
+}
+
+/// How far the aimed arm's forearm and hand are into its legs and its
+/// other arm at their worst while it is aimed (samples 18 to 50; px).
+fn aimed_in_limbs(bake: &Bake, input: &lahza_motion_core::sim::SimInput, side: &str) -> (f64, String) {
+    let other = if side == "l" { "r" } else { "l" };
+    let capsule = |id: &str, k: usize| {
+        let body = input.bodies.iter().find(|x| x.id == id).unwrap();
+        let lahza_motion_core::sim::ShapeInput::Capsule { radius, half } = body.colliders[0].shape else { panic!("{id} is no capsule") };
+        let m = body.colliders[0].local;
+        let p = pose(bake, id, k);
+        let end = |s: f64| p.apply([m.0[3] + m.0[1] * half * s, m.0[7] + m.0[5] * half * s, m.0[11] + m.0[9] * half * s]);
+        (end(-1.0), end(1.0), radius)
+    };
+    let mut worst = (0.0, String::new());
+    for part in ["fore", "hand"] {
+        for limb in ["thigh_l", "shin_l", "thigh_r", "shin_r"].map(String::from).into_iter().chain(["upper", "fore", "hand"].map(|o| format!("{o}_{other}"))) {
+            for k in 18..=50 {
+                let ((p1, q1, r1), (p2, q2, r2)) = (capsule(&format!("{part}_{side}"), k), capsule(&limb, k));
+                let deep = r1 + r2 - crate::ragdoll_tests::between_of(p1, q1, p2, q2);
+                if deep > worst.0 {
+                    worst = (deep, format!("{part}_{side} in {limb} at {k}"));
+                }
+            }
+        }
+    }
+    worst
+}
+
+#[test]
+fn aimed_arms_go_round_its_legs_and_its_other_arm() {
+    // Twelve takes of an arm sent somewhere: the six about the trunk, and
+    // six to or past its own legs and its other arm. (Led round its trunk
+    // and head only, the hand ended behind the body in five of them: the
+    // other arm or a thigh stopped it and it slid round the back; and a
+    // hand lay 9 to 10 px into a thigh on its way.)
+    let input = limb_input();
+    let mut pins = Vec::new();
+    for (name, behaviours, hits, ball) in limb_takes() {
+        let (bake, trunk) = arms_in_trunk(behaviours, hits, ball);
+        let (side, to) = sent_to(&bake, name, 45);
+        let (deep, what) = aimed_in_limbs(&bake, &input, side);
+        let (reached, before) = (dist(wrist(&bake, side, 45), to), pose(&bake, "hips", 45).p[2] - wrist(&bake, side, 45)[2]);
+        eprintln!("{name}: the wrist is {reached:.0} px from where it was sent, {before:.0} px before its hips; {deep:.1} px into a limb ({what})");
+        // Its forearm and hand stay out of its legs and its other arm
+        // while it is aimed (a hand starts beside its own thigh, and is on
+        // what it was sent to).
+        assert!(deep < 10.0, "{name}: {deep:.1} px, {what}");
+        assert!(trunk.iter().all(|(w, d)| *d < if w.ends_with("in chest") { 12.0 } else { 4.0 }), "{name}: {trunk:?}");
+        // It gets there by the front (but the one sent behind it), as near
+        // as the arm reaches: a shin and the far thigh are past its reach.
+        let within = match name {
+            "reach a shin" => 190.0,
+            "guard low across with the left" | "reach the far thigh with the left" => 130.0,
+            "reach its own thigh" => 90.0,
+            _ => 70.0,
+        };
+        assert!(reached < within, "{name}: the wrist is {reached:.0} px from where it was sent");
+        if name == "guard behind with the right" {
+            assert!(before < -100.0, "{name}: {before:.0}");
+        } else {
+            assert!(before > 15.0, "{name}: the wrist is {before:.0} px before its hips");
+        }
+        assert!(fell(&bake).is_none(), "{name}: it fell");
+        pins.push(pin(&bake));
+    }
+    assert_eq!(pins[6..], [(36488, 12350543114967474932), (36488, 2835367254801679572), (36488, 5280890019335777092), (36488, 13893123442561146920), (36488, 16339386643993423887), (36488, 1022878826198314602)], "the bakes changed: if the simulator or the format did, bakes are stale and these numbers are the new ones");
+}
+
+#[test]
+fn an_elbow_swivels_clear_of_what_lies_where_it_would_go() {
+    // The standing figure, its left hand to be sent before its chest.
+    let input = limb_input();
+    let r = &input.ragdolls[0];
+    let mut take = crate::Take::new(&input, &mut crate::core_meshes).unwrap();
+    take.release_due(&input, 0);
+    let bone = |id: &str| r.bones.iter().position(|b| input.bodies[b.body].id == id).unwrap();
+    let left = (0..2).find(|&k| take.brains[0].hand(k) == bone("hand_l")).unwrap();
+    let to = { let p = take.world.pose(r.bones[bone("chest")].body).p; [p[0] - 10.0, p[1] - 10.0, p[2] - 90.0] };
+    // Nothing in the way: no swivel, and the same again.
+    for _ in 0..60 {
+        assert_eq!(take.brains[0].swing(&take.world, r, left, to, 1.0 / 240.0), 0.0);
+    }
+    let (elbow, hand) = take.brains[0].elbow_and_hand(&take.world, r, left, to, 0.0).unwrap();
+    // The other forearm laid through where that elbow is: the arm turns
+    // about the line from its shoulder to the hand's place until its
+    // elbow is clear of it, at 4 rad/s; the hand's place is the same.
+    let other = r.bones[bone("fore_r")].body;
+    let h = take.world.handles[other];
+    let mut at = *take.world.w.bodies[h].position();
+    let m = 1.0 / take.world.unit;
+    at.translation = rapier3d::prelude::Vector::new((elbow[0] * m) as f32, ((elbow[1] - 35.0) * m) as f32, (elbow[2] * m) as f32);
+    take.world.w.bodies[h].set_position(at, true);
+    let lies = |take: &crate::Take| { let p = take.world.pose(other); (p.apply([0.0, 0.0, 0.0]), p.apply([0.0, 70.0, 0.0])) };
+    let (a, b) = lies(&take);
+    assert!(crate::ragdoll_tests::between_of(elbow, elbow, a, b) < 3.0);
+    let mut swivel = 0.0;
+    for k in 0..120 {
+        let now = take.brains[0].swing(&take.world, r, left, to, 1.0 / 240.0);
+        assert!((now - swivel).abs() <= 4.0 / 240.0 + 1e-9, "step {k}: {swivel} to {now}");
+        swivel = now;
+    }
+    assert!(swivel.abs() >= 0.25, "swivelled {swivel} rad");
+    let (round, still) = take.brains[0].elbow_and_hand(&take.world, r, left, to, swivel).unwrap();
+    let clear = crate::ragdoll_tests::between_of(round, round, a, b);
+    assert!(clear > 25.0 && dist(still, hand) < 1e-6 && dist(round, elbow) > 15.0, "the elbow is {clear:.0} px from the forearm's line, {:.0} px from where it was", dist(round, elbow));
+    // And it stays there (the turn it has is kept while no other is better).
+    for _ in 0..60 {
+        assert_eq!(take.brains[0].swing(&take.world, r, left, to, 1.0 / 240.0), swivel);
+    }
+}
+
+/// The figure's bodies as `arms_in_trunk` has them (for their capsules).
+fn limb_input() -> lahza_motion_core::sim::SimInput {
+    let doll = json!({"strength": 1,
+        "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+        "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 179, "twist": 179}, {"bone": "fore", "swing": 150, "hinge": [1, 0, 0]}]});
+    let p = figure_scene(json!({}), doll, json!({"ground": {"y": 809.5, "friction": 0.9}}), 2.5);
+    lahza_motion_core::Compiled::new(&p).sim_input(0, None).0
+}
+
 fn arm_takes() -> Vec<(&'static str, Value, Value, Option<Value>)> {
     let ball = |x: f64| json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 20}, "body": {"type": "kinematic"},
         "transform": {"position": {"keys": [{"at": 0.3, "v": [x + 500.0 * (x - 960.0).signum(), 470]}, {"at": 1.2, "v": [x, 470], "ease": "linear"}]}}});
@@ -409,7 +561,7 @@ fn aimed_arms_go_round_the_body_not_through_it() {
         assert!(fell(&bake).is_none(), "{name}: it fell");
         pins.push(pin(&bake));
     }
-    assert_eq!(pins, [(36621, 11581137727660598137), (36488, 947309298340335586), (36488, 17833138615412773368), (36488, 16887651574034388283), (36552, 8588104402154634968), (36552, 7065585522355567997)], "the bakes changed: if the simulator or the format did, bakes are stale and these numbers are the new ones");
+    assert_eq!(pins, [(36621, 11581137727660598137), (36488, 947309298340335586), (36488, 8986901811003104630), (36488, 5805295552292717695), (36488, 16322485885650760222), (36488, 9435012912182592627)], "the bakes changed: if the simulator or the format did, bakes are stale and these numbers are the new ones");
 }
 
 #[test]
@@ -478,5 +630,5 @@ fn another_seed_reacts_another_way_when_asked_to() {
     for (k, b) in takes.iter().enumerate() {
         assert!(fell(b).is_none() && steps(b) >= 1 && up(b) < 1.2, "seed {}: fell {:?}, {} steps, arms up at {}", k + 1, fell(b), steps(b), up(b));
     }
-    assert_eq!(pin(&takes[0]), (57021, 6885115440864738725), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+    assert_eq!(pin(&takes[0]), (57021, 13457893656667637522), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }

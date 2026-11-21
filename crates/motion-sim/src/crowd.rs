@@ -32,6 +32,8 @@ struct Agent {
     /// How far its guard is up (0..1), and until when it holds it.
     guard: f64,
     wary: f64,
+    /// In a try ahead: too far from what is tried to matter; it stands.
+    idle: bool,
     /// Its place at this sample and the next.
     now: Pose,
     next: Pose,
@@ -52,6 +54,8 @@ pub struct Herd {
     sample: u32,
     /// Whose capsule a body is.
     proxies: HashMap<RigidBodyHandle, (usize, usize)>,
+    /// A copy for a try ahead: it steers, and keeps nothing.
+    quiet: bool,
 }
 
 /// A body as agents see it: its box (px), how it moves (px/s).
@@ -292,6 +296,7 @@ impl Herd {
                     dodged: None,
                     guard: 0.0,
                     wary: f64::NEG_INFINITY,
+                    idle: false,
                     now,
                     next: now,
                     track: Track { id: a.id.clone(), from: 0, rest: a.rest, samples: Vec::with_capacity(room), clock: Vec::with_capacity(room) },
@@ -308,7 +313,32 @@ impl Herd {
             taken: vec![0; input.crowds.len()],
             sample: 0,
             proxies,
+            quiet: false,
         }
+    }
+
+    /// A copy for tries ahead: the agents as they are, steering on from
+    /// here, with nothing kept of where they go. Those farther from every
+    /// one of `near` (level places, px) than an agent could come in twice
+    /// `horizon` seconds stand where they are: they cannot matter to what
+    /// is tried there, and a try's cost is by the agents that steer.
+    /// (`near` None: a copy of a copy, the same agents steering.)
+    pub fn fork(&self, input: &SimInput, near: Option<&[[f64; 2]]>, horizon: f64) -> Herd {
+        let agents = self.agents.iter().zip(&input.crowds).map(|(herd, c)| {
+            let range = 2.0 * (2.2 * c.speed * horizon + 8.0 * c.radius);
+            herd.iter().map(|a| Agent {
+                at: a.at, vel: a.vel, heading: a.heading, speed: a.speed, walked: a.walked, phase: a.phase, down: a.down, proxy: a.proxy, path: a.path.clone(), dodged: a.dodged, guard: a.guard, wary: a.wary,
+                idle: a.idle || near.is_some_and(|near| !near.iter().any(|p| len2([p[0] - a.at[0], p[1] - a.at[1]]) < range)),
+                now: a.now, next: a.next,
+                track: Track { id: String::new(), from: 0, rest: a.track.rest, samples: Vec::new(), clock: Vec::new() },
+            }).collect()
+        }).collect();
+        Herd { agents, events: Vec::new(), rows: Vec::new(), guards: Vec::new(), slots: Vec::new(), taken: Vec::new(), sample: self.sample, proxies: HashMap::new(), quiet: true }
+    }
+
+    /// How many of its agents steer (in a try's copy: those near enough).
+    pub fn steering(&self) -> usize {
+        self.agents.iter().flatten().filter(|a| a.down.is_none() && !a.idle).count()
     }
 
     /// The capsules of the agents that walk, each with its speed to the
@@ -374,7 +404,8 @@ impl Herd {
             let gravity = input.gravity[1] * u;
             for (k, a) in self.agents[n].iter_mut().enumerate() {
                 a.now = a.next;
-                if c.instanced {
+                if self.quiet {
+                } else if c.instanced {
                     self.rows[n].push([a.now.p[0] as f32, a.now.p[2] as f32, turn(c, k, a.heading) as f32, Self::clock(c, a) as f32]);
                     if c.guard.is_some() {
                         self.guards[n].push(a.guard as f32);
@@ -383,7 +414,7 @@ impl Herd {
                     a.track.samples.push(sample_of(&a.now));
                     a.track.clock.push(Self::clock(c, a) as f32);
                 }
-                if a.down.is_some() {
+                if a.down.is_some() || a.idle {
                     continue;
                 }
                 let goal = c.agents[k].goal;
@@ -493,7 +524,7 @@ impl Herd {
                         want[0] += out[0] * a.speed * 3.0;
                         want[1] += out[1] * a.speed * 3.0;
                         dodging = true;
-                        if a.dodged != Some(b.body) {
+                        if a.dodged != Some(b.body) && !self.quiet {
                             a.dodged = Some(b.body);
                             let who = if c.instanced { format!("{}#{k}", c.id) } else { a.track.id.clone() };
                             self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "dodge".into(), a: who, b: input.bodies[b.body].id.clone(), speed: (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt().round() });
@@ -534,7 +565,7 @@ impl Herd {
     /// Moves the agents' capsules toward `f` (0..1) of the way to the
     /// next sample, for the step about to be taken.
     pub fn drive(&self, world: &mut World, f: f64) {
-        for a in self.agents.iter().flatten().filter(|a| a.down.is_none()) {
+        for a in self.agents.iter().flatten().filter(|a| a.down.is_none() && !a.idle) {
             let p = Pose { p: std::array::from_fn(|k| a.now.p[k] + (a.next.p[k] - a.now.p[k]) * f), q: a.next.q };
             world.w.bodies[a.proxy].set_next_kinematic_position(pose(&p, world.unit));
         }

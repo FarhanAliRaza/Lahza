@@ -15,6 +15,9 @@ it walking on the spot until a ball strikes it at 0.87 s:
            lies still, rolls onto its front, pushes up and stands
   sit    — the same, getting up from its back (`way: back`): it sits up
            over its folded legs and stands
+  cross  — no ball: tapped on the right thigh and then on the right
+           forearm, its left hand goes to each, round its own left leg
+           and its right arm (before them, not through or behind)
 
 then bakes, checks, and writes a contact sheet per scene (the CPU renderer
 unless GPU=1). RENDER=1 writes an MP4 too.
@@ -70,6 +73,7 @@ LIMITS = [
 
 def scene(name, start, ragdoll, length):
     hero = f"{name}-hero"
+    ball = not ragdoll.pop("no_ball", False)
     doll = dict({"id": "doll", "root": f"{hero}-hips", "release": start + 0.8, "rest": start + 0.0, "mass": 70}, **ragdoll)
     if os.environ.get("BY_HAND"):
         doll["limits"] = LIMITS
@@ -89,7 +93,7 @@ def scene(name, start, ragdoll, length):
              "transform": {"position": {"keys": [{"at": start + 0.3, "v": [W + 100, FLOOR - 330]}, {"at": start + 0.8, "v": [W / 2 + 190, FLOOR - 320], "ease": "linear"}]}},
              "time": {"start": start + 0.3},
              "body": {"release": start + 0.8, "mass": 9, "bounce": 0.2}, "allow": ["draws_off_frame"]},
-        ],
+        ][:2 if ball else 1],
     }, hero
 
 
@@ -107,6 +111,9 @@ SCENES = [
     ("sit", {"strength": 1, "behaviours": [{"type": "balance"}, {"type": "get_up", "params": {"way": "back"}}],
              "hits": [{"at": 1.05, "bone": "chest", "velocity": [-1400, 0, 0]}]},
      9.0, (1.8, 3.0, 3.4, 3.8, 4.2, 4.6, 5.0, 5.4, 6.2, 8.5)),
+    ("cross", {"no_ball": True, "strength": 1, "behaviours": [{"type": "balance"}, {"type": "reach", "params": {"hand": "left", "hold": 1.2}}],
+               "hits": [{"at": 1.0, "bone": "thigh_r", "velocity": [0, 0, 60]}, {"at": 2.6, "bone": "fore_r", "velocity": [0, 0, 60]}]},
+     4.5, (0.9, 1.2, 1.4, 1.7, 2.1, 2.5, 2.8, 3.0, 3.3, 3.7, 4.3)),
 ]
 
 os.makedirs(OUT, exist_ok=True)
