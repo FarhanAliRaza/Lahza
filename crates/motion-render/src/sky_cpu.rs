@@ -1,0 +1,1202 @@
+//! Sky visibility on the CPU (`RenderOptions::sky`): what pt.wgsl's `sky`
+//! and `sky_filter` find with the GPU's ray queries, found here with a BVH
+//! over the list's triangles in camera space, so the CPU's frame has the
+//! lighting the GPU's has. The same rays from the same points toward the
+//! same fixed set of directions, the same light along the open ones and
+//! back from what the others hit (`sky_lit`, `sky_onward`), the same two
+//! filter passes, in the same f32 arithmetic;
+//! `at` is motion.wgsl's `sky_at`. The two differ where a ray grazes an
+//! edge (two ways of meeting a triangle).
+//! What hides the sky, as there: a surface by its opacity and a card (a
+//! flat 3D layer's quad) by its picture's coverage (a group drawn before
+//! this one), each taking that share of a ray, the rest going on.
+
+use crate::mesh3d::{LROWS, MAT_ROWS};
+use crate::pt::{Trace, TraceMesh};
+
+type V3 = [f32; 3];
+
+fn add(a: V3, b: V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn sub(a: V3, b: V3) -> V3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn mul(a: V3, k: f32) -> V3 {
+    [a[0] * k, a[1] * k, a[2] * k]
+}
+fn dot(a: V3, b: V3) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: V3, b: V3) -> V3 {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+fn norm(a: V3) -> V3 {
+    let l = dot(a, a).sqrt();
+    if l > 0.0 {
+        mul(a, 1.0 / l)
+    } else {
+        a
+    }
+}
+
+/// pt.wgsl `basis`: columns (tangent, bitangent, n).
+fn basis(n: V3) -> [V3; 3] {
+    let t = if n[0].abs() > 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let b = norm(cross(n, t));
+    [cross(b, n), b, n]
+}
+
+pub(crate) fn oct_encode(n: V3) -> [f32; 2] {
+    let s = n[0].abs() + n[1].abs() + n[2].abs();
+    let o = [n[0] / s, n[1] / s];
+    if n[2] >= 0.0 {
+        return o;
+    }
+    let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+    [(1.0 - o[1].abs()) * sign(o[0]), (1.0 - o[0].abs()) * sign(o[1])]
+}
+
+pub(crate) fn oct_decode(e: [f32; 2]) -> V3 {
+    let z = 1.0 - e[0].abs() - e[1].abs();
+    if z >= 0.0 {
+        return norm([e[0], e[1], z]);
+    }
+    let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+    norm([(1.0 - e[1].abs()) * sign(e[0]), (1.0 - e[0].abs()) * sign(e[1]), z])
+}
+
+const FLAG_UNLIT: u32 = 1;
+const FLAG_FACETED: u32 = 2;
+const FLAG_SHADOW_CATCHER: u32 = 8;
+const FLAG_WIRE: u32 = 32;
+const FLAG_VOLUME: u32 = 64;
+
+/// What the rays need of a material.
+#[derive(Clone, Copy)]
+struct Mat {
+    flags: u32,
+    /// How much of a ray it takes (pt.wgsl `sky_cover`): its opacity
+    /// times what it does not let through; a wireframe its faces' fill;
+    /// a shadow catcher and a volume nothing.
+    cover: f32,
+    /// Base colour less what is metal, and the emission.
+    kd: V3,
+    emit: V3,
+    /// Not lit (pt.wgsl `sky_flat`): the colour that comes back as it is.
+    flat: Option<V3>,
+    /// A volume: its instance and its material's first row there, and
+    /// its sigma (pt.wgsl `sky_through`).
+    volume: Option<(usize, usize, f32)>,
+}
+
+/// A triangle in camera space with its corners' normals. `mat`: its
+/// material, or `CARD` and the card it is half of.
+struct Tri {
+    p: [V3; 3],
+    n: [V3; 3],
+    mat: u32,
+}
+
+const CARD: u32 = 1 << 31;
+
+/// A card's picture (pt.wgsl's `b_card` rows): target px to its texels,
+/// and where they are.
+struct Card {
+    origin: [f32; 2],
+    factor: [f32; 2],
+    offset: usize,
+    size: (i32, i32),
+}
+
+/// Which ray: the camera's (it goes through cards, which take no sky, and
+/// stops at what is at least half there), a ray from the surface it found
+/// (it meets whatever is there at all, and goes on with what that leaves:
+/// `fill`'s rays), or the ray that goes on from a ray's end (as the
+/// camera's, but cards stand where they cover more than half).
+#[derive(Clone, Copy, PartialEq)]
+enum Ray {
+    Camera,
+    Sky,
+    Onward,
+}
+
+/// pt.wgsl `SKY_LEAST`: less of a ray than this is none of it.
+const SKY_LEAST: f32 = 0.004;
+
+struct Node {
+    lo: V3,
+    hi: V3,
+    /// A leaf: its first triangle and how many; else its second child
+    /// (the first follows it) and 0.
+    at: u32,
+    count: u32,
+}
+
+struct Scene<'a> {
+    tris: Vec<Tri>,
+    mats: Vec<Mat>,
+    nodes: Vec<Node>,
+    cards: Vec<Card>,
+    /// The groups drawn before the sky's (the cards' pictures).
+    groups: &'a [[f32; 4]],
+    /// Each instance's material rows and the image pool (a volume's
+    /// density, as the CPU's own shading looks it up).
+    rows: Vec<&'a [[f32; 4]]>,
+    images: &'a [u32],
+    volumes: bool,
+    /// The camera, for where a point of a card is in its picture.
+    focal: f32,
+    centre: [f32; 2],
+    root: [f32; 9],
+}
+
+struct Hit {
+    t: f32,
+    p: V3,
+    n: V3,
+    g: V3,
+    mat: Mat,
+    /// A card: its picture's colour there (premultiplied sRGB).
+    card: Option<[f32; 4]>,
+    /// How much of the ray it takes.
+    cover: f32,
+}
+
+impl<'a> Scene<'a> {
+    fn new(t: &'a Trace, groups: &'a [[f32; 4]], images: &'a [u32]) -> Scene<'a> {
+        let (mut tris, mut mats) = (Vec::new(), Vec::new());
+        let mut rows = Vec::new();
+        for inst in &t.instances {
+            // (A mesh the GPU makes in its pool is not here to cast at.)
+            let TraceMesh::Cpu(mesh) = &inst.mesh else { continue };
+            let mat_base = mats.len() as u32;
+            for (k, m) in inst.materials.chunks_exact(MAT_ROWS).enumerate() {
+                let flags = m[2][3] as u32;
+                let cover = if flags & (FLAG_SHADOW_CATCHER | FLAG_VOLUME) != 0 {
+                    0.0
+                } else if flags & FLAG_WIRE != 0 {
+                    m[1][3]
+                } else {
+                    m[0][3] * (1.0 - m[3][0])
+                };
+                let flat = if flags & FLAG_WIRE != 0 {
+                    Some([m[1][0], m[1][1], m[1][2]])
+                } else if flags & FLAG_UNLIT != 0 {
+                    Some([m[0][0] + m[2][0], m[0][1] + m[2][1], m[0][2] + m[2][2]])
+                } else {
+                    None
+                };
+                mats.push(Mat {
+                    flags,
+                    cover,
+                    kd: mul([m[0][0], m[0][1], m[0][2]], 1.0 - m[1][0]),
+                    emit: [m[2][0], m[2][1], m[2][2]],
+                    flat,
+                    volume: (flags & FLAG_VOLUME != 0).then(|| (rows.len(), k * MAT_ROWS, m[18][0])),
+                });
+            }
+            rows.push(&inst.materials[..]);
+            let r = inst.transform;
+            let rows = [[r[0][0], r[0][1], r[0][2]], [r[1][0], r[1][1], r[1][2]], [r[2][0], r[2][1], r[2][2]]];
+            let place = |p: [f32; 3]| [dot(rows[0], p) + r[0][3], dot(rows[1], p) + r[1][3], dot(rows[2], p) + r[2][3]];
+            // Normals go through the inverse transpose (its cofactors).
+            let co = [cross(rows[1], rows[2]), cross(rows[2], rows[0]), cross(rows[0], rows[1])];
+            let turn = |n: [f32; 3]| [dot(co[0], n), dot(co[1], n), dot(co[2], n)];
+            let p: Vec<V3> = mesh.positions.iter().map(|p| place(*p)).collect();
+            let n: Vec<V3> = mesh.normals.iter().map(|n| turn(*n)).collect();
+            for (k, tri) in mesh.tris.iter().enumerate() {
+                let tag = mesh.tags.get(k).copied().unwrap_or(0);
+                let (part, seg) = ((tag & 0xff) as usize, (tag >> 8) & 0xffff);
+                let Some((first, count)) = inst.parts.get(part).copied() else { continue };
+                let mat = mat_base + first + seg % count.max(1);
+                let [a, b, c] = tri.map(|i| i as usize);
+                if mat as usize >= mats.len() || a.max(b).max(c) >= p.len().min(n.len()) {
+                    continue;
+                }
+                tris.push(Tri { p: [p[a], p[b], p[c]], n: [n[a], n[b], n[c]], mat });
+            }
+        }
+        // Cards: two triangles each, as the tracer's structure has them.
+        let mut cards = Vec::new();
+        for c in &t.cards {
+            let k = CARD | cards.len() as u32;
+            let v = c.view;
+            tris.push(Tri { p: [v[0], v[1], v[2]], n: [[0.0; 3]; 3], mat: k });
+            tris.push(Tri { p: [v[0], v[2], v[3]], n: [[0.0; 3]; 3], mat: k });
+            let b = c.picture;
+            cards.push(Card { origin: [b.origin[0] as f32, b.origin[1] as f32], factor: [b.factor[0] as f32, b.factor[1] as f32], offset: b.offset as usize, size: (b.size.0 as i32, b.size.1 as i32) });
+        }
+        let volumes = mats.iter().any(|m| m.volume.is_some());
+        let mut scene = Scene { tris, mats, nodes: Vec::new(), cards, groups, rows, images, volumes, focal: t.focal, centre: t.centre, root: t.root };
+        let n = scene.tris.len();
+        if n > 0 {
+            let mut centres: Vec<V3> = scene.tris.iter().map(|t| mul(add(add(t.p[0], t.p[1]), t.p[2]), 1.0 / 3.0)).collect();
+            scene.nodes.reserve(n / 2 + 1);
+            scene.split(&mut centres, 0, n);
+        }
+        scene
+    }
+
+    /// The node over triangles `from..to` (sorted in place, with their
+    /// centres): halved at the median along its centres' longest side
+    /// until four or fewer are left.
+    fn split(&mut self, centres: &mut [V3], from: usize, to: usize) -> u32 {
+        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        let (mut clo, mut chi) = (lo, hi);
+        for k in from..to {
+            for p in self.tris[k].p {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+            for a in 0..3 {
+                clo[a] = clo[a].min(centres[k][a]);
+                chi[a] = chi[a].max(centres[k][a]);
+            }
+        }
+        let me = self.nodes.len();
+        self.nodes.push(Node { lo, hi, at: from as u32, count: (to - from) as u32 });
+        if to - from <= 4 {
+            return me as u32;
+        }
+        let side = sub(chi, clo);
+        let axis = if side[0] >= side[1] && side[0] >= side[2] { 0 } else if side[1] >= side[2] { 1 } else { 2 };
+        let mid = (from + to) / 2;
+        // (Triangles and centres together: sort an order, then apply it.)
+        let mut order: Vec<usize> = (from..to).collect();
+        order.select_nth_unstable_by(mid - from, |a, b| centres[*a][axis].total_cmp(&centres[*b][axis]));
+        let mut seen = vec![false; to - from];
+        for start in 0..order.len() {
+            if seen[start] {
+                continue;
+            }
+            // Follow the cycle that brings each to its place.
+            let mut k = start;
+            while !seen[k] {
+                seen[k] = true;
+                let next = order[k] - from;
+                if !seen[next] {
+                    self.tris.swap(from + k, from + next);
+                    centres.swap(from + k, from + next);
+                }
+                k = next;
+            }
+        }
+        self.split(centres, from, mid);
+        let second = self.split(centres, mid, to);
+        self.nodes[me].at = second;
+        self.nodes[me].count = 0;
+        me as u32
+    }
+
+    /// pt.wgsl `card_picture`: card `k`'s picture (premultiplied sRGB) at
+    /// camera-space point `p`.
+    fn card_picture(&self, k: usize, p: V3) -> [f32; 4] {
+        let Some(c) = self.cards.get(k) else { return [0.0; 4] };
+        let r = &self.root;
+        let s = [self.focal * p[0] / p[2] + self.centre[0], self.focal * p[1] / p[2] + self.centre[1], 1.0];
+        let q = [dot([r[0], r[1], r[2]], s), dot([r[3], r[4], r[5]], s), dot([r[6], r[7], r[8]], s)];
+        let g = [(q[0] / q[2] - c.origin[0]) / c.factor[0] - 0.5, (q[1] / q[2] - c.origin[1]) / c.factor[1] - 0.5];
+        let (x0, y0) = (g[0].floor(), g[1].floor());
+        let (fx, fy) = (g[0] - x0, g[1] - y0);
+        let at = |x: i32, y: i32| {
+            if x < 0 || y < 0 || x >= c.size.0 || y >= c.size.1 {
+                return [0.0; 4];
+            }
+            self.groups.get(c.offset + (y * c.size.0 + x) as usize).copied().unwrap_or([0.0; 4])
+        };
+        let (xi, yi) = (x0 as i32, y0 as i32);
+        let (a, b, cc, dd) = (at(xi, yi), at(xi + 1, yi), at(xi, yi + 1), at(xi + 1, yi + 1));
+        std::array::from_fn(|i| {
+            let (top, bottom) = (a[i] + (b[i] - a[i]) * fx, cc[i] + (dd[i] - cc[i]) * fx);
+            top + (bottom - top) * fy
+        })
+    }
+
+    /// The nearest thing that takes of the ray along `o + t d`, `from` <
+    /// t: t, the triangle and where in it (the weights of its second and
+    /// third corners).
+    fn cast(&self, o: V3, d: V3, from: f32, ray: Ray) -> Option<(f32, usize, [f32; 2])> {
+        let least = if ray == Ray::Sky { SKY_LEAST } else { 0.5 };
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let inv = [1.0 / d[0], 1.0 / d[1], 1.0 / d[2]];
+        let mut best: Option<(f32, usize, [f32; 2])> = None;
+        let mut far = 1e30f32;
+        let mut stack = [0u32; 64];
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let index = stack[top];
+            let node = &self.nodes[index as usize];
+            let (mut t0, mut t1) = (0.0f32, far);
+            for a in 0..3 {
+                let (x, y) = ((node.lo[a] - o[a]) * inv[a], (node.hi[a] - o[a]) * inv[a]);
+                t0 = t0.max(x.min(y));
+                t1 = t1.min(x.max(y));
+            }
+            // (A NaN, from a ray along a box's face, passes: looked into.)
+            if t0 > t1 {
+                continue;
+            }
+            if node.count == 0 {
+                // (Its first child follows it. Halving keeps the tree
+                // far shallower than the stack.)
+                if top + 2 <= stack.len() {
+                    stack[top] = node.at;
+                    stack[top + 1] = index + 1;
+                    top += 2;
+                }
+                continue;
+            }
+            for k in node.at as usize..(node.at + node.count) as usize {
+                let tri = &self.tris[k];
+                let card = tri.mat & CARD != 0;
+                if if card { ray == Ray::Camera } else { !(self.mats[tri.mat as usize].cover >= least) } {
+                    continue;
+                }
+                let Some((t, [u, v])) = meet(tri, o, d) else { continue };
+                if t > from && t < far {
+                    if card && self.card_picture((tri.mat & !CARD) as usize, add(o, mul(d, t)))[3] <= least {
+                        continue;
+                    }
+                    far = t;
+                    best = Some((t, k, [u, v]));
+                }
+            }
+        }
+        best
+    }
+
+    /// pt.wgsl `sky_shade`: how much of a shadow ray gets past the
+    /// surfaces and cards between `o` and `tmax` along `d`, each taking
+    /// what it covers (0: under SKY_LEAST of it).
+    fn shade(&self, o: V3, d: V3, tmax: f32) -> f32 {
+        if self.nodes.is_empty() {
+            return 1.0;
+        }
+        let inv = [1.0 / d[0], 1.0 / d[1], 1.0 / d[2]];
+        let mut left = 1.0f32;
+        let mut stack = [0u32; 64];
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let index = stack[top];
+            let node = &self.nodes[index as usize];
+            let (mut t0, mut t1) = (0.0f32, tmax);
+            for a in 0..3 {
+                let (x, y) = ((node.lo[a] - o[a]) * inv[a], (node.hi[a] - o[a]) * inv[a]);
+                t0 = t0.max(x.min(y));
+                t1 = t1.min(x.max(y));
+            }
+            if t0 > t1 {
+                continue;
+            }
+            if node.count == 0 {
+                if top + 2 <= stack.len() {
+                    stack[top] = node.at;
+                    stack[top + 1] = index + 1;
+                    top += 2;
+                }
+                continue;
+            }
+            for k in node.at as usize..(node.at + node.count) as usize {
+                let tri = &self.tris[k];
+                let card = tri.mat & CARD != 0;
+                if !card && self.mats[tri.mat as usize].cover <= 0.0 {
+                    continue;
+                }
+                let Some((t, _)) = meet(tri, o, d) else { continue };
+                if t > 0.0 && t < tmax {
+                    let cover = if card { self.card_picture((tri.mat & !CARD) as usize, add(o, mul(d, t)))[3] } else { self.mats[tri.mat as usize].cover };
+                    left *= 1.0 - cover.clamp(0.0, 1.0);
+                    if left < SKY_LEAST {
+                        return 0.0;
+                    }
+                }
+            }
+        }
+        left
+    }
+
+    /// pt.wgsl `sky_through`: how much of a ray gets through the volumes
+    /// between `o` and `tmax` along `d`, their density marched in eight
+    /// even steps a crossing.
+    fn through(&self, o: V3, d: V3, tmax: f32) -> f32 {
+        self.through_with(o, d, tmax).0
+    }
+
+    /// And the volume that takes most of it, with where along the ray it
+    /// does (the middle of what it takes): pt.wgsl's `vol_mat`, `vol_at`.
+    fn through_with(&self, o: V3, d: V3, tmax: f32) -> (f32, Option<(u32, V3)>) {
+        if !self.volumes || self.nodes.is_empty() {
+            return (1.0, None);
+        }
+        // Every crossing of a volume's faces along the whole ray, in
+        // order (at most eight).
+        let mut found: Vec<(f32, u32)> = Vec::new();
+        let inv = [1.0 / d[0], 1.0 / d[1], 1.0 / d[2]];
+        let mut stack = [0u32; 64];
+        let mut top = 1;
+        while top > 0 {
+            top -= 1;
+            let index = stack[top];
+            let node = &self.nodes[index as usize];
+            let (mut t0, mut t1) = (0.0f32, 1e30f32);
+            for a in 0..3 {
+                let (x, y) = ((node.lo[a] - o[a]) * inv[a], (node.hi[a] - o[a]) * inv[a]);
+                t0 = t0.max(x.min(y));
+                t1 = t1.min(x.max(y));
+            }
+            if t0 > t1 {
+                continue;
+            }
+            if node.count == 0 {
+                if top + 2 <= stack.len() {
+                    stack[top] = node.at;
+                    stack[top + 1] = index + 1;
+                    top += 2;
+                }
+                continue;
+            }
+            for k in node.at as usize..(node.at + node.count) as usize {
+                let tri = &self.tris[k];
+                if tri.mat & CARD != 0 || self.mats[tri.mat as usize].volume.is_none() {
+                    continue;
+                }
+                if let Some((t, _)) = meet(tri, o, d) {
+                    if t > 0.0 && t < 1e30 {
+                        found.push((t, tri.mat));
+                    }
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.truncate(8);
+        let mut tau = 0.0f32;
+        let (mut most, mut which) = (0.0f32, None);
+        // (A volume is an instance: its faces may each have a material
+        // row of their own.)
+        let of = |mat: u32| self.mats[mat as usize].volume.map(|v| v.0);
+        for i in 0..found.len() {
+            let me = found[i].1;
+            if found[..i].iter().any(|f| of(f.1) == of(me)) {
+                continue;
+            }
+            let Some((inst, row, sigma)) = self.mats[me as usize].volume else { continue };
+            let mut inside = found.iter().filter(|f| of(f.1) == of(me)).count() % 2 == 1;
+            let mut from = 0.0f32;
+            let (mut mine, mut along) = (0.0f32, 0.0f32);
+            for j in 0..=found.len() {
+                let to = match found.get(j) {
+                    Some(f) if of(f.1) != of(me) => continue,
+                    Some(f) => f.0.min(tmax),
+                    None => tmax,
+                };
+                if inside && to > from && to < 1e29 {
+                    let dt = (to - from) / 8.0;
+                    for s in 0..8 {
+                        let at = from + (s as f32 + 0.5) * dt;
+                        let step = sigma * crate::mesh3d::volume_density(self.rows[inst], self.images, row, add(o, mul(d, at))) * dt;
+                        mine += step;
+                        along += step * at;
+                    }
+                }
+                inside = !inside;
+                from = to;
+                if to >= tmax {
+                    break;
+                }
+            }
+            tau += mine;
+            if mine > most {
+                most = mine;
+                which = Some((me, add(o, mul(d, along / mine))));
+            }
+        }
+        ((-tau).exp(), which)
+    }
+
+    /// pt.wgsl `sky_volume_light`: the light volume `mat` scatters back
+    /// along ray `j` travelling `d` from where it takes it, `p`: the
+    /// raster's own rule for a volume's light (mesh3d.rs `volume_lights`,
+    /// no tap toward the lights), the even part by what one ray from `p`
+    /// finds.
+    fn volume_light(&self, t: &Trace, env: &Env, mat: u32, p: V3, d: V3, j: f32) -> V3 {
+        let Some((inst, row, _)) = self.mats[mat as usize].volume else { return [0.0; 3] };
+        let m = self.rows[inst];
+        let lights = &t.lights[..];
+        let r = |i: usize| lights.get(i).copied().unwrap_or([0.0; 4]);
+        let xyz = |r: [f32; 4]| [r[0], r[1], r[2]];
+        let pi = std::f32::consts::PI;
+        let hg = |g: f32, c: f32| {
+            let k = 1.0 + g * g - 2.0 * g * c;
+            (1.0 - g * g) / (4.0 * pi * (k * k.max(0.0).sqrt()).max(1e-6))
+        };
+        let (mut sc, mut ambient) = ([0.0f32; 3], [0.0f32; 3]);
+        for i in 0..r(0)[0] as usize {
+            let (row_l, mut col) = (r(7 + i * LROWS), xyz(r(7 + i * LROWS + 1)));
+            let kind = row_l[3] as u32;
+            if kind == 2 {
+                ambient = add(ambient, col);
+                continue;
+            }
+            let mut l = xyz(row_l);
+            if kind == 1 || kind == 3 {
+                let dl = sub(xyz(row_l), p);
+                let dist = dot(dl, dl).sqrt();
+                l = mul(dl, 1.0 / dist.max(1e-20));
+                col = mul(col, crate::mesh3d::range_window(dist, r(7 + i * LROWS + 2)[0]));
+                if kind == 3 {
+                    col = mul(col, 1e6 / (dist * dist + r(7 + i * LROWS + 4)[3].max(1.0) / pi));
+                }
+            }
+            sc = add(sc, mul(col, pi * hg(m[row + 18][1], dot(l, d))));
+        }
+        let z = 1.0 - 2.0 * (j * 0.754_877_7 + 0.5).fract();
+        let phi = 2.0 * pi * (j * 0.569_840_3 + 0.25).fract();
+        let s = (1.0 - z * z).max(0.0).sqrt();
+        let way = [s * phi.cos(), s * phi.sin(), z];
+        let (up, down) = ([0.0, -1.0, 0.0], [0.0, 1.0, 0.0]);
+        sc = add(sc, match self.hit(p, way, 0.0, Ray::Onward) {
+            None if lights.len() <= 6 => ambient,
+            None if env.image => add(mul(add(self.env_on(t, env, up), self.env_on(t, env, down)), 0.5), ambient),
+            None => add(add(env.even(way), mul(add(crate::mesh3d::env_lobes_diffuse(lights, 0, up), crate::mesh3d::env_lobes_diffuse(lights, 0, down)), 0.5)), ambient),
+            Some(Hit { card: Some(c), .. }) => [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode),
+            Some(Hit { mat: Mat { flat: Some(c), .. }, .. }) => c,
+            Some(far) => {
+                let e = mul(env.even_diffuse(far.n), SKY_REST);
+                sky_lit(self, t, &far, [e[0], e[1], e[2], SKY_REST])
+            }
+        });
+        let albedo = xyz(m[row + 19]);
+        add([albedo[0] * sc[0], albedo[1] * sc[1], albedo[2] * sc[2]], xyz(m[row + 20]))
+    }
+
+    /// The environment's light on a matte surface facing world direction
+    /// `n` (the raster's `env_diffuse`, by the rows the rays have).
+    fn env_on(&self, t: &Trace, env: &Env, n: V3) -> V3 {
+        let lights = &t.lights[..];
+        if !env.image {
+            return crate::mesh3d::env_diffuse(lights, 0, n);
+        }
+        match t.env.as_ref().map(|e| (&e.raster, e.raster.first().copied().unwrap_or([0.0; 4]))) {
+            Some((rows, d)) if d[2] >= 1.0 && d[3] >= 1.0 && d[1] as usize + d[2] as usize * d[3] as usize <= rows.len() => mul(crate::mesh3d::env_tex(rows, d[1] as usize, d[2] as usize, d[3] as usize, crate::mesh3d::env_uv(lights, 0, n)), lights[0][3]),
+            _ => [0.0; 3],
+        }
+    }
+
+    /// pt.wgsl `cast_ray` for the sky's rays: the nearest surface and its
+    /// normals facing the ray, or a card with its picture's colour.
+    fn hit(&self, o: V3, d: V3, from: f32, ray: Ray) -> Option<Hit> {
+        let (t, k, uv) = self.cast(o, d, from, ray)?;
+        let tri = &self.tris[k];
+        if tri.mat & CARD != 0 {
+            let p = add(o, mul(d, t));
+            let back = mul(d, -1.0);
+            let c = self.card_picture((tri.mat & !CARD) as usize, p);
+            return Some(Hit { t, p, n: back, g: back, mat: Mat { flags: 0, cover: 1.0, kd: [0.0; 3], emit: [0.0; 3], flat: None, volume: None }, card: Some(c), cover: c[3].clamp(0.0, 1.0) });
+        }
+        let mat = self.mats[tri.mat as usize];
+        let w = [1.0 - uv[0] - uv[1], uv[0], uv[1]];
+        let mut g = norm(cross(sub(tri.p[1], tri.p[0]), sub(tri.p[2], tri.p[0])));
+        let mut n = norm(add(add(mul(tri.n[0], w[0]), mul(tri.n[1], w[1])), mul(tri.n[2], w[2])));
+        if mat.flags & FLAG_FACETED != 0 {
+            n = g;
+        }
+        if dot(g, d) > 0.0 {
+            g = mul(g, -1.0);
+        }
+        if dot(n, g) < 0.0 {
+            n = mul(n, -1.0);
+        }
+        Some(Hit { t, p: add(o, mul(d, t)), n, g, mat, card: None, cover: mat.cover.clamp(0.0, 1.0) })
+    }
+}
+
+/// Where `o + t d` meets a triangle: t and the weights of its second and
+/// third corners.
+fn meet(tri: &Tri, o: V3, d: V3) -> Option<(f32, [f32; 2])> {
+    let (e1, e2) = (sub(tri.p[1], tri.p[0]), sub(tri.p[2], tri.p[0]));
+    let pv = cross(d, e2);
+    let det = dot(e1, pv);
+    if det.abs() < 1e-20 {
+        return None;
+    }
+    let tv = sub(o, tri.p[0]);
+    let u = dot(tv, pv) / det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let qv = cross(tv, e1);
+    let v = dot(d, qv) / det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    Some((dot(e2, qv) / det, [u, v]))
+}
+
+/// pt.wgsl `offset`.
+fn offset(h: &Hit, toward: V3) -> V3 {
+    let eps = 0.02 + h.t * 1e-5;
+    if dot(toward, h.g) >= 0.0 {
+        add(h.p, mul(h.g, eps))
+    } else {
+        sub(h.p, mul(h.g, eps))
+    }
+}
+
+/// The environment as the rays take it (pt.wgsl `sky_env`): without an
+/// image, the sky, horizon and ground toward camera direction `d` as they
+/// are (what the tracer's `env_smooth` has, less the ambient lights), and
+/// how much the lobes weigh that way; with an image nothing, and no
+/// weight (its light is looked up where the rays' light is used).
+struct Env<'a> {
+    lights: &'a [[f32; 4]],
+    image: bool,
+    /// Under this much weight the lobes go by the open part.
+    least: f32,
+}
+
+impl Env<'_> {
+    fn new(lights: &[[f32; 4]]) -> Env<'_> {
+        let mut env = Env { lights, image: lights.len() <= 6 || lights[0][2] > 0.5, least: 0.0 };
+        if !env.image {
+            env.least = 0.02 * env.lobe_rows().map(|(_, c)| c[0] + c[1] + c[2]).sum::<f32>();
+        }
+        env
+    }
+    fn lobe_rows(&self) -> impl Iterator<Item = ([f32; 4], [f32; 4])> + '_ {
+        let first = 7 + self.lights[0][0] as usize * LROWS;
+        (0..self.lights[0][1] as usize).filter_map(move |i| Some((*self.lights.get(first + i * 2)?, *self.lights.get(first + i * 2 + 1)?)))
+    }
+    fn world(&self, d: V3) -> V3 {
+        let xyz = |r: [f32; 4]| [r[0], r[1], r[2]];
+        [dot(xyz(self.lights[1]), d), dot(xyz(self.lights[2]), d), dot(xyz(self.lights[3]), d)]
+    }
+    fn even(&self, d: V3) -> V3 {
+        if self.image {
+            return [0.0; 3];
+        }
+        let up = -self.world(d)[1];
+        let xyz = |r: [f32; 4]| [r[0], r[1], r[2]];
+        let (sky, horizon, ground) = (xyz(self.lights[4]), xyz(self.lights[5]), xyz(self.lights[6]));
+        let step = |e: f32, x: f32| {
+            let t = (x / e).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let (to, k) = if up >= 0.0 { (sky, step(0.6, up)) } else { (ground, step(0.2, -up)) };
+        add(horizon, mul(sub(to, horizon), k))
+    }
+    /// The same on a matte surface facing `n` (the raster's fit).
+    fn even_diffuse(&self, n: V3) -> V3 {
+        if self.image {
+            return [0.0; 3];
+        }
+        crate::mesh3d::env_even(self.lights, 0, self.world(n))
+    }
+    fn lobes(&self, d: V3) -> f32 {
+        if self.image {
+            return 0.0;
+        }
+        let w = self.world(d);
+        self.lobe_rows().map(|(l, c)| (c[0] + c[1] + c[2]) * ((dot(w, [l[0], l[1], l[2]]) - 1.0) / (l[3] * l[3]).max(1e-6)).exp()).sum()
+    }
+}
+
+/// pt.wgsl `SKY_REST`.
+const SKY_REST: f32 = 0.5;
+
+/// pt.wgsl `sky_turn`: the ray that goes on from the surface ray `j` of
+/// a texel ended on, of a fixed set as the first (spread by the cosine
+/// about that surface); `again`: the one after that. None: under the
+/// true surface.
+fn sky_turn(h: &Hit, j: f32, again: bool) -> Option<V3> {
+    let (a, b, c, e) = if again { (0.819_172_5, 0.671_043_6, 0.25, 0.75) } else { (0.754_877_7, 0.569_840_3, 0.5, 0.25) };
+    let u1 = (j * a + c).fract();
+    let phi = 2.0 * std::f32::consts::PI * (j * b + e).fract();
+    let r = u1.sqrt();
+    let frame = basis(h.n);
+    let local = [r * phi.cos(), r * phi.sin(), (1.0 - u1).sqrt()];
+    let d = norm(add(add(mul(frame[0], local[0]), mul(frame[1], local[1])), mul(frame[2], local[2])));
+    (dot(d, h.g) > 0.02).then_some(d)
+}
+
+/// pt.wgsl `sky_onward`: what the surface ray `j` of a texel ended on
+/// sees itself, by one ray more from it: the sky's light along it and how
+/// far it is open, or the light of what it ends on, that one lit by
+/// whether a last ray from it is open.
+fn sky_onward(scene: &Scene, t: &Trace, env: &Env, h: &Hit, j: f32) -> [f32; 4] {
+    let Some(d) = sky_turn(h, j, false) else { return [0.0; 4] };
+    let o = offset(h, h.g);
+    let far = scene.hit(o, d, 0.0, Ray::Onward);
+    let (through, volume) = scene.through_with(o, d, far.as_ref().map_or(1e30, |f| f.t));
+    // (What the volumes on its way take of it, they scatter back.)
+    let scattered = volume.filter(|_| through < 1.0).map_or([0.0; 3], |(mat, p)| mul(scene.volume_light(t, env, mat, p, d, j), 1.0 - through));
+    let light = match far {
+        None => {
+            let e = env.even(d);
+            return [e[0] * through + scattered[0], e[1] * through + scattered[1], e[2] * through + scattered[2], through];
+        }
+        Some(Hit { card: Some(c), .. }) => [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode),
+        Some(Hit { mat: Mat { flat: Some(c), .. }, .. }) => c,
+        Some(far) => {
+            // (Not open: SKY_REST of the environment, for all the light
+            // that would still come back from there.)
+            let e = mul(env.even_diffuse(far.n), SKY_REST);
+            let mut seen = [e[0], e[1], e[2], SKY_REST];
+            if let Some(d) = sky_turn(&far, j, true) {
+                let o = offset(&far, far.g);
+                let open = scene.shade(o, d, 1e30);
+                if open > 0.0 {
+                    let (open, e) = (open * scene.through(o, d, 1e30), env.even(d));
+                    seen = [e[0] * open, e[1] * open, e[2] * open, open];
+                }
+            }
+            sky_lit(scene, t, &far, seen)
+        }
+    };
+    [light[0] * through + scattered[0], light[1] * through + scattered[1], light[2] * through + scattered[2], 0.0]
+}
+
+/// pt.wgsl `sky_lit`: the light a surface the sky's ray ends on sends
+/// back, under what it sees itself (`seen`: the light along one ray more
+/// from it, and how far that is open).
+fn sky_lit(scene: &Scene, t: &Trace, h: &Hit, seen: [f32; 4]) -> V3 {
+    let open = seen[3];
+    let lights = &t.lights[..];
+    let row = |i: usize| lights.get(i).copied().unwrap_or([0.0; 4]);
+    let xyz = |r: [f32; 4]| [r[0], r[1], r[2]];
+    let world = [dot(xyz(row(1)), h.n), dot(xyz(row(2)), h.n), dot(xyz(row(3)), h.n)];
+    // The sky, horizon and ground came along the ray (`seen`); the
+    // lobes as the raster's own shading takes them, and an environment
+    // image's diffuse level, by how far the ray was open.
+    let mut l = if lights.len() <= 6 {
+        [0.0; 3]
+    } else if lights[0][2] > 0.5 {
+        match t.env.as_ref().map(|e| (&e.raster, e.raster.first().copied().unwrap_or([0.0; 4]))) {
+            Some((rows, d)) if d[2] >= 1.0 && d[3] >= 1.0 && d[1] as usize + d[2] as usize * d[3] as usize <= rows.len() => mul(crate::mesh3d::env_tex(rows, d[1] as usize, d[2] as usize, d[3] as usize, crate::mesh3d::env_uv(lights, 0, world)), lights[0][3] * open),
+            _ => [0.0; 3],
+        }
+    } else {
+        mul(crate::mesh3d::env_lobes_diffuse(lights, 0, world), open)
+    };
+    l = add(l, [seen[0], seen[1], seen[2]]);
+    for i in 0..row(0)[0] as usize {
+        let (r, col, extra) = (row(7 + i * LROWS), row(7 + i * LROWS + 1), row(7 + i * LROWS + 2));
+        let kind = r[3] as u32;
+        if kind == 2 {
+            l = add(l, mul(xyz(col), open));
+            continue;
+        }
+        let (mut to, mut dist, mut window) = (norm(xyz(r)), 1e30f32, 1.0f32);
+        if kind != 0 {
+            let away = sub(xyz(r), h.p);
+            dist = dot(away, away).sqrt();
+            to = mul(away, 1.0 / dist.max(1e-6));
+            if extra[0] > 0.0 {
+                let x = dist / extra[0];
+                let w = (1.0 - x * x * x * x).clamp(0.0, 1.0);
+                window = w * w;
+            }
+        }
+        let facing = dot(h.n, to);
+        if facing <= 0.0 {
+            continue;
+        }
+        let lit = if col[3] > 0.5 { scene.shade(offset(h, to), to, dist * 0.999) } else { 1.0 };
+        l = add(l, mul(xyz(col), facing * window * lit));
+    }
+    add([h.mat.kd[0] * l[0], h.mat.kd[1] * l[1], h.mat.kd[2] * l[2]], h.mat.emit)
+}
+
+const SKY_ORDER: [u32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+/// What `sky` leaves of a texel before the filters.
+#[derive(Clone, Copy, Default)]
+struct Raw {
+    /// The open rays' directions summed, over the rays; the camera depth.
+    open: [f32; 4],
+    /// The true normal (two numbers), its plane, the open part.
+    plane: [f32; 4],
+    back: V3,
+    /// The lobes' weight along the open rays, and along all of them.
+    lobe: [f32; 2],
+    /// A volume before the surface (or before nothing): how much of the
+    /// environment's mean light it has where it takes the camera's ray,
+    /// and 1.
+    volume: [f32; 2],
+}
+
+/// Fills traced list `t`'s sky group, `w` × `h` texels of visibility, as
+/// many after them of the light that comes back and as many of the
+/// surfaces' planes, at `out`. `groups`: the list's groups before it (its
+/// cards' pictures); `images`: the image pool's texels (a volume's grid).
+pub(crate) fn fill(t: &Trace, groups: &[[f32; 4]], images: &[u32], w: usize, h: usize, out: &mut [[f32; 4]], threads: usize) {
+    if out.len() < w * h * 3 || w == 0 || h == 0 {
+        return;
+    }
+    // LAHZA_SKY_TIMES: where the time goes (the structure, the rays, the
+    // two filter passes), on stderr.
+    let times = std::env::var_os("LAHZA_SKY_TIMES").is_some();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |what: &str| {
+        if times {
+            eprintln!("sky visibility, {w} x {h}: {what} {:.1} ms", clock.elapsed().as_secs_f64() * 1000.0);
+        }
+        clock = std::time::Instant::now();
+    };
+    let scene = Scene::new(t, groups, images);
+    lap(&format!("a BVH over {} triangles", scene.tris.len()));
+    let inv = t.inv_root;
+    let dir = |x: f32, y: f32| {
+        let tp = [t.origin[0] + t.factor[0] * (x + 0.5), t.origin[1] + t.factor[1] * (y + 0.5), 1.0];
+        let q = [dot([inv[0], inv[1], inv[2]], tp), dot([inv[3], inv[4], inv[5]], tp), dot([inv[6], inv[7], inv[8]], tp)];
+        norm([(q[0] / q[2] - t.centre[0]) / t.focal, (q[1] / q[2] - t.centre[1]) / t.focal, 1.0])
+    };
+    let rays = t.options.spp.max(1);
+    let env = Env::new(&t.lights);
+    let texel = |x: usize, y: usize| -> Raw {
+        let d = dir(x as f32, y as f32);
+        let mut raw = Raw::default();
+        let hit = scene.hit([0.0; 3], d, 0.0, Ray::Camera);
+        let total = (rays * 16) as f32;
+        let place = SKY_ORDER[(y % 4) * 4 + x % 4];
+        // A volume on the camera's ray takes the sky too: from where it
+        // takes the ray, rays all round. As one number: how much of the
+        // environment's mean light from above and below the rays bring,
+        // an open one the sky's along it, another the light of what it
+        // ends on (pt.wgsl `sky`).
+        if let (_, Some((_, at))) = scene.through_with([0.0; 3], d, hit.as_ref().map_or(1e30, |h| h.t)) {
+            let lum = |c: V3| c[0] + c[1] + c[2];
+            let (up, down) = ([0.0, -1.0, 0.0], [0.0, 1.0, 0.0]);
+            let whole = lum(mul(add(scene.env_on(t, &env, up), scene.env_on(t, &env, down)), 0.5));
+            let even = if env.image || t.lights.len() <= 6 { 0.0 } else { lum(mul(add(crate::mesh3d::env_even(&t.lights, 0, up), crate::mesh3d::env_even(&t.lights, 0, down)), 0.5)) };
+            let mut got = 0.0f32;
+            for k in 0..rays {
+                let j = (k * 16 + place) as f32;
+                let z = 1.0 - 2.0 * (j + 0.5) / total;
+                let phi = 2.0 * std::f32::consts::PI * (j * 0.618_034 + 0.25).fract();
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let ray = [r * phi.cos(), r * phi.sin(), z];
+                let light = match scene.hit(at, ray, 0.0, Ray::Onward) {
+                    None => {
+                        got += if env.image { 1.0 } else { lum(env.even(ray)) / even.max(1e-6) };
+                        continue;
+                    }
+                    Some(Hit { card: Some(c), .. }) => [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode),
+                    Some(Hit { mat: Mat { flat: Some(c), .. }, .. }) => c,
+                    Some(far) => sky_lit(&scene, t, &far, sky_onward(&scene, t, &env, &far, j)),
+                };
+                got += lum(light) / whole.max(1e-6);
+            }
+            raw.volume = [(got / rays as f32).min(2.0), 1.0];
+        }
+        let Some(hit) = hit else { return raw };
+        let frame = basis(hit.n);
+        let o = offset(&hit, hit.g);
+        let (mut sum, mut n, mut back) = ([0.0f32; 3], 0.0f32, [0.0f32; 3]);
+        for k in 0..rays {
+            let j = (k * 16 + place) as f32;
+            let u1 = (j + 0.5) / total;
+            let phi = 2.0 * std::f32::consts::PI * (j * 0.618_034 + 0.25).fract();
+            let r = u1.sqrt();
+            let local = [r * phi.cos(), r * phi.sin(), (1.0 - u1).sqrt()];
+            let ray = norm(add(add(mul(frame[0], local[0]), mul(frame[1], local[1])), mul(frame[2], local[2])));
+            if dot(ray, hit.g) <= 0.02 {
+                continue;
+            }
+            let lobes = env.lobes(ray);
+            raw.lobe[1] += lobes;
+            // The ray goes on through what covers it in part, with what
+            // each thing leaves of it (four things at most).
+            let (mut left, mut from, mut passed) = (1.0f32, 0.0f32, 1.0f32);
+            for _ in 0..4 {
+                let far = scene.hit(o, ray, from, Ray::Sky);
+                // (And what the volumes on its way let through; what
+                // they take of it since the thing before, they scatter
+                // back.)
+                let (clear, volume) = scene.through_with(o, ray, far.as_ref().map_or(1e30, |f| f.t));
+                if let Some((mat, p)) = volume.filter(|_| passed > clear) {
+                    back = add(back, mul(scene.volume_light(t, &env, mat, p, ray, j), left * (passed - clear)));
+                }
+                passed = clear;
+                let through = left * clear;
+                let Some(far) = far else {
+                    sum = add(sum, mul(ray, through));
+                    n += through;
+                    // (The sky's own light along it, with the light back.)
+                    back = add(back, mul(env.even(ray), through));
+                    raw.lobe[0] += lobes * through;
+                    break;
+                };
+                let light = match &far {
+                    // (A card's colour comes back as it is.)
+                    Hit { card: Some(c), .. } => [c[0] / c[3], c[1] / c[3], c[2] / c[3]].map(crate::mesh3d::srgb_decode),
+                    // (And what is not lit.)
+                    Hit { mat: Mat { flat: Some(c), .. }, .. } => *c,
+                    far => sky_lit(&scene, t, far, sky_onward(&scene, t, &env, far, j)),
+                };
+                back = add(back, mul(light, through * far.cover));
+                left *= 1.0 - far.cover;
+                if left < SKY_LEAST {
+                    break;
+                }
+                from = far.t * 1.0001 + 0.01;
+            }
+        }
+        let e = oct_encode(hit.g);
+        raw.open = [sum[0] / rays as f32, sum[1] / rays as f32, sum[2] / rays as f32, d[2] * hit.t];
+        raw.plane = [e[0], e[1], dot(hit.g, hit.p), n / rays as f32];
+        raw.back = mul(back, 1.0 / rays as f32);
+        raw.lobe = [raw.lobe[0] / rays as f32, raw.lobe[1] / rays as f32];
+        raw
+    };
+    let rows = |f: &(dyn Fn(usize, &mut [Raw]) + Sync), into: &mut [Raw]| {
+        let per = h.div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|s| {
+            for (k, chunk) in into.chunks_mut(per * w).enumerate() {
+                s.spawn(move || {
+                    for (r, row) in chunk.chunks_mut(w).enumerate() {
+                        f(k * per + r, row);
+                    }
+                });
+            }
+        });
+    };
+    let mut raw = vec![Raw::default(); w * h];
+    rows(
+        &|y, row| {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = texel(x, y);
+            }
+        },
+        &mut raw,
+    );
+    lap("the rays");
+    // (Each texel's ray and true normal once, not once a tap: the same
+    // numbers the filter would work out.)
+    let dirs: Vec<V3> = (0..w * h).map(|i| dir((i % w) as f32, (i / w) as f32)).collect();
+    let normals: Vec<V3> = raw.iter().map(|r| if r.open[3] > 0.0 { oct_decode([r.plane[0], r.plane[1]]) } else { [0.0; 3] }).collect();
+    // pt.wgsl `sky_filter`: the tile's sixteen places as one value (step
+    // 0), then smoothed two texels apart.
+    let filter = |from: &[Raw], values: Option<&[Raw]>, step: i32, x: usize, y: usize| -> Raw {
+        let c = from[y * w + x];
+        if c.open[3] <= 0.0 {
+            return Raw::default();
+        }
+        let n0 = normals[y * w + x];
+        let (mut sums, mut backs, mut weights) = ([[0.0f32; 6]; 16], [[0.0f32; 3]; 16], [0.0f32; 16]);
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let (px, py) = (x as i32 + dx * step.max(1), y as i32 + dy * step.max(1));
+                if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                    continue;
+                }
+                let j = py as usize * w + px as usize;
+                let cj = from[j];
+                if cj.open[3] <= 0.0 {
+                    continue;
+                }
+                let dj = dirs[j];
+                let pj = mul(dj, cj.open[3] / dj[2]);
+                if (dot(n0, pj) - c.plane[2]).abs() > 0.01 * c.open[3] + 0.5 || dot(n0, normals[j]) < 0.9 {
+                    continue;
+                }
+                let mut wt = 1.0;
+                if dx.abs() == 2 {
+                    wt *= 0.5;
+                }
+                if dy.abs() == 2 {
+                    wt *= 0.5;
+                }
+                // (The second pass: less across a change of the open
+                // part.)
+                if let Some(v) = values {
+                    wt *= (-(v[j].open[3] - v[y * w + x].open[3]).abs() / 0.1).exp();
+                }
+                let (place, value, back) = match values {
+                    Some(v) => (0, [v[j].open[0], v[j].open[1], v[j].open[2], v[j].open[3], v[j].lobe[0], v[j].lobe[1]], v[j].back),
+                    None => ((py as usize % 4) * 4 + px as usize % 4, [cj.open[0], cj.open[1], cj.open[2], cj.plane[3], cj.lobe[0], cj.lobe[1]], cj.back),
+                };
+                for a in 0..6 {
+                    sums[place][a] += value[a] * wt;
+                }
+                backs[place] = add(backs[place], mul(back, wt));
+                weights[place] += wt;
+            }
+        }
+        let (mut sum, mut back, mut weight) = ([0.0f32; 6], [0.0f32; 3], 0.0f32);
+        for k in 0..16 {
+            if weights[k] > 0.0 {
+                for a in 0..6 {
+                    sum[a] += sums[k][a] / weights[k];
+                }
+                back = add(back, mul(backs[k], 1.0 / weights[k]));
+                weight += 1.0;
+            }
+        }
+        let weight = weight.max(1e-6);
+        // (As the filter's passes hand on: the summed direction with the
+        // open part, and the light back.)
+        Raw { open: [sum[0] / weight, sum[1] / weight, sum[2] / weight, sum[3] / weight], plane: c.plane, back: mul(back, 1.0 / weight), lobe: [sum[4] / weight, sum[5] / weight], volume: [0.0; 2] }
+    };
+    let mut once = vec![Raw::default(); w * h];
+    rows(
+        &|y, row| {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = filter(&raw, None, 0, x, y);
+            }
+        },
+        &mut once,
+    );
+    let mut twice = vec![Raw::default(); w * h];
+    rows(
+        &|y, row| {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = filter(&raw, Some(&once), 2, x, y);
+            }
+        },
+        &mut twice,
+    );
+    // The volumes' sky (pt.wgsl `sky_filter`'s first lines): the same
+    // two passes over the texels that have one, whatever is behind.
+    let volume = |from: &[[f32; 2]], step: i32, x: usize, y: usize| -> [f32; 2] {
+        if from[y * w + x][1] <= 0.0 {
+            return [0.0; 2];
+        }
+        let (mut sums, mut weights) = ([0.0f32; 16], [0.0f32; 16]);
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                let (px, py) = (x as i32 + dx * step.max(1), y as i32 + dy * step.max(1));
+                if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                    continue;
+                }
+                let v = from[py as usize * w + px as usize];
+                if v[1] <= 0.0 {
+                    continue;
+                }
+                let mut wt = 1.0;
+                if dx.abs() == 2 {
+                    wt *= 0.5;
+                }
+                if dy.abs() == 2 {
+                    wt *= 0.5;
+                }
+                let place = if step > 0 { 0 } else { (py as usize % 4) * 4 + px as usize % 4 };
+                sums[place] += v[0] * wt;
+                weights[place] += wt;
+            }
+        }
+        let (mut sum, mut weight) = (0.0f32, 0.0f32);
+        for k in 0..16 {
+            if weights[k] > 0.0 {
+                sum += sums[k] / weights[k];
+                weight += 1.0;
+            }
+        }
+        [sum / weight.max(1e-6), 1.0]
+    };
+    let mut volumes = vec![[0.0f32; 2]; w * h];
+    if scene.volumes {
+        let first: Vec<[f32; 2]> = raw.iter().map(|r| r.volume).collect();
+        let once: Vec<[f32; 2]> = (0..w * h).map(|i| volume(&first, 0, i % w, i / w)).collect();
+        volumes = (0..w * h).map(|i| volume(&once, 2, i % w, i / w)).collect();
+    }
+    lap("the filter's two passes");
+    for i in 0..w * h {
+        let (c, v) = (raw[i], twice[i]);
+        // (A volume's sky and one; 0: no volume.)
+        let volume = if volumes[i][1] > 0.0 { volumes[i][0] + 1.0 } else { 0.0 };
+        if c.open[3] <= 0.0 {
+            out[i] = [0.0; 4];
+            out[w * h + i] = [0.0; 4];
+            out[2 * w * h + i] = [0.0, 0.0, 0.0, volume];
+            continue;
+        }
+        let m = [v.open[0], v.open[1], v.open[2]];
+        let toward = if dot(m, m) > 1e-8 { norm(m) } else { oct_decode([c.plane[0], c.plane[1]]) };
+        let e = oct_encode(toward);
+        out[i] = [e[0], e[1], v.open[3], c.open[3]];
+        // (The lobes by what was open of their weight; where the rays
+        // hardly met them, a narrow sun, by the open part.)
+        let lobes = (v.lobe[0] + env.least * v.open[3]) / (v.lobe[1] + env.least).max(1e-6);
+        out[w * h + i] = [v.back[0], v.back[1], v.back[2], if env.image { v.open[3] } else { lobes }];
+        out[2 * w * h + i] = [c.plane[0], c.plane[1], c.plane[2], volume];
+    }
+}
+
+/// motion.wgsl `sky_at`: of the sky group at `off` (`w` × `h` texels, a
+/// texel two target px each way), what the surface at canvas point `c`,
+/// camera point `p` on a triangle whose true normal toward the camera is
+/// `gn`, sees of the sky: the open direction (camera space), the open
+/// part, the light that comes back (with the sky's, horizon's and
+/// ground's own through the open rays, unless the environment is an
+/// image), and what is open of the lobes. None: no surface there (`own`,
+/// a see-through batch: none of its own).
+pub(crate) fn at(groups: &[[f32; 4]], off: usize, w: i32, h: i32, own: bool, c: [f32; 2], p: V3, gn: V3) -> Option<(V3, f32, V3, f32)> {
+    let g = [c[0] * 0.5 - 0.5, c[1] * 0.5 - 0.5];
+    let g0 = [(g[0] + 0.5).floor(), (g[1] + 0.5).floor()];
+    let texel = |base: usize, x: i32, y: i32| groups.get(base + (y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize).copied().unwrap_or([0.0; 4]);
+    let (mut sum, mut back, mut weight) = ([0.0f32; 4], [0.0f32; 4], 0.0f32);
+    let (mut near, mut near_back, mut nearest) = ([0.0f32; 4], [0.0f32; 4], 1e30f32);
+    for k in 0..9 {
+        let a = [g0[0] + (k % 3 - 1) as f32, g0[1] + (k / 3 - 1) as f32];
+        let t = texel(off, a[0] as i32, a[1] as i32);
+        if t[3] <= 0.0 {
+            continue;
+        }
+        let b = texel(off + (w * h) as usize, a[0] as i32, a[1] as i32);
+        let plane = texel(off + 2 * (w * h) as usize, a[0] as i32, a[1] as i32);
+        let nt = oct_decode([plane[0], plane[1]]);
+        let away = (dot(nt, p) - plane[2]).abs() / (0.01 * p[2] + 0.5) + (0.9 - dot(nt, gn)).max(0.0) * 10.0;
+        if away < nearest {
+            nearest = away;
+            near = t;
+            near_back = b;
+        }
+        let d = [(a[0] - g[0]).abs(), (a[1] - g[1]).abs()];
+        let wt = (1.5 - d[0]).max(0.0) * (1.5 - d[1]).max(0.0) * (1.0 - away).max(0.0);
+        let dir = oct_decode([t[0], t[1]]);
+        sum = [sum[0] + dir[0] * wt, sum[1] + dir[1] * wt, sum[2] + dir[2] * wt, sum[3] + t[2] * wt];
+        back = [back[0] + b[0] * wt, back[1] + b[1] * wt, back[2] + b[2] * wt, back[3] + b[3] * wt];
+        weight += wt;
+    }
+    if nearest > 1e29 {
+        return None;
+    }
+    if weight <= 1e-3 {
+        if own {
+            return None;
+        }
+        return Some((oct_decode([near[0], near[1]]), near[2].clamp(0.0, 1.0), [near_back[0], near_back[1], near_back[2]], near_back[3].clamp(0.0, 1.0)));
+    }
+    Some((norm([sum[0], sum[1], sum[2]]), (sum[3] / weight).clamp(0.0, 1.0), [back[0] / weight, back[1] / weight, back[2] / weight], (back[3] / weight).clamp(0.0, 1.0)))
+}
+
+/// motion.wgsl `sky_volume`: how much of the sky a volume at canvas point
+/// `c` has (of the environment's mean light; 1: not known), of the sky group at `off` (its third row's
+/// last number, between the four texels around that have a volume).
+pub(crate) fn at_volume(groups: &[[f32; 4]], off: usize, w: i32, h: i32, c: [f32; 2]) -> f32 {
+    let g = [c[0] * 0.5 - 0.5, c[1] * 0.5 - 0.5];
+    let g0 = [g[0].floor(), g[1].floor()];
+    let f = [g[0] - g0[0], g[1] - g0[1]];
+    let (mut sum, mut weight) = (0.0f32, 0.0f32);
+    for k in 0..4 {
+        let (x, y) = (g0[0] as i32 + (k & 1), g0[1] as i32 + (k >> 1));
+        let v = groups.get(off + 2 * (w * h) as usize + (y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize).map_or(0.0, |t| t[3]);
+        if v <= 0.0 {
+            continue;
+        }
+        let wt = (if k & 1 == 1 { f[0] } else { 1.0 - f[0] }) * (if k >> 1 == 1 { f[1] } else { 1.0 - f[1] });
+        sum += (v - 1.0) * wt;
+        weight += wt;
+    }
+    if weight <= 1e-3 {
+        return 1.0;
+    }
+    (sum / weight).clamp(0.0, 2.0)
+}

@@ -302,6 +302,21 @@ mod tests {
     }
 
     #[test]
+    fn fill_crops_to_the_split_cell_a_camera_region_draws() {
+        use super::super::scene_model::{SceneGeometry,SceneStyle};
+        // An ultrawide screen with Avoid empty area on, switched to split
+        // screen by a camera region: the crop matches the cell, not the
+        // project's own (overlay) card.
+        let style=SceneStyle {padding:8,fill:true,aspect:Some(16.0/9.0),
+            camera:CameraOverlay {layout:CameraLayout::Split,..Default::default()},..Default::default()};
+        assert!(style.fills_card());
+        let geometry=SceneGeometry::layout(1920.0,1080.0,3440.0,1440.0,&style);
+        let viewport=geometry.camera_viewport(Default::default(),&style,(3440,1440));
+        let visible_aspect=3440.0*viewport.fill.0/(1440.0*viewport.fill.1);
+        assert!((visible_aspect-geometry.media.width/geometry.media.height).abs()<1e-9);
+    }
+
+    #[test]
     fn crop_center_zoom_and_mirror_keep_the_same_selected_content() {
         let mut overlay = CameraOverlay { crop_center: (1.0, 0.0), crop_zoom: 200, ..Default::default() };
         let rect = Rect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 };

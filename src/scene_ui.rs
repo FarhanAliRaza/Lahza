@@ -1250,8 +1250,9 @@ impl Studio {
         } else {
             ViewportFrame::default()
         };
-        let has_pointer = (self.video_project.is_some() && self.video_pointer_synthesized)
-            || (self.animation_active && self.has_walkthrough());
+        let has_pointer = ((self.video_project.is_some() && self.video_pointer_synthesized)
+            || (self.animation_active && self.has_walkthrough()))
+            && !self.motion_pieces.as_ref().is_some_and(|pieces| pieces.covers_screen_at(time));
         let camera = if self.video_project.is_some() && style.has_camera_content() {
             self.camera_frame_rgba.clone()
         } else {
@@ -1283,6 +1284,12 @@ impl Studio {
             self.preview_overlay(time, canvas)
         } else {
             None
+        };
+        // Motion pieces placed over the video join the media layer, under
+        // the annotations, so zooms and camera moves carry them too.
+        let overlay = match self.motion_pieces.as_mut() {
+            Some(pieces) => pieces.media_overlay(time, overlay),
+            None => overlay,
         };
         let temporal_overlay = motion.as_ref().filter(|plan| plan.samples.len() > 1)
             .and_then(|_| {
@@ -2189,6 +2196,7 @@ impl Studio {
     ) -> AnyElement {
         let canvas_annotations = self.canvas_annotation_marks();
         let media_visible = self.image_visible_at(self.timeline_display_time());
+        let piece_frames = self.motion_piece_frames((f32::from(canvas_width) as f64, f32::from(canvas_height) as f64));
         let image = self.scene_preview_image(canvas_width, canvas_height);
         self.watch_scene_preview(cx);
         let bounds_store = self.scene_canvas_bounds.clone();
@@ -2262,6 +2270,13 @@ impl Studio {
                         .object_fit(ObjectFit::Fill),
                 )
             })
+            // Motion pieces: canvas-space, over the scene, under annotations.
+            .children(piece_frames.into_iter().map(|(frame, placement)| {
+                img(frame).absolute().inset_0().size_full().object_fit(match placement {
+                    lahza_motion_core::recording::Placement::Full => ObjectFit::Cover,
+                    lahza_motion_core::recording::Placement::Overlay => ObjectFit::Contain,
+                })
+            }))
             .child(
                 canvas(
                     // The hitbox lets occluding overlays (dialogs) shadow the
@@ -2411,6 +2426,10 @@ impl Studio {
                                         return;
                                     }
                                     this.focus_handle.focus(window);
+                                    if this.motion_canvas_pointer_down(event.position, bounds, cx) {
+                                        cx.notify();
+                                        return;
+                                    }
                                     if this.canvas_annotation_pointer_down(event.position, bounds, &canvas_hits, interaction_bounds, &annotation_bounds, event.click_count) {
                                         cx.notify();
                                         return;

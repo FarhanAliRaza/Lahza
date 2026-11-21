@@ -1976,10 +1976,23 @@ impl Studio {
         request.noise_reduction = self.video_noise_reduction;
         request.audio_mode = Some(self.video_audio_mode);
         request.audio_clips = self.video_audio_clips.iter().cloned().map(|clip| (session.directory.join(&clip.file), clip)).collect();
+        request.audio_clips.extend(self.motion_piece_audio());
         request.recording_duration = Some(self.video_recording_duration);
         request.overlay = self.annotation_overlay_source();
         request.canvas_overlay = crate::scene_ui::canvas_overlay_source_for(
             self.annotations.clone(), self.selected_canvas_ratio() as f64);
+        // Motion pieces render at export size under the canvas annotations.
+        if let Some(pieces) = self.motion_pieces.as_ref() {
+            request.pointer_hidden = pieces.screen_covered();
+            request.canvas_overlay = pieces.export_canvas_overlay(request.canvas_overlay.take(), self.export_canvas_height(), self.selected_canvas_ratio() as f64);
+            // Over-the-video pieces in the recording's space (long side
+            // capped; the compositor resamples the layer).
+            if let Some((w, h)) = self.media_dimensions() {
+                let s = (2560.0 / w.max(h) as f64).min(1.0);
+                let media = (((w as f64 * s).round() as u32).max(2), ((h as f64 * s).round() as u32).max(2));
+                request.overlay = pieces.export_media_overlay(request.overlay.take(), media);
+            }
+        }
         request.studio_overlays = Some((*self.studio_overlays()).clone());
         let source = SceneSource::Video {
             media: Self::media_source_for(&session),
@@ -2319,21 +2332,24 @@ impl Studio {
                 }
                 None => request.destination = request.format.apply_to_path(&destination),
             }
-            let _ = weak.update(cx, |this, cx| this.run_scene_export(source, request, cx));
+            let _ = weak.update(cx, |this, cx| this.run_scene_export(source, request, |_| {}, cx));
         })
         .detach();
     }
 
-    fn run_scene_export(
+    /// Runs the export in the background; `on_done` sees how it ended.
+    pub(crate) fn run_scene_export(
         &mut self,
         source: SceneSource,
         request: SceneExportRequest,
+        on_done: impl FnOnce(&Result<(), String>) + 'static,
         cx: &mut Context<Self>,
     ) {
         // The file picker is asynchronous; another export may have started
         // since this request was captured. Keep ownership of the active job.
         if self.export_progress.is_some() {
             self.toast = Some("An export is already running".into());
+            on_done(&Err("an export is already running".into()));
             cx.notify();
             return;
         }
@@ -2357,6 +2373,7 @@ impl Studio {
         self.watch_export_progress(job_progress, |_| {}, cx);
         cx.spawn(async move |weak, cx| {
             let result = task.await;
+            on_done(&result);
             let _ = weak.update(cx, |this, cx| {
                 this.export_progress = None;
                 this.toast = Some(match result {

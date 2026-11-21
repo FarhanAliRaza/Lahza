@@ -707,8 +707,11 @@ impl SceneGeometry {
     /// Cheap, allocation-free full-split crop shared by motion estimates,
     /// handles, preview, and both render backends.
     pub fn camera_viewport(&self, mut viewport: ViewportFrame, style: &SceneStyle, source: (u32,u32)) -> ViewportFrame {
-        let split = style.camera.split_strength() > 0.0 && !style.fills_card();
-        if style.camera.full_bleed_strength() <= 0.0 && !split { return viewport; }
+        // Fill's crop is worked out once for the project's own camera; a
+        // timed camera region (split, full screen) reshapes the card, so the
+        // crop follows the card drawn in this frame.
+        let covers = style.camera.split_strength() > 0.0 || style.fills_card();
+        if style.camera.full_bleed_strength() <= 0.0 && !covers { return viewport; }
         let crop=style.source_crop.validated();
         let source_aspect=source.0.max(1) as f64 * crop.width as f64 /
             (source.1.max(1) as f64 * crop.height as f64);

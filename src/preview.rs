@@ -764,6 +764,8 @@ impl Studio {
     ) -> AnyElement {
         self.autosave_scene_style();
         self.sync_reframe();
+        self.ensure_motion_pieces(cx);
+        self.ensure_motion_doc(window, cx);
         if self.video_audio_prepare_pending {
             self.prepare_video_audio(cx);
         }
@@ -780,16 +782,43 @@ impl Studio {
         self.refresh_timeline_thumbnails(cx);
         self.ensure_camera_frame(cx);
         self.fit_timeline_to_window(window.viewport_size());
-        let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
-        let video_canvas = if self.crop_active {
-            self.video_crop_canvas(canvas_width, canvas_height, cx)
-        } else {
-            self.scene_canvas(canvas_width, canvas_height, cx)
-        };
         let top_bar = self.top_bar(cx);
-        let canvas_area = self.canvas_area(video_canvas);
-        let timeline = if self.crop_active { div().into_any_element() } else { self.timeline_bar(cx) };
-        let sidebar = (self.inspector_visible && !self.crop_active).then(|| self.sidebar(window.viewport_size().width, cx));
+        let body = {
+            let (canvas_width, canvas_height) = self.canvas_budget(window.viewport_size());
+            let video_canvas = if let Some(isolated) = self.motion_isolate_canvas(canvas_width, canvas_height) {
+                isolated
+            } else if self.crop_active {
+                self.video_crop_canvas(canvas_width, canvas_height, cx)
+            } else {
+                let scene = self.scene_canvas(canvas_width, canvas_height, cx);
+                match self.motion_selection_outline(canvas_width, canvas_height, cx) {
+                    Some(outline) => div().relative().child(scene).child(outline).into_any_element(),
+                    None => scene,
+                }
+            };
+            let canvas_area = self.canvas_area(video_canvas);
+            let timeline = if self.crop_active { div().into_any_element() } else { self.timeline_bar(cx) };
+            // The prompt bar, under the preview, wherever motion is edited.
+            let prompt = self.motion_prompt_visible().then(|| self.motion_prompt_bar(cx));
+            let sidebar = (self.inspector_visible && !self.crop_active).then(|| self.sidebar(window.viewport_size().width, cx));
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(canvas_area)
+                        .children(prompt)
+                        .child(timeline),
+                )
+                .when_some(sidebar, |this, sidebar| this.child(sidebar))
+                .into_any_element()
+        };
         let speed_dialog = self.video_speed_dialog(cx);
 
         let editor = div()
@@ -816,6 +845,16 @@ impl Studio {
                     cx.stop_propagation();
                     return;
                 }
+                // In the Motion tab: `\` held shows a proposal as it was
+                // before, and typing with a layer selected begins a prompt.
+                if this.motion_prompt_visible() {
+                    let k = &event.keystroke;
+                    if (k.key == "\\" && !k.modifiers.control && this.motion_compare_key(true, cx)) || this.begin_prompt_by_typing(event, window, cx) {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 if this.handle_video_key(event, cx) {
                     cx.stop_propagation();
                     cx.notify();
@@ -839,6 +878,10 @@ impl Studio {
                     changed |= this.update_camera_drag(event.position);
                 } else if event.dragging() && this.video_audio_drag.is_some() {
                     changed |= this.update_audio_drag(event.position.x);
+                } else if event.dragging() && this.motion_piece_drag.is_some() {
+                    changed |= this.update_piece_drag(event.position.x);
+                } else if event.dragging() && this.motion_layer_drag.is_some() {
+                    changed |= this.update_motion_layer_drag(event.position, cx);
                 } else if event.dragging() {
                     changed |= this.update_video_move_drag(event.position.x);
                     if this.video_zoom_drag.is_some() {
@@ -876,7 +919,9 @@ impl Studio {
                     if this.end_annotation_drag() {
                         cx.notify();
                     }
-                    if this.finish_audio_drag(event.position.x, cx)
+                    if this.finish_piece_drag(event.position.x, cx)
+                        || this.finish_motion_layer_drag(event.position, event.modifiers.shift, cx)
+                        || this.finish_audio_drag(event.position.x, cx)
                         || this.finish_video_move_drag(event.position.x, cx)
                     {
                         this.end_slider_drag();
@@ -906,6 +951,8 @@ impl Studio {
                     this.end_camera_drag();
                     this.end_media_drag();
                     this.end_annotation_drag();
+                    this.finish_piece_drag(event.position.x, cx);
+                    this.finish_motion_layer_drag(event.position, event.modifiers.shift, cx);
                     this.finish_audio_drag(event.position.x, cx);
                     this.finish_video_move_drag(event.position.x, cx);
                     if this.video_trim_drag.is_some() {
@@ -926,23 +973,7 @@ impl Studio {
                 }),
             )
             .child(top_bar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(canvas_area)
-                            .child(timeline),
-                    )
-                    .when_some(sidebar, |this, sidebar| this.child(sidebar)),
-            )
+            .child(body)
             .when_some(speed_dialog, |this, dialog| {
                 this.child(gpui::deferred(dialog).with_priority(1))
             })

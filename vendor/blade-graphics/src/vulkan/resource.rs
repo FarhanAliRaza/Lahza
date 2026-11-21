@@ -36,6 +36,9 @@ impl super::Context {
             crate::Memory::Upload => {
                 gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::UPLOAD
             }
+            crate::Memory::Download => {
+                gpu_alloc::UsageFlags::HOST_ACCESS | gpu_alloc::UsageFlags::DOWNLOAD
+            }
         };
         let memory_types = requirements.memory_type_bits & manager.valid_ash_memory_types;
         let mut block = match memory {
@@ -131,7 +134,7 @@ impl super::Context {
                 ptr as *mut u8
             }
             crate::Memory::Device | crate::Memory::External(_) => ptr::null_mut(),
-            crate::Memory::Shared | crate::Memory::Upload => unsafe {
+            crate::Memory::Shared | crate::Memory::Upload | crate::Memory::Download => unsafe {
                 block
                     .map(
                         AshMemoryDevice::wrap(&self.device.core),
@@ -216,6 +219,24 @@ impl super::Context {
         }
     }
 
+    /// The device address of an acceleration structure: what an instance
+    /// record refers to its bottom-level structure by, for callers that
+    /// keep and rewrite their own instance buffers.
+    pub fn acceleration_structure_address(
+        &self,
+        acceleration_structure: super::AccelerationStructure,
+    ) -> u64 {
+        let rt = self.device.ray_tracing.as_ref().unwrap();
+        let info = vk::AccelerationStructureDeviceAddressInfoKHR {
+            acceleration_structure: acceleration_structure.raw,
+            ..Default::default()
+        };
+        unsafe {
+            rt.acceleration_structure
+                .get_acceleration_structure_device_address(&info)
+        }
+    }
+
     pub fn create_acceleration_structure_instance_buffer(
         &self,
         instances: &[crate::AccelerationStructureInstance],
@@ -271,6 +292,12 @@ impl super::Context {
         buffer: super::Buffer,
     ) -> Option<crate::ExternalMemorySource> {
         buffer.external
+    }
+    /// Whether buffers and textures can be created with
+    /// `Memory::External` (the device has external memory by handle).
+    /// Creating one without it panics.
+    pub fn has_external_memory(&self) -> bool {
+        self.device.external_memory.is_some()
     }
 }
 

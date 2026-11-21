@@ -27,8 +27,8 @@ const INSPECTOR_WIDTH_WIDE: f32 = 440.0;
 const WIDE_WINDOW: f32 = 1800.0;
 pub(crate) const TOP_BAR_HEIGHT: f32 = 60.0;
 /// Canvas well padding; less vertical so the canvas keeps its height.
-const CANVAS_PADDING_X: f32 = 40.0;
-const CANVAS_PADDING_Y: f32 = 24.0;
+pub(crate) const CANVAS_PADDING_X: f32 = 40.0;
+pub(crate) const CANVAS_PADDING_Y: f32 = 24.0;
 /// Default lane area height; it grows on tall windows until resized by hand.
 pub(crate) const DEFAULT_LANE_HEIGHT: f32 = 176.0;
 const MAX_LANE_HEIGHT: f32 = 340.0;
@@ -174,7 +174,10 @@ impl Studio {
 
     /// The segment the mode switcher highlights. A recording keeps its
     /// motion controls in the Motion tab, so that tab reads as Motion.
-    fn displayed_mode(&self) -> EditorMode {
+    pub(crate) fn displayed_mode(&self) -> EditorMode {
+        if self.motion_project.is_some() {
+            return EditorMode::Motion;
+        }
         let mode = self.editor_mode();
         if mode == EditorMode::Video
             && self.inspector_visible
@@ -187,6 +190,13 @@ impl Studio {
     }
 
     pub(crate) fn switch_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        // Leaving a motion project for an image or a recording closes it.
+        if self.motion_project.is_some() {
+            if mode == EditorMode::Motion {
+                return;
+            }
+            self.close_motion_project();
+        }
         if mode == self.editor_mode() {
             // Video highlighted as Motion: Video returns to the general tab.
             if mode == EditorMode::Video && self.displayed_mode() == EditorMode::Motion {
@@ -239,6 +249,9 @@ impl Studio {
     }
 
     fn can_undo(&self) -> bool {
+        if self.motion_editing() && self.motion_doc.is_some() {
+            return true;
+        }
         match self.editor_mode() {
             EditorMode::Video => !self.video_undo_stack.is_empty() && !self.video_edit_busy,
             EditorMode::Motion => !self.video_undo_stack.is_empty() || !self.undo_stack.is_empty(),
@@ -250,6 +263,9 @@ impl Studio {
     }
 
     fn can_redo(&self) -> bool {
+        if self.motion_editing() && self.motion_doc.is_some() {
+            return true;
+        }
         match self.editor_mode() {
             EditorMode::Video => !self.video_redo_stack.is_empty() && !self.video_edit_busy,
             EditorMode::Motion => !self.video_redo_stack.is_empty() || !self.redo_stack.is_empty(),
@@ -261,6 +277,9 @@ impl Studio {
     }
 
     pub(crate) fn undo_current(&mut self, cx: &mut Context<Self>) {
+        if self.motion_editing() && self.undo_motion_doc(false, cx) {
+            return;
+        }
         match self.editor_mode() {
             EditorMode::Video => self.undo_video_edit(cx),
             EditorMode::Motion => {
@@ -281,6 +300,9 @@ impl Studio {
     }
 
     pub(crate) fn redo_current(&mut self, cx: &mut Context<Self>) {
+        if self.motion_editing() && self.undo_motion_doc(true, cx) {
+            return;
+        }
         match self.editor_mode() {
             EditorMode::Video => self.redo_video_edit(cx),
             EditorMode::Motion => {
@@ -392,7 +414,7 @@ impl Studio {
         let width = (viewport.width.max(px(EDITOR_MIN_WIDTH))
             - px(CANVAS_PADDING_X * 2.0 + inspector)).max(px(1.0));
         let height = (viewport.height.max(px(EDITOR_MIN_HEIGHT))
-            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height()))
+            - px(TOP_BAR_HEIGHT + CANVAS_PADDING_Y * 2.0 + self.timeline_bar_height() + self.motion_prompt_height()))
         .max(px(1.0));
         self.preview_canvas_size(width, height)
     }
@@ -703,7 +725,7 @@ impl Studio {
     pub(crate) fn effective_tab(&self) -> InspectorTab {
         let mode = self.editor_mode();
         let tab = if mode != EditorMode::Static
-            && (self.video_selected_zoom_cue.is_some() || self.walkthrough_mode)
+            && (self.video_selected_zoom_cue.is_some() || self.walkthrough_mode || self.selected_motion_piece.is_some())
         {
             InspectorTab::Motion
         } else if self.selected_annotation.is_some() || self.tool != Tool::Select {
@@ -729,6 +751,7 @@ impl Studio {
         self.selected_annotation = None;
         self.annotation_draft = None;
         self.video_selected_zoom_cue = None;
+        self.selected_motion_piece = None;
         self.scene_selection = SceneSelection::Scene;
         self.walkthrough_mode = false;
         if tab != InspectorTab::Annotate {
@@ -1415,6 +1438,21 @@ impl Studio {
     }
 
     fn motion_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(layer) = self.motion_layer_inspector(cx) {
+            return layer;
+        }
+        // With no layer selected: what the agent was asked here, above
+        // the rest of the tab.
+        if self.motion_prompt_visible() && !self.motion_agent.requests.is_empty() {
+            return div().flex().flex_col().gap_4().child(self.motion_agent_log(None, cx)).child(self.motion_tab_rest(cx)).into_any_element();
+        }
+        self.motion_tab_rest(cx)
+    }
+
+    fn motion_tab_rest(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(piece) = self.motion_piece_inspector(cx) {
+            return piece;
+        }
         if let Some(region) = self.motion_inspector(cx) {
             return region;
         }
@@ -1694,6 +1732,12 @@ impl Studio {
         self.pause_video_playback();
         self.video_trim_drag = None;
         self.video_zoom_drag = None;
+        // In the Motion tab, Shift marks a span to prompt about.
+        if event.modifiers.shift && self.motion_prompt_visible() {
+            self.begin_motion_span(event.position.x);
+            cx.notify();
+            return;
+        }
         let target = self.motion_timeline_time_at(event.position.x)
             .unwrap_or(self.video_position);
         self.scrub_video_to(target, cx);
@@ -1825,8 +1869,29 @@ impl Studio {
             ruler_tick += ruler_step;
         }
         ruler_marks.extend(self.press_markers(timeline_duration, timeline_content_width, cx));
+        // The span marked for a prompt (Shift-drag on the ruler).
+        if let Some((a, b)) = self.motion_agent.span.filter(|_| self.motion_prompt_visible()) {
+            let x = |t: f64| (t / timeline_duration * timeline_content_width) as f32;
+            ruler_marks.push(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(x(a)))
+                    .w(px((x(b) - x(a)).max(2.0)))
+                    .rounded(px(3.0))
+                    .bg(crate::theme::accent().opacity(0.22))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(crate::theme::accent())
+                    .into_any_element(),
+            );
+        }
         let audio_lane = self.audio_lane(timeline_scroll, timeline_content_width, progress);
         let camera_lane = self.camera_region_lane(timeline_scroll, timeline_content_width, progress, cx);
+        let motion_piece_lane = self.motion_piece_lane(timeline_scroll, cx);
+        let motion_layer_lane = self.motion_layer_lane(timeline_scroll, cx);
+        let motion_layer_labels = self.motion_layer_labels(TRACK_LABEL_WIDTH, cx);
         let clip_lane: Vec<AnyElement> = if is_video {
             self.video_clip_lane(
                 timeline_duration,
@@ -1942,6 +2007,8 @@ impl Studio {
         };
         let tracks_height = 48.0
             + 4.0
+            + self.motion_piece_lane_height().map_or(0.0, |h| h + 4.0)
+            + self.motion_layer_lane_height(cx).map_or(0.0, |h| h + 4.0)
             + self.motion_lane_height()
             + audio_height
             + camera_height
@@ -2079,6 +2146,30 @@ impl Studio {
                                     .h_full()
                                     .children(ruler_marks),
                             )
+                            // In the Motion tab the top of the ruler is the
+                            // strip where a drag marks a span to ask about,
+                            // as over a motion project's ruler.
+                            .when(self.motion_prompt_visible(), |this| {
+                                this.child(
+                                    div()
+                                        .id("timeline-span-strip")
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(8.0))
+                                        .rounded(px(3.0))
+                                        .bg(crate::theme::control_bg())
+                                        .cursor_crosshair()
+                                        .tooltip(crate::timeline_ui::tooltip("Drag to mark a span to ask about; click to clear"))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.pause_video_playback();
+                                            this.begin_motion_span(event.position.x);
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .when(playhead_visible, |this| {
                                 this.child(
                                     div()
@@ -2153,6 +2244,8 @@ impl Studio {
                                         if is_video { "Video" } else { "Image" },
                                         48.0,
                                     ))
+                                    .when_some(self.motion_piece_lane_height(), |d, h| d.child(Self::track_label("Motion", h)))
+                                    .when_some(motion_layer_labels, |d, labels| d.child(labels))
                                     .child(Self::track_label("Zooms", self.motion_lane_height()))
                                     .when(annotation_track.is_some(), |d| {
                                         d.child(Self::track_label(
@@ -2250,6 +2343,8 @@ impl Studio {
                                                 ),
                                             ),
                                     )
+                                    .when_some(motion_piece_lane, |d, lane| d.child(lane))
+                                    .when_some(motion_layer_lane, |d, lane| d.child(lane))
                                     .child(motion_track)
                                     .when_some(annotation_track, |d, lane| d.child(lane))
                                     .when_some(camera_lane, |d, lane| d.child(lane))

@@ -282,7 +282,12 @@ impl ScreenUpscaler {
             .ensure(context, tiles.len() * layers.len() * PARAM_SLOT);
         for (index, param) in tiles
             .iter()
-            .flat_map(|tile| layers.iter().map(|layer| UpscaleParams { layer: *layer, ..*tile }))
+            .flat_map(|tile| {
+                layers.iter().map(|layer| UpscaleParams {
+                    layer: *layer,
+                    ..*tile
+                })
+            })
             .enumerate()
         {
             let bytes = bytemuck::bytes_of(&param);
@@ -419,9 +424,17 @@ mod tests {
     // Whole-frame CPU oracle, intentionally independent of tile addressing,
     // GPU scratch buffers, dispatches and the production ROI plan.
     fn reference(image: &RgbaImage, plan: UpscalePlan) -> RgbaImage {
+        reference_with_weights(image, plan, Model::for_scale(plan.scale).weights)
+    }
+
+    fn reference_with_weights(
+        image: &RgbaImage,
+        plan: UpscalePlan,
+        coefficients: &[u8],
+    ) -> RgbaImage {
         let model = Model::for_scale(plan.scale);
-        let weights: Vec<f32> = model
-            .weights
+        assert_eq!(coefficients.len(), model.weights.len());
+        let weights: Vec<f32> = coefficients
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -430,7 +443,11 @@ mod tests {
         let rgb: Vec<f32> = (0..h * w * 4)
             .map(|i| {
                 let p = source_pixel(image, (i / 4 % w) as i32, (i / 4 / w) as i32);
-                if i % 4 == 3 { 0.0 } else { p[i % 4] }
+                if i % 4 == 3 {
+                    0.0
+                } else {
+                    p[i % 4]
+                }
             })
             .collect();
         // Planar-by-group features: pixel-major, `groups` vec4s per pixel.
@@ -442,8 +459,10 @@ mod tests {
                     for og in 0..outputs {
                         let mut sum = [0.0_f32; 4];
                         for tap in 0..9 {
-                            let sx = (x as i32 + tap as i32 % 3 - 1).clamp(0, w as i32 - 1) as usize;
-                            let sy = (y as i32 + tap as i32 / 3 - 1).clamp(0, h as i32 - 1) as usize;
+                            let sx =
+                                (x as i32 + tap as i32 % 3 - 1).clamp(0, w as i32 - 1) as usize;
+                            let sy =
+                                (y as i32 + tap as i32 / 3 - 1).clamp(0, h as i32 - 1) as usize;
                             for ig in 0..inputs {
                                 let at = ((sy * w + sx) * inputs + ig) * 4;
                                 let base = (offset + ((og * 9 + tap) * inputs + ig) * 4) * 4;
@@ -618,6 +637,23 @@ mod tests {
             unsafe { gpu::Context::init(gpu::ContextDesc::default()) }.expect("Vulkan context");
         eprintln!("neural GPU: {:?}", context.device_information());
         let mut upscaler = ScreenUpscaler::new(&context).unwrap();
+        // Exercise an experimental 2x model without replacing bundled assets.
+        let candidate = std::env::var_os("LAHZA_UPSCALE_WEIGHTS_2X")
+            .map(|path| std::fs::read(path).expect("candidate 2x weights"));
+        if let Some(bytes) = &candidate {
+            assert_eq!(bytes.len(), Model::for_scale(2).weights.len());
+            assert!(bytes
+                .chunks_exact(4)
+                .all(|b| { f32::from_le_bytes(b.try_into().unwrap()).is_finite() }));
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    upscaler.weights[0].buffer.data(),
+                    bytes.len(),
+                );
+            }
+            context.sync_buffer(upscaler.weights[0].buffer);
+        }
         eprintln!(
             "neural precision: {}",
             if upscaler.uses_f16 {
@@ -703,7 +739,15 @@ mod tests {
             );
             context.sync_buffer(readback.buffer);
             let actual = unsafe { std::slice::from_raw_parts(readback.buffer.data(), length) };
-            let expected = reference(&source, plan);
+            let expected = if plan.scale == 2 {
+                reference_with_weights(
+                    &source,
+                    plan,
+                    candidate.as_deref().unwrap_or(Model::for_scale(2).weights),
+                )
+            } else {
+                reference(&source, plan)
+            };
             let maximum = actual
                 .iter()
                 .zip(expected.as_raw())

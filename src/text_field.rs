@@ -12,6 +12,14 @@ pub(crate) enum Target {
     Time(usize, bool),
     /// A subtitle cue's text, by cue id.
     Cue(uuid::Uuid),
+    /// The motion prompt bar.
+    Prompt,
+    /// The selected motion text layer's words.
+    LayerText,
+    /// A colour of the selected motion layer, as #rrggbb.
+    LayerColor,
+    /// The agent's API key (typed masked, never shown back).
+    ApiKey,
     None,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +28,8 @@ pub(crate) enum EventKind {
     Change,
     Commit,
     Cancel,
+    /// Enter in a one-line field (a `Commit` follows as focus leaves).
+    Submit,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct FieldEvent {
@@ -166,6 +176,9 @@ pub(crate) struct TextField {
     pub focus: FocusHandle,
     parent_focus: FocusHandle,
     pub target: Target,
+    /// Shows a star for each byte typed, and gives nothing to the
+    /// clipboard: for a secret.
+    pub masked: bool,
     buffer: Buffer,
     initial: String,
     placeholder: SharedString,
@@ -204,6 +217,7 @@ impl TextField {
             focus,
             parent_focus,
             target: Target::None,
+            masked: false,
             buffer: Buffer::default(),
             initial: String::new(),
             placeholder: placeholder.to_owned().into(),
@@ -387,7 +401,7 @@ impl TextField {
             }
             "c" | "x" if command => {
                 let range = self.buffer.range();
-                if !range.is_empty() {
+                if !range.is_empty() && !self.masked {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         self.buffer.state.text[range.clone()].into(),
                     ));
@@ -429,9 +443,7 @@ impl TextField {
                 self.marked = None;
             }
             "enter" => {
-                if self.buffer.multiline {
-                    self.emit(EventKind::Commit, cx);
-                }
+                self.emit(if self.buffer.multiline { EventKind::Commit } else { EventKind::Submit }, cx);
                 self.parent_focus.focus(window);
             }
             "escape" => {
@@ -464,7 +476,33 @@ impl TextField {
     }
 }
 
+/// What a one-line field draws for `text`: a star for each byte when it
+/// is masked, so every offset into the text is the same offset into what
+/// is drawn.
+fn shown(text: &str, masked: bool) -> String {
+    if masked { "*".repeat(text.len()) } else { text.replace(['\r', '\n'], " ") }
+}
+
 impl TextField {
+    /// Replaces what is typed, focused or not (a sent prompt empties
+    /// its field).
+    pub(crate) fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.buffer.state.text = text.into();
+        self.buffer.select(text.len(), false);
+        self.initial = text.into();
+        self.marked = None;
+        self.scroll = px(0.);
+        cx.notify();
+    }
+
+    /// Takes focus and types `text` at the caret: a key pressed elsewhere
+    /// that begins an entry here.
+    pub(crate) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window);
+        self.buffer.replace(self.buffer.range(), text);
+        self.changed(cx);
+    }
+
     pub(crate) fn canvas_hit(&self, p: Point<Pixels>) -> bool {
         self.bounds.is_some_and(|b| b.contains(&p))
     }
@@ -792,7 +830,7 @@ impl Render for TextField {
                         let text: SharedString = if empty {
                             input.placeholder.clone()
                         } else {
-                            input.buffer.state.text.replace(['\r', '\n'], " ").into()
+                            shown(&input.buffer.state.text, input.masked).into()
                         };
                         let color = if empty {
                             crate::muted()
@@ -958,5 +996,18 @@ mod tests {
         b.select(0, false);
         b.delete(false, false);
         assert_eq!(b.state.text, "one ");
+    }
+}
+
+#[cfg(test)]
+mod masked_tests {
+    use super::shown;
+
+    #[test]
+    fn a_masked_field_draws_stars_and_keeps_every_offset() {
+        assert_eq!(shown("sk-ant-secret", true), "*************");
+        assert_eq!(shown("clé", true).len(), "clé".len(), "a star a byte: offsets stay");
+        assert!(!shown("sk-ant-secret", true).contains("secret"));
+        assert_eq!(shown("two\nlines", false), "two lines");
     }
 }

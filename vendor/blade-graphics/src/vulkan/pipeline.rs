@@ -362,17 +362,23 @@ impl crate::traits::ShaderDevice for super::Context {
 
         let layout = self.create_pipeline_layout(desc.data_layouts, &group_infos);
 
-        let create_info = vk::ComputePipelineCreateInfo::default()
+        let mut create_info = vk::ComputePipelineCreateInfo::default()
             .layout(layout.raw)
             .stage(cs.create_info);
+        if self.device.pipeline_stats.is_some() {
+            create_info = create_info.flags(vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR);
+        }
 
         let mut raw_vec = unsafe {
             self.device
                 .core
-                .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_compute_pipelines(self.pipeline_cache, &[create_info], None)
                 .unwrap()
         };
         let raw = raw_vec.pop().unwrap();
+        if let Some(ref stats) = self.device.pipeline_stats {
+            print_pipeline_stats(stats, raw, desc.name);
+        }
 
         unsafe { self.device.core.destroy_shader_module(cs.vk_module, None) };
 
@@ -607,7 +613,7 @@ impl crate::traits::ShaderDevice for super::Context {
         let mut raw_vec = unsafe {
             self.device
                 .core
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_graphics_pipelines(self.pipeline_cache, &[create_info], None)
                 .unwrap()
         };
         let raw = raw_vec.pop().unwrap();
@@ -755,4 +761,33 @@ fn map_blend_component(
     let src = map_blend_factor(component.src_factor);
     let dst = map_blend_factor(component.dst_factor);
     (op, src, dst)
+}
+
+/// Lahza: prints a compiled pipeline's driver statistics (registers, local
+/// memory, instruction counts as the driver names them) to stderr.
+fn print_pipeline_stats(stats: &ash::khr::pipeline_executable_properties::Device, pipeline: vk::Pipeline, name: &str) {
+    let text = |chars: &[std::ffi::c_char]| unsafe { std::ffi::CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned();
+    let executables = match unsafe { stats.get_pipeline_executable_properties(&vk::PipelineInfoKHR::default().pipeline(pipeline)) } {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[pipeline-stats] {name}: {e:?}");
+            return;
+        }
+    };
+    for (index, exe) in executables.iter().enumerate() {
+        let info = vk::PipelineExecutableInfoKHR::default().pipeline(pipeline).executable_index(index as u32);
+        let Ok(list) = (unsafe { stats.get_pipeline_executable_statistics(&info) }) else { continue };
+        for s in &list {
+            let value = unsafe {
+                match s.format {
+                    vk::PipelineExecutableStatisticFormatKHR::BOOL32 => format!("{}", s.value.b32 != 0),
+                    vk::PipelineExecutableStatisticFormatKHR::INT64 => format!("{}", s.value.i64),
+                    vk::PipelineExecutableStatisticFormatKHR::UINT64 => format!("{}", s.value.u64),
+                    vk::PipelineExecutableStatisticFormatKHR::FLOAT64 => format!("{}", s.value.f64),
+                    _ => "?".into(),
+                }
+            };
+            eprintln!("[pipeline-stats] {name} · {}: {} = {value}", text(&exe.name), text(&s.name));
+        }
+    }
 }

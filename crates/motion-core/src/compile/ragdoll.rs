@@ -1,0 +1,481 @@
+//! Ragdolls in the compiled project: a skeleton's bone layers resolved to
+//! bodies (a capsule each), the joints between them, and the clip their
+//! motors follow.
+
+use super::sim::visit;
+use super::*;
+use crate::sim::{decompose, quat_mul, quat_rotate, BehaviourInput, BodyInput, BodyKind, BoneInput, ColliderInput, Pose, RagdollInput, ShapeInput, SimInput};
+
+/// A ragdoll's times and keyed numbers, resolved.
+pub(super) struct CRagdoll {
+    /// Timeline seconds.
+    release: Option<f64>,
+    rest: Option<f64>,
+    strength: Prop<f64>,
+    strengths: Vec<Prop<f64>>,
+    /// (from, to, amount) per behaviour.
+    behaviours: Vec<(Option<f64>, Option<f64>, Prop<f64>)>,
+    hits: Vec<f64>,
+}
+
+impl<'a> Compiler<'a> {
+    pub(super) fn ragdolls(&mut self, scene: &Scene, start: f64, pre_roll: f64) -> Vec<CRagdoll> {
+        let id = scene.id.as_str();
+        let Some(sim) = &scene.simulation else { return Vec::new() };
+        sim.ragdolls
+            .iter()
+            .enumerate()
+            .map(|(n, r)| {
+                let what = |f: &str| format!("simulation.ragdolls.{n}.{f}");
+                let time = |this: &mut Self, t: &Option<TimeRef>, f: &str| t.as_ref().and_then(|t| this.time(t, id, &what(f))).map(|t| t - pre_roll);
+                CRagdoll {
+                    release: time(self, &r.release, "release"),
+                    rest: time(self, &r.rest, "rest"),
+                    strength: self.prop(&r.strength, id, &what("strength"), start, None, pre_roll),
+                    strengths: r.strengths.iter().enumerate().map(|(k, s)| self.prop(&s.strength, id, &what(&format!("strengths.{k}.strength")), start, None, pre_roll)).collect(),
+                    behaviours: r
+                        .behaviours
+                        .iter()
+                        .enumerate()
+                        .map(|(k, b)| (time(self, &b.from, &format!("behaviours.{k}.from")), time(self, &b.to, &format!("behaviours.{k}.to")), self.prop(&b.amount, id, &what(&format!("behaviours.{k}.amount")), start, None, pre_roll)))
+                        .collect(),
+                    hits: r.hits.iter().enumerate().map(|(k, h)| self.time(&h.at, id, &what(&format!("hits.{k}.at"))).unwrap_or(0.0) - pre_roll).collect(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// The layers as a flat tree: each with the index of the layer it is
+/// inside (comps only).
+pub(super) fn tree<'l>(layers: &'l [CLayer], inside: Option<usize>, out: &mut Vec<(&'l CLayer, Option<usize>)>) {
+    for l in layers {
+        out.push((l, inside));
+        let me = out.len() - 1;
+        if let CKind::Comp(children) = &l.kind {
+            tree(children, Some(me), out);
+        }
+    }
+}
+
+fn skin_joints<'l>(layers: &'l [CLayer], out: &mut HashSet<&'l str>) {
+    for l in layers {
+        if let CKind::Mesh(m) = &l.kind {
+            if let Some((_, joints, _)) = &m.skin {
+                out.extend(joints.iter().map(|j| &**j));
+            }
+        }
+        skin_joints(l.children(), out);
+    }
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn len(a: [f64; 3]) -> f64 {
+    (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+}
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// The rotation that takes y to `d` (unit), as a matrix.
+fn y_to(d: [f64; 3]) -> Mat4 {
+    let y = [0.0, 1.0, 0.0];
+    let c = dot(y, d);
+    let q = if c < -1.0 + 1e-9 {
+        [1.0, 0.0, 0.0, 0.0]
+    } else {
+        let axis = crate::sim::cross(y, d);
+        let q = [axis[0], axis[1], axis[2], 1.0 + c];
+        let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        q.map(|v| v / n)
+    };
+    Pose { p: [0.0; 3], q }.matrix()
+}
+
+impl Compiled {
+    /// Adds scene `i`'s ragdolls to `input`: their bones as bodies, the
+    /// joints' frames and limits, and per sample what the clip asks of the
+    /// motors.
+    pub(super) fn ragdoll_input(&self, i: usize, input: &mut SimInput, errors: &mut Vec<String>) {
+        let scene = &self.scenes[i];
+        let sim = &scene.sim;
+        let set = &sim.settings;
+        // The document's ragdolls, then a limp one per agent of a crowd
+        // that has a `ragdoll` (let go when the agent is knocked down).
+        // (How hard each crowd's hold the pose they fell in.)
+        let holds: HashMap<&str, f64> = set.crowds.iter().filter_map(|c| Some((c.id.as_str(), c.ragdoll.as_ref()?.strength.clamp(0.0, 1.0)))).collect();
+        let limp = CRagdoll { release: None, rest: None, strength: Prop::constant(0.0), strengths: Vec::new(), behaviours: Vec::new(), hits: Vec::new() };
+        let mut agents: Vec<crate::sim::Ragdoll> = set
+            .crowds
+            .iter()
+            .flat_map(|c| c.ragdoll.iter().flat_map(move |r| c.agents.iter().map(move |a| crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), feet: r.feet.clone(), ..crate::sim::Ragdoll::of(format!("{}/{a}", c.id), a.clone(), r.mass, r.thickness, r.friction) })))
+            .collect();
+        // Then one for each crowd of instances, made as many times as may
+        // be down at once (its bones' bodies are `<crowd>#<n>/<layer>`).
+        let mut pools: Vec<Option<(&str, usize)>> = vec![None; agents.len()];
+        for c in &set.crowds {
+            if let (Some(character), Some(r)) = (&c.character, &c.ragdoll) {
+                let many = if c.starts.is_empty() { c.count.unwrap_or(0) as usize } else { c.starts.len() };
+                agents.push(crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), feet: r.feet.clone(), ..crate::sim::Ragdoll::of(format!("{}#0", c.id), character.clone(), r.mass, r.thickness, r.friction) });
+                pools.push(Some((&c.id, (r.max as usize).min(many).max(1))));
+            }
+        }
+        let own = set.ragdolls.len();
+        let specs: Vec<(&crate::sim::Ragdoll, &CRagdoll)> = set.ragdolls.iter().zip(&sim.ragdolls).chain(agents.iter().map(|a| (a, &limp))).collect();
+        if specs.is_empty() {
+            return;
+        }
+        let (rate, samples) = (input.rate, input.samples as usize);
+        let mut flat = Vec::new();
+        tree(&scene.layers, None, &mut flat);
+        let mut joints = HashSet::new();
+        skin_joints(&scene.layers, &mut joints);
+        let index: HashMap<&str, usize> = flat.iter().enumerate().map(|(k, (l, _))| (&*l.id, k)).collect();
+        // Each ragdoll's bones, as indices into `flat`, in tree order.
+        let mut all: Vec<Vec<usize>> = Vec::new();
+        for (n, (r, _)) in specs.iter().enumerate() {
+            let what = if n < own { format!("{}.simulation.ragdolls.{n}", scene.id) } else { format!("{}.simulation.crowds: agent '{}'", scene.id, r.root) };
+            let Some(&root) = index.get(r.root.as_str()) else {
+                errors.push(format!("{what}.root: no layer '{}' in the scene", r.root));
+                all.push(Vec::new());
+                continue;
+            };
+            let under = |mut k: usize| loop {
+                if k == root {
+                    return true;
+                }
+                match flat[k].1 {
+                    Some(p) => k = p,
+                    None => return false,
+                }
+            };
+            let comp = |k: usize| matches!(flat[k].0.kind, CKind::Comp(_));
+            let mut bones: Vec<usize> = if !r.bones.is_empty() {
+                let mut out = Vec::new();
+                for b in &r.bones {
+                    match index.get(b.as_str()) {
+                        Some(&k) if under(k) => out.push(k),
+                        Some(_) => errors.push(format!("{what}.bones: '{b}' is not under the root '{}'", r.root)),
+                        None => errors.push(format!("{what}.bones: no layer '{b}' in the scene")),
+                    }
+                }
+                out
+            } else {
+                let named: Vec<usize> = (0..flat.len()).filter(|&k| under(k) && comp(k) && joints.contains(&*flat[k].0.id)).collect();
+                // No skin names them: every comp under the root is a bone.
+                if named.is_empty() { (0..flat.len()).filter(|&k| under(k) && comp(k)).collect() } else { named }
+            };
+            // (A crowd's agent is placed by the crowd: its own comp is no bone.)
+            if n >= own {
+                bones.retain(|&k| k != root);
+            }
+            bones.sort_unstable();
+            bones.dedup();
+            if bones.is_empty() {
+                errors.push(format!("{what}: no bones under '{}' (comps, as model_import makes of a skeleton's joints)", r.root));
+            }
+            for &k in &bones {
+                if flat[k].0.body.as_ref().is_some_and(|b| b.declared) {
+                    errors.push(format!("{what}: its bone '{}' has a \"body\" of its own; a ragdoll makes its bones' bodies", flat[k].0.id));
+                }
+                if all.iter().any(|other| other.contains(&k)) {
+                    errors.push(format!("{what}: its bone '{}' is another ragdoll's too", flat[k].0.id));
+                }
+            }
+            all.push(bones);
+        }
+        if !errors.is_empty() {
+            return;
+        }
+        // Every bone's keyed world at every sample (index 0: one before
+        // the start), and at each ragdoll's rest time.
+        let wanted: HashMap<&str, (usize, usize)> = all.iter().enumerate().flat_map(|(r, bones)| bones.iter().enumerate().map(move |(b, &k)| (k, (r, b)))).map(|(k, v)| (&*flat[k].0.id, v)).collect();
+        let at = |t: f64, out: &mut dyn FnMut(usize, usize, Mat4)| {
+            let tc = t + scene.pre_roll;
+            let space = Space { keyed: true, ..self.camera(scene, tc) };
+            visit(&scene.layers, tc, None, &space, None, &mut |l, world, _, _| {
+                if let Some(&(r, b)) = wanted.get(&*l.id) {
+                    out(r, b, world);
+                }
+                None
+            });
+        };
+        let mut worlds: Vec<Vec<Vec<Mat4>>> = all.iter().map(|bones| vec![Vec::with_capacity(samples + 2); bones.len()]).collect();
+        for k in 0..=samples + 1 {
+            at(sim.start + (k as f64 - 1.0) / rate, &mut |r, b, w| worlds[r][b].push(w));
+        }
+        let sample_of = |t: f64| (((t - sim.start) * rate).round().max(0.0) as u32).min(samples as u32);
+        for (n, ((r, c), bones)) in specs.iter().zip(&all).enumerate() {
+            // (A crowd's are let go by the simulation, if ever.)
+            let puppet = n >= own;
+            let release = if puppet { 0 } else { c.release.map(sample_of).unwrap_or(0) };
+            let mut rest: Vec<Pose> = vec![Pose::IDENTITY; bones.len()];
+            at(c.rest.unwrap_or(sim.start), &mut |rr, b, w| {
+                if rr == n {
+                    rest[b] = decompose(w).0;
+                }
+            });
+            // A bone's parent: the nearest bone it is inside.
+            let parent: Vec<Option<usize>> = bones
+                .iter()
+                .map(|&k| {
+                    let mut cur = flat[k].1;
+                    while let Some(p) = cur {
+                        if let Some(b) = bones.iter().position(|&x| x == p) {
+                            return Some(b);
+                        }
+                        cur = flat[p].1;
+                    }
+                    None
+                })
+                .collect();
+            let name = |b: usize| &*flat[bones[b]].0.id;
+            // Where each bone points (its own frame) and how long it is.
+            let mut shape: Vec<([f64; 3], f64, f64)> = Vec::with_capacity(bones.len());
+            for b in 0..bones.len() {
+                let inv = rest[b].inverse();
+                let kids: Vec<[f64; 3]> = (0..bones.len()).filter(|&c| parent[c] == Some(b)).map(|c| inv.apply(rest[c].p)).collect();
+                // The way in: from its parent to it, in its own frame.
+                let incoming = parent[b].map(|p| quat_rotate(inv.q, sub(rest[b].p, rest[p].p))).filter(|v| len(*v) > 1e-6);
+                let pick = kids.iter().copied().filter(|k| len(*k) > 1e-6).max_by(|x, y| {
+                    // The child that carries on the way in; the farthest for a root.
+                    let score = |k: &[f64; 3]| match incoming {
+                        Some(d) => dot(*k, d) / len(d),
+                        None => len(*k),
+                    };
+                    score(x).total_cmp(&score(y))
+                });
+                let (along, length) = match (pick, incoming) {
+                    (Some(k), _) => (k.map(|v| v / len(k)), len(k)),
+                    // A last bone (a hand, a head, a foot): on as it came,
+                    // 0.6 of its parent's bone.
+                    (None, Some(d)) => (d.map(|v| v / len(d)), len(d) * 0.6),
+                    (None, None) => ([0.0, -1.0, 0.0], 40.0),
+                };
+                // Thick enough to hold what hangs beside its line (hips, shoulders).
+                let beside = kids.iter().map(|k| len(sub(*k, along.map(|a| a * dot(*k, along).clamp(0.0, length))))).fold(0.0, f64::max);
+                let radius = (r.thickness * length).max(beside * 0.6).max(1.0).min(length.max(2.0));
+                shape.push((along, length, radius));
+            }
+            let volume = |(_, length, radius): &([f64; 3], f64, f64)| std::f64::consts::PI * radius * radius * ((length - 2.0 * radius).max(0.0) + radius * 4.0 / 3.0);
+            // Mass by volume, but no bone much lighter than what hangs
+            // from it: a light pelvis between heavy legs and a heavy trunk
+            // is a joint no solver holds.
+            let mut share: Vec<f64> = shape.iter().map(volume).collect();
+            for b in (0..bones.len()).rev() {
+                let heaviest = (0..bones.len()).filter(|&c| parent[c] == Some(b)).map(|c| share[c]).fold(0.0, f64::max);
+                share[b] = share[b].max(heaviest * 0.75);
+            }
+            let total: f64 = share.iter().sum();
+            let limit = |id: &str| r.limits.iter().find(|l| id.contains(l.bone.as_str()));
+            // A bone's own name: its id without what all the skeleton's
+            // share (the model's id an import puts before each).
+            let shared = (0..bones.len()).map(name).reduce(|a, b| &a[..a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()]).filter(|_| bones.len() > 1).map_or(0, str::len);
+            // The way it faces, in the scene's space, as it stands at rest.
+            let root = (0..bones.len()).find(|&b| parent[b].is_none()).unwrap_or(0);
+            let forward = quat_rotate(rest.get(root).map_or([0.0, 0.0, 0.0, 1.0], |p| p.q), [r.facing[0], 0.0, r.facing[1]]);
+            let first_body = input.bodies.len();
+            // Its feet, hands and head, where the document names them.
+            let what = format!("{}.simulation.ragdolls.{n}", scene.id);
+            let mut named = |ids: &[String], part: &str| -> Vec<usize> {
+                ids.iter().filter_map(|id| match (0..bones.len()).find(|&b| name(b) == id.as_str()) {
+                    Some(b) => Some(b),
+                    None => {
+                        errors.push(format!("{what}.{part}: '{id}' is no bone of it (it has {})", (0..bones.len()).map(name).collect::<Vec<_>>().join(", ")));
+                        None
+                    }
+                }).collect()
+            };
+            let feet = (!r.feet.is_empty()).then(|| named(&r.feet, "feet"));
+            let hands = (!r.hands.is_empty()).then(|| named(&r.hands, "hands"));
+            let head = r.head.as_ref().and_then(|h| named(std::slice::from_ref(h), "head").first().copied());
+            // (A hand is the left one when it is on the figure's left: to
+            // the right of its root as seen from the front it faces.)
+            let hands = hands.map(|hands| {
+                let side = crate::sim::cross([0.0, 1.0, 0.0], forward);
+                let at = |b: usize| dot(sub(rest[b].p, rest[root].p), side);
+                let middle = hands.iter().map(|&b| at(b)).sum::<f64>() / hands.len().max(1) as f64;
+                hands.iter().map(|&b| (b, if hands.len() > 1 { at(b) > middle } else { at(b) > 0.0 })).collect::<Vec<_>>()
+            });
+            if let Some(hands) = &hands {
+                for &(b, _) in hands {
+                    if parent[b].and_then(|p| parent[p]).is_none() {
+                        errors.push(format!("{what}.hands: '{}' hangs from fewer than two bones (a hand's arm is the two before it)", name(b)));
+                    }
+                }
+            }
+            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone(), feet, hands, head, hold: None };
+            for b in 0..bones.len() {
+                let poses: Vec<Pose> = worlds[n][b].iter().map(|w| decompose(*w).0).collect();
+                let (along, length, radius) = shape[b];
+                // A capsule from the bone's origin along it (never shorter
+                // than it is thick).
+                let half = (length / 2.0 - radius).max(0.0);
+                let mid = (half + radius).min(length.max(radius * 2.0) / 2.0);
+                let local = Mat4::translate(along[0] * mid, along[1] * mid, along[2] * mid).then(y_to(along));
+                let mass = r.mass * share[b] / total.max(1e-9);
+                let rest_matrix = decompose(worlds[n][b][release as usize + 1]).1;
+                // A shape given for the bone stands for its capsule.
+                let collider = match r.shapes.iter().find(|s| name(b).contains(s.bone.as_str())) {
+                    Some(s) => match super::sim::given_shape(&s.shape, rest_matrix) {
+                        Some(c) => c,
+                        None => {
+                            errors.push(format!("{}.simulation.ragdolls.{n}.shapes: '{}' takes a box, sphere, capsule or cylinder (and no uneven scale on the bone)", scene.id, s.bone));
+                            continue;
+                        }
+                    },
+                    None => ColliderInput { shape: ShapeInput::Capsule { radius, half }, local },
+                };
+                input.bodies.push(BodyInput {
+                    id: name(b).to_string(),
+                    kind: BodyKind::Dynamic,
+                    colliders: vec![collider],
+                    mass: Some(mass),
+                    density: 1.0,
+                    friction: r.friction,
+                    bounce: r.bounce,
+                    damping: 0.0,
+                    spin_damping: 0.0,
+                    velocity: [0.0; 3],
+                    spin: [0.0; 3],
+                    ccd: false,
+                    release,
+                    keyed: poses[1..=release as usize + 1].to_vec(),
+                    before: poses[release as usize],
+                    rest: rest_matrix,
+                    pushes: Vec::new(),
+                    group: n as u32 + 1,
+                    apart: Vec::new(),
+                    lives: Vec::new(),
+                });
+                let (bind, anchor_parent, clip) = match parent[b] {
+                    Some(p) => {
+                        let inv = rest[p].inverse();
+                        let parents: Vec<Pose> = worlds[n][p].iter().map(|w| decompose(*w).0).collect();
+                        // The bone's turn relative to its parent, per sample.
+                        let clip = (1..=samples + 1).map(|k| quat_mul(parents[k].inverse().q, poses[k].q)).collect();
+                        (quat_mul(inv.q, rest[b].q), inv.apply(rest[b].p), clip)
+                    }
+                    None => ([0.0, 0.0, 0.0, 1.0], [0.0; 3], Vec::new()),
+                };
+                // Its strength: the ragdoll's, times every entry that
+                // names it or a bone it hangs from.
+                let mut chain = vec![b];
+                while let Some(p) = parent[*chain.last().unwrap()] {
+                    chain.push(p);
+                }
+                let scales: Vec<usize> = r.strengths.iter().enumerate().filter(|(_, s)| chain.iter().any(|&x| name(x).contains(s.bone.as_str()))).map(|(k, _)| k).collect();
+                let strength = (0..=samples).map(|k| {
+                    let t = sim.start + k as f64 / rate + scene.pre_roll;
+                    scales.iter().fold(c.strength.at(t), |acc, &s| acc * c.strengths[s].at(t)).clamp(0.0, 1.0)
+                });
+                // Its limits: given, or a human's by its name, or 40 and 20.
+                let (swing, twist, hinge) = match (limit(name(b)), crate::sim::human_limit(name(b).get(shared..).unwrap_or(""))) {
+                    (Some(l), _) => (l.swing, l.twist, l.hinge),
+                    (None, Some((swing, twist, bend))) => {
+                        // A hinge's axle: across the bone and the way the
+                        // figure faces, turned so that the bone folds
+                        // back (a knee) or forward (an elbow).
+                        let ahead = quat_rotate(rest[b].inverse().q, forward);
+                        let axle = crate::sim::cross(ahead, along);
+                        let hinge = match bend {
+                            crate::sim::Bend::Ball => None,
+                            // (A limb that points the way it faces has no
+                            // such axle: it stays a ball, as wide.)
+                            _ if len(axle) < 0.2 => None,
+                            crate::sim::Bend::Forward => Some(axle),
+                            crate::sim::Bend::Back => Some(axle.map(|v| -v)),
+                        };
+                        (swing, twist, hinge)
+                    }
+                    (None, None) => (crate::sim::default_swing(), crate::sim::default_twist(), None),
+                };
+                out.bones.push(BoneInput {
+                    body: first_body + b,
+                    parent: parent[b],
+                    anchor_parent,
+                    along,
+                    length,
+                    swing,
+                    twist,
+                    hinge: hinge.filter(|h| len(*h) > 1e-9).map(|h| h.map(|v| v / len(h))),
+                    bind,
+                    clip,
+                    strength: strength.collect(),
+                    mass,
+                });
+            }
+            for (h, at) in r.hits.iter().zip(&c.hits) {
+                match (0..bones.len()).find(|&b| name(b) == h.bone).or_else(|| (0..bones.len()).find(|&b| name(b).contains(h.bone.as_str()))) {
+                    Some(b) => out.hits.push((*at, b, h.velocity, h.dur.max(0.0))),
+                    None => errors.push(format!("{}.simulation.ragdolls.{n}.hits: no bone '{}' (it has {})", scene.id, h.bone, (0..bones.len()).map(name).collect::<Vec<_>>().join(", "))),
+                }
+            }
+            for (bh, (from, to, amount)) in r.behaviours.iter().zip(&c.behaviours) {
+                let target_body = bh.params.get("target").and_then(|t| t.as_str()).and_then(|id| input.bodies.iter().position(|b| b.id == id));
+                if let Some(id) = bh.params.get("target").and_then(|t| t.as_str()) {
+                    if target_body.is_none() {
+                        errors.push(format!("{}.simulation.ragdolls.{n}.behaviours: target '{id}' is no body of the scene", scene.id));
+                    }
+                }
+                out.behaviours.push(BehaviourInput {
+                    kind: bh.kind,
+                    from: from.unwrap_or(sim.start),
+                    to: to.unwrap_or(sim.end),
+                    amount: (0..=samples).map(|k| amount.at(sim.start + k as f64 / rate + scene.pre_roll).clamp(0.0, 1.0)).collect(),
+                    params: bh.params.clone(),
+                    target_body,
+                });
+            }
+            if puppet {
+                let held = holds.get(r.id.split(['/', '#']).next().unwrap_or("")).copied().unwrap_or(0.0);
+                for b in &mut out.bones {
+                    let body = &mut input.bodies[b.body];
+                    body.keyed.truncate(1);
+                    body.before = body.keyed[0];
+                    body.release = u32::MAX;
+                    b.clip = Vec::new();
+                    b.strength = vec![held];
+                }
+                out.release = u32::MAX;
+                // (One that gets up: `get_up` for the whole take, its
+                // bones at full strength, held to the crowd's but while
+                // it rises.)
+                let crowd = r.id.split(['/', '#']).next().unwrap_or("");
+                if let Some(params) = set.crowds.iter().find(|c| c.id == crowd && c.character.is_some()).and_then(|c| c.ragdoll.as_ref()?.get_up.as_ref()) {
+                    let mut params = params.clone();
+                    params.entry("way".into()).or_insert_with(|| "near".into());
+                    out.behaviours.push(BehaviourInput { kind: crate::sim::BehaviourKind::GetUp, from: sim.start, to: sim.end, amount: vec![1.0], params, target_body: None });
+                    out.bones.iter_mut().for_each(|b| b.strength = vec![1.0]);
+                    out.hold = Some(held);
+                }
+            }
+            if let Some((crowd, many)) = pools.get(n.wrapping_sub(own)).copied().flatten() {
+                let (first, count) = (first_body, input.bodies.len() - first_body);
+                let names: Vec<String> = input.bodies[first..].iter().map(|b| b.id.clone()).collect();
+                for slot in 0..many {
+                    let base = if slot == 0 { first } else { input.bodies.len() };
+                    for k in 0..count {
+                        if slot > 0 {
+                            let body = input.bodies[first + k].clone();
+                            input.bodies.push(body);
+                        }
+                        let body = &mut input.bodies[base + k];
+                        body.id = format!("{crowd}#{slot}/{}", names[k]);
+                        body.group = input.ragdolls.len() as u32 + 1;
+                    }
+                    let mut copy = out.clone();
+                    copy.id = format!("{crowd}#{slot}");
+                    for b in &mut copy.bones {
+                        b.body = b.body - first + base;
+                    }
+                    input.ragdolls.push(copy);
+                }
+                continue;
+            }
+            input.ragdolls.push(out);
+        }
+    }
+}

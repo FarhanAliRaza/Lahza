@@ -1,0 +1,12 @@
+[package]
+name = "lahza-motion-audio"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Music analysis into marker tracks: tempo, downbeats, grids, onsets, hits, stops and drops"
+
+[dependencies]
+lahza-motion-core = { path = "../motion-core" }
+rustfft = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

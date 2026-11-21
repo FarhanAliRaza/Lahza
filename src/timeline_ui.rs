@@ -21,6 +21,8 @@ pub(crate) enum TimelineContextTarget {
     Audio(Uuid),
     EmptyMotion(f64),
     AddMedia,
+    /// The built-in sound effects, from "+ Media".
+    SoundEffects,
 }
 
 type ContextAction = Rc<dyn Fn(&mut Studio, &mut Context<Studio>)>;
@@ -130,7 +132,7 @@ pub(crate) struct TimelineUiState {
     pub hovered_clip: Option<Uuid>,
     pub hover_time: Option<f64>,
     pub vertical_scroll: gpui::ScrollHandle,
-    context: Option<(TimelineContextTarget, Point<Pixels>)>,
+    pub(crate) context: Option<(TimelineContextTarget, Point<Pixels>)>,
     context_highlight: Option<usize>,
     scrollbar_drag: Option<(Pixels, f64)>,
     resize_drag: Option<(Pixels, f32)>,
@@ -643,7 +645,7 @@ impl Studio {
                     return false;
                 }
             }
-            TimelineContextTarget::AddMedia | TimelineContextTarget::EmptyMotion(_) => {}
+            TimelineContextTarget::AddMedia | TimelineContextTarget::SoundEffects | TimelineContextTarget::EmptyMotion(_) => {}
         }
         true
     }
@@ -732,14 +734,14 @@ impl Studio {
     fn timeline_media_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let open = matches!(
             self.timeline_ui.context,
-            Some((TimelineContextTarget::AddMedia, _))
+            Some((TimelineContextTarget::AddMedia | TimelineContextTarget::SoundEffects, _))
         );
         let enabled = !self.video_edit_busy;
         let button = button("timeline-add-media", "+ Media", ButtonKind::Secondary, ButtonSize::Sm)
             .selected(open)
             .disabled(!enabled)
             .tooltip_opt(
-                self.timeline_ui.context.is_none().then_some("Import video, image overlay, or audio"),
+                self.timeline_ui.context.is_none().then_some("Import video, image overlay, audio, or add a sound effect"),
             )
             .into_div()
             .when(enabled, |d| {
@@ -796,6 +798,17 @@ impl Studio {
                 cx,
                 |this, cx| this.add_motion_region_at(this.video_position, cx),
             ))
+            .when(self.motion_editing() && self.motion_doc.is_some(), |d| {
+                d.child(self.timeline_button(
+                    "motion-isolate",
+                    "Isolate",
+                    "Show only the motion design in the preview",
+                    true,
+                    self.motion_isolate,
+                    cx,
+                    |this, cx| this.toggle_motion_isolate(cx),
+                ))
+            })
             .when(!video, |d| {
                 d.child(self.timeline_button(
                     "timeline-extend-scene",
@@ -1093,7 +1106,7 @@ impl Studio {
     pub(crate) fn timeline_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if matches!(
             self.timeline_ui.context,
-            Some((TimelineContextTarget::AddMedia, _))
+            Some((TimelineContextTarget::AddMedia | TimelineContextTarget::SoundEffects, _))
         ) {
             return None; // Rendered beside its toolbar trigger instead.
         }
@@ -1106,6 +1119,7 @@ impl Studio {
             TimelineContextTarget::Motion(_) => "Zoom".into(),
             TimelineContextTarget::Camera(_) => "Camera layout".into(),
             TimelineContextTarget::Audio(_) => "Music / SFX".into(),
+            TimelineContextTarget::SoundEffects => format!("Sound effect · at {}", precise_timecode(self.video_position)).into(),
             TimelineContextTarget::AddMedia | TimelineContextTarget::EmptyMotion(_) => return None,
         })
     }
@@ -1126,7 +1140,17 @@ impl Studio {
                 context_item("Audio…", true, |this, cx| {
                     this.import_timeline_media(crate::media_ui::ImportKind::Audio, cx)
                 }),
+                context_item("Sound effect…", true, |this, cx| {
+                    this.timeline_ui.context = Some((TimelineContextTarget::SoundEffects, Point::default()));
+                    cx.notify();
+                }),
             ],
+            TimelineContextTarget::SoundEffects => lahza_motion_audio::sfx::SOUNDS
+                .iter()
+                .map(|&(name, seconds, _)| {
+                    context_item(format!("{name}  ·  {seconds:.2} s"), ready, move |this, cx| this.add_sound_effect_to_video(name, cx))
+                })
+                .collect(),
             TimelineContextTarget::Clip(id, time) => {
                 let speed = self
                     .video_clip_timeline
@@ -1244,7 +1268,7 @@ impl Studio {
         }
     }
 
-    fn render_timeline_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_timeline_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (target, position) = self.timeline_ui.context?;
         let highlight = self.timeline_ui.context_highlight;
         let rows = self
@@ -1303,7 +1327,7 @@ impl Studio {
                 menu.child(div().px_3().py_1().micro().text_color(muted()).child(header))
             })
             .children(rows);
-        let anchored = if matches!(target, TimelineContextTarget::AddMedia) {
+        let anchored = if matches!(target, TimelineContextTarget::AddMedia | TimelineContextTarget::SoundEffects) {
             gpui::anchored()
                 .position_mode(gpui::AnchoredPositionMode::Local)
                 .position(point(px(0.0), px(32.0)))
