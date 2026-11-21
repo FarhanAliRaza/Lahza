@@ -110,7 +110,7 @@ impl Compiled {
         let mut agents: Vec<crate::sim::Ragdoll> = set
             .crowds
             .iter()
-            .flat_map(|c| c.ragdoll.iter().flat_map(move |r| c.agents.iter().map(move |a| crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), ..crate::sim::Ragdoll::of(format!("{}/{a}", c.id), a.clone(), r.mass, r.thickness, r.friction) })))
+            .flat_map(|c| c.ragdoll.iter().flat_map(move |r| c.agents.iter().map(move |a| crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), feet: r.feet.clone(), ..crate::sim::Ragdoll::of(format!("{}/{a}", c.id), a.clone(), r.mass, r.thickness, r.friction) })))
             .collect();
         // Then one for each crowd of instances, made as many times as may
         // be down at once (its bones' bodies are `<crowd>#<n>/<layer>`).
@@ -118,7 +118,7 @@ impl Compiled {
         for c in &set.crowds {
             if let (Some(character), Some(r)) = (&c.character, &c.ragdoll) {
                 let many = if c.starts.is_empty() { c.count.unwrap_or(0) as usize } else { c.starts.len() };
-                agents.push(crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), ..crate::sim::Ragdoll::of(format!("{}#0", c.id), character.clone(), r.mass, r.thickness, r.friction) });
+                agents.push(crate::sim::Ragdoll { limits: r.limits.clone(), shapes: r.shapes.clone(), feet: r.feet.clone(), ..crate::sim::Ragdoll::of(format!("{}#0", c.id), character.clone(), r.mass, r.thickness, r.friction) });
                 pools.push(Some((&c.id, (r.max as usize).min(many).max(1))));
             }
         }
@@ -306,7 +306,7 @@ impl Compiled {
                     }
                 }
             }
-            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone(), feet, hands, head };
+            let mut out = RagdollInput { id: r.id.clone(), bones: Vec::with_capacity(bones.len()), self_collide: r.self_collide, release, behaviours: Vec::new(), hits: Vec::new(), controller: r.controller.clone(), feet, hands, head, hold: None };
             for b in 0..bones.len() {
                 let poses: Vec<Pose> = worlds[n][b].iter().map(|w| decompose(*w).0).collect();
                 let (along, length, radius) = shape[b];
@@ -440,6 +440,17 @@ impl Compiled {
                     b.strength = vec![held];
                 }
                 out.release = u32::MAX;
+                // (One that gets up: `get_up` for the whole take, its
+                // bones at full strength, held to the crowd's but while
+                // it rises.)
+                let crowd = r.id.split(['/', '#']).next().unwrap_or("");
+                if let Some(params) = set.crowds.iter().find(|c| c.id == crowd && c.character.is_some()).and_then(|c| c.ragdoll.as_ref()?.get_up.as_ref()) {
+                    let mut params = params.clone();
+                    params.entry("way".into()).or_insert_with(|| "near".into());
+                    out.behaviours.push(BehaviourInput { kind: crate::sim::BehaviourKind::GetUp, from: sim.start, to: sim.end, amount: vec![1.0], params, target_body: None });
+                    out.bones.iter_mut().for_each(|b| b.strength = vec![1.0]);
+                    out.hold = Some(held);
+                }
             }
             if let Some((crowd, many)) = pools.get(n.wrapping_sub(own)).copied().flatten() {
                 let (first, count) = (first_body, input.bodies.len() - first_body);

@@ -591,3 +591,135 @@ fn those_who_walk_go_round_one_who_lies() {
     }
     assert_eq!(crate::behaviour_tests::pin(&bake), (113054, 11342613009363423641), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
 }
+
+/// Instances of the sixteen-bone figure (`ragdoll_tests`), standing on
+/// the floor: three in a row 220 px apart, walking along x.
+fn figures(extra: Vec<Value>, crowd: Value, ragdoll: Value, seconds: f64) -> Project {
+    let hero = json!({"id": "hero", "kind": "comp", "three_d": true, "transform": {"position": [300, 800]}, "layers": [crate::ragdoll_tests::figure(json!({"transform": {"position": [0, -250.5]}}))]});
+    let mut layers = vec![floor(), hero];
+    layers.extend(extra);
+    let mut r = json!({"mass": 70, "max": 2,
+        "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+        "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 120, "twist": 60}, {"bone": "fore", "swing": 140, "hinge": [1, 0, 0]}, {"bone": ""}]});
+    for (k, v) in ragdoll.as_object().unwrap() {
+        r[k] = v.clone();
+    }
+    let mut c = json!({"id": "walkers", "character": "hero", "starts": [[300, 0], [520, 0], [740, 0]], "march": [900, 0], "radius": 40, "height": 420, "speed": 120, "vary": 0, "stride": 140, "cycle": 1.0, "dodge": 0, "ragdoll": r});
+    for (k, v) in crowd.as_object().unwrap() {
+        c[k] = v.clone();
+    }
+    project(json!({"id": "s1", "simulation": {"seed": 1, "crowds": [c]}, "layers": layers}), seconds)
+}
+
+/// A ball thrown across the row at the instance that starts at `x`.
+fn thrown(id: &str, x: f64, at: f64) -> Value {
+    json!({"id": id, "kind": "mesh", "mesh": {"type": "sphere", "radius": 30}, "transform": {"position": [x, 430], "z": -260}, "body": {"mass": 30, "release": at, "velocity": [0, 0, 1600]}})
+}
+
+#[test]
+fn one_knocked_down_gets_up_and_walks_on() {
+    // One of the sixteen-bone figure, walking along x, struck from the
+    // side at 0.1 s by a ball at 1600 px/s; its crowd's fallen get up.
+    let take = || {
+        let mut p = figures(vec![thrown("ball", 530.0, 0.0)], json!({"starts": [[520, 0], [1500, 0], [1500, 300]], "knock": 800}), json!({"get_up": {}}), 14.0);
+        baked(&mut p)
+    };
+    let bake = take();
+    let events: Vec<(&str, &str, f64)> = bake.events.iter().filter(|e| ["knock", "fall", "get_up", "rise", "up"].contains(&e.kind.as_str())).map(|e| (e.kind.as_str(), e.a.as_str(), e.t)).collect();
+    // Knocked, down as the pool's first ragdoll, still for 0.8 s, up as
+    // `get_up` does it (helped, by 2.4 s), and then an agent again.
+    let kinds: Vec<(&str, &str)> = events.iter().map(|e| (e.0, e.1)).collect();
+    assert_eq!(kinds, [("knock", "walkers#0"), ("fall", "walkers#0"), ("get_up", "walkers#0"), ("rise", "walkers#0"), ("up", "walkers#0")], "{events:?}");
+    let (down, up) = (events[0].2, events[4].2);
+    assert!(down < 0.2 && up > 3.5 && up < 6.5 && (events[3].2 - up).abs() < 0.05, "{events:?}");
+    let h = &bake.herds[0];
+    assert_eq!(h.falls.len(), 1);
+    let [who, from, to, fall] = h.falls[0];
+    assert!(who == 0 && fall == 0 && from == h.down[0] && (to as f64 / 30.0 - up).abs() < 0.04, "{:?}", h.falls);
+    // It is its ragdoll's from the one to the other, and the agent's
+    // before and after.
+    assert!(h.fallen(0, from as f64 - 0.5).is_none() && h.fallen(0, from as f64) == Some(0) && h.fallen(0, to as f64 - 0.01) == Some(0) && h.fallen(0, to as f64).is_none());
+    // Down, its hips were on the floor; it walks on from where it stood
+    // up, and is at its goal at the end. Its bones stay as they stood.
+    let hips = |k: usize| at(&bake, "walkers#0/hips", k);
+    let lowest = (from as usize..to as usize).map(|k| hips(k)[1]).fold(f64::MIN, f64::max);
+    let agent = |k: usize| { let s = h.samples[k * 3]; [s[0] as f64, 0.0, s[1] as f64] };
+    assert!(lowest > 740.0 && (hips(to as usize)[1] - 550.0).abs() < 25.0, "its hips were at y {lowest:.0} at their lowest and are at {:.0} as it stands", hips(to as usize)[1]);
+    assert!(level(agent(to as usize), hips(to as usize)) < 30.0, "it walks on from {:?}; its hips were at {:?}", agent(to as usize), hips(to as usize));
+    assert!(level(agent(to as usize + 60), agent(to as usize)) > 100.0 && level(agent(h.len() - 1), [1420.0, 0.0, 0.0]) < 40.0, "it ended at {:?}", agent(h.len() - 1));
+    assert!(hips(h.len() - 1) == hips(to as usize - 1));
+    eprintln!("down at {down:.2} s, up at {up:.2} s, {:.0} px from where it was struck", level(agent(to as usize), [520.0, 0.0, 0.0]));
+    // The same bytes again; and the bake survives its file.
+    assert!(take().to_bytes() == bake.to_bytes());
+    assert_eq!(Bake::from_bytes(&bake.to_bytes()).unwrap(), *bake);
+    assert_eq!(crate::behaviour_tests::pin(&bake), (225744, 18350922712031349476), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn a_ragdoll_of_the_pool_falls_again_for_the_next() {
+    // Six standing, a pool of one ragdoll, four balls: at instance 3 as
+    // the take starts, at 1 at 5 s, at 5 at 5.4 s, at 0 at 10 s.
+    let ball = |id: &str, x: f64, at: f64| json!({"id": id, "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [x + 5.0, 700], "z": -150}, "body": {"mass": 30, "release": at, "velocity": [0, 0, 1500]}});
+    let starts: Vec<Value> = (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect();
+    let mut p = herd_scene(vec![ball("b3", 540.0, 0.0), ball("b1", 380.0, 5.0), ball("b5", 700.0, 5.4), ball("b0", 300.0, 10.0)], json!({"goals": starts, "dodge": 0, "knock": 900, "ragdoll": {"mass": 60, "max": 1, "limits": [{"bone": ""}]}}), 1, 14.0);
+    let bake = baked(&mut p);
+    let knocks: Vec<(&str, f64)> = bake.events.iter().filter(|e| e.kind == "knock").map(|e| (e.a.as_str(), e.t)).collect();
+    assert_eq!(knocks.iter().map(|k| k.0).collect::<Vec<_>>(), ["walkers#3", "walkers#1", "walkers#5", "walkers#0"], "{knocks:?}");
+    let h = &bake.herds[0];
+    // The first lay still a second and more: the second falls as its
+    // ragdoll, and the fourth as it again. The third was struck while it
+    // was still falling: with none to take, it stops where it stands.
+    let falls: Vec<[u32; 4]> = h.falls.clone();
+    assert!(falls.len() == 3 && falls.iter().map(|f| (f[0], f[3])).collect::<Vec<_>>() == [(3, 0), (1, 1), (0, 2)] && falls.iter().all(|f| f[2] == u32::MAX), "{falls:?}");
+    assert_eq!(h.slot, [2, 1, u32::MAX, 0, u32::MAX, u32::MAX]);
+    assert!(h.down[5] != u32::MAX && h.fallen(5, 400.0).is_none() && h.fallen(3, 400.0) == Some(0) && h.fallen(1, 400.0) == Some(1) && h.fallen(0, 400.0) == Some(2));
+    // Each fall has its own bones' tracks; a fall's stay as they lay from
+    // when its ragdoll was given on.
+    let ids: Vec<&str> = bake.tracks.iter().map(|t| t.id.as_str()).filter(|id| id.ends_with("hips")).collect();
+    assert_eq!(ids, ["walkers#0/a0-hips", "walkers#1/a0-hips", "walkers#2/a0-hips"]);
+    let hips = |fall: usize, k: usize| at(&bake, &format!("walkers#{fall}/a0-hips"), k);
+    let (second, third, last) = (falls[1][1] as usize, falls[2][1] as usize, h.len() - 1);
+    assert!(hips(0, second - 1) == hips(0, last) && level(hips(0, last), hips(0, second - 30)) < 2.0, "the first lay at {:?}, and at the end {:?}", hips(0, second), hips(0, last));
+    assert!(hips(1, third - 1) == hips(1, last) && level(hips(1, last), hips(0, last)) > 60.0 && hips(1, last)[1] > 770.0);
+    assert!(level(hips(2, last), hips(1, last)) > 30.0 && hips(2, last)[1] > 770.0 && bake.tracks[bake.track("walkers#2/a0-hips").unwrap()].from as usize == third);
+    assert_eq!(Bake::from_bytes(&bake.to_bytes()).unwrap(), *bake);
+    assert_eq!(crate::behaviour_tests::pin(&bake), (269649, 10792876780960502325), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn one_knocked_down_with_its_guard_up_falls_from_that_pose() {
+    // The guard test's character (its spine a quarter round in the
+    // guard's pose) and its ball, which now strikes: instance 3 has its
+    // guard up when it does.
+    let scene = |crowd: Value| {
+        let mut a = agent(0, 300.0, 0.0);
+        let spine = &mut a["layers"][0]["layers"][0];
+        spine["transform"]["rotation"] = json!({"keys": [{"at": 2, "v": 0}, {"at": 3.5, "v": 90, "ease": "linear"}]});
+        let ball = json!({"id": "ball", "kind": "mesh", "mesh": {"type": "sphere", "radius": 26}, "transform": {"position": [540, 720], "z": -900}, "body": {"mass": 30, "velocity": [0, -120, 1500]}});
+        let starts: Vec<Value> = (0..6).map(|i| json!([300.0 + i as f64 * 80.0, 0.0])).collect();
+        let mut c = json!({"id": "walkers", "character": "a0", "starts": starts, "goals": starts, "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0, "dodge": 0, "ragdoll": {"mass": 60, "max": 1, "limits": [{"bone": ""}]}});
+        for (k, v) in crowd.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        let mut p = project(json!({"id": "s1", "simulation": {"crowds": [c]}, "layers": [floor(), a, ball]}), 4.0);
+        let input = Compiled::new(&p).sim_input(0, None).0;
+        (baked(&mut p), input)
+    };
+    // How far its spine is turned against its hips as it is let go.
+    let bent = |bake: &Bake| {
+        let h = &bake.herds[0];
+        let k = h.down[3] as usize;
+        assert!(k < 30 && h.slot[3] == 0, "down {:?}", h.down);
+        let q = |id: &str| { let s = bake.tracks[bake.track(id).unwrap()].samples[k]; [s[3] as f64, s[4] as f64, s[5] as f64, s[6] as f64] };
+        let (a, b) = (q("walkers#0/a0-hips"), q("walkers#0/a0-spine"));
+        ((2.0 * (0..4).map(|i| a[i] * b[i]).sum::<f64>().abs().min(1.0).acos()).to_degrees(), h.guard.get(k * 6 + 3).copied())
+    };
+    let (plain, input) = scene(json!({}));
+    assert!(input.crowds[0].guard_pose.is_empty() && bent(&plain).0 < 3.0, "walking, its spine is {:.0}° from its hips", bent(&plain).0);
+    let (guarded, input) = scene(json!({"guard": {"pose": 3.5, "ahead": 1.0, "bones": ["a0-spine"]}}));
+    // (The pose takes the spine and the head on it; not the hips or legs.)
+    assert_eq!(input.crowds[0].guard_pose.iter().map(|g| g.1).collect::<Vec<_>>(), [false, true, true, false, false]);
+    let (angle, up) = bent(&guarded);
+    assert!(up.is_some_and(|g| g > 0.99) && (angle - 90.0).abs() < 4.0, "its guard {up:?} up, its spine {angle:.0}° from its hips as it is let go");
+    assert_eq!(crate::behaviour_tests::pin(&guarded), (36989, 3641593593800269882), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}

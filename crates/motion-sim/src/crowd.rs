@@ -22,8 +22,11 @@ struct Agent {
     /// px walked, and where in the cycle it started (0..1).
     walked: f64,
     phase: f64,
-    /// The sample from which it is down.
+    /// The sample from which it is down, the one it first went down at,
+    /// and (an instance with a ragdoll) which of its crowd's falls it is in.
     down: Option<u32>,
+    fell: Option<u32>,
+    fall: Option<usize>,
     proxy: RigidBodyHandle,
     /// The corners of its way round what stands between it and its goal
     /// (none: straight there), and the body it last stepped aside from.
@@ -56,6 +59,71 @@ pub struct Herd {
     proxies: HashMap<RigidBodyHandle, (usize, usize)>,
     /// A copy for a try ahead: it steers, and keeps nothing.
     quiet: bool,
+    /// Per crowd of instances: every fall of the take so far, and per
+    /// ragdoll of its pool the fall that has it now.
+    falls: Vec<Vec<Fall>>,
+    held: Vec<Vec<Option<usize>>>,
+    /// Where those lie whose ragdoll was given to another.
+    lain: Vec<Block>,
+}
+
+/// A fall of an instance: who, on which ragdoll of the pool, from which
+/// sample, until which it walks again, and until which its bones are the
+/// ragdoll's (after that they stay as they lay: it rose, or the ragdoll
+/// was given on); and since when it has lain still.
+#[derive(Clone)]
+struct Fall {
+    agent: usize,
+    slot: usize,
+    from: u32,
+    to: u32,
+    end: u32,
+    still: Option<u32>,
+}
+
+/// A fall as the bake keeps it: the crowd, which of its falls, the
+/// ragdoll, and the samples its bones are the ragdoll's from and to.
+pub struct Fell {
+    pub crowd: usize,
+    pub fall: usize,
+    pub ragdoll: usize,
+    pub from: u32,
+    pub end: u32,
+}
+
+/// The box of a ragdoll's bones as they are.
+fn bones_box(world: &World, input: &SimInput, r: usize) -> Option<Block> {
+    let u = world.unit;
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for bone in &input.ragdolls[r].bones {
+        for &col in world.w.bodies[world.handles[bone.body]].colliders() {
+            let aabb = world.w.colliders[col].compute_aabb();
+            for x in 0..3 {
+                lo[x] = lo[x].min(aabb.mins[x] as f64 * u);
+                hi[x] = hi[x].max(aabb.maxs[x] as f64 * u);
+            }
+        }
+    }
+    let root = input.ragdolls[r].bones[0].body;
+    let v = world.w.bodies[world.handles[root]].linvel();
+    (lo[0] <= hi[0]).then(|| Block { body: root, lo, hi, vel: [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], fixed: false, shaped: false })
+}
+
+/// Takes a ragdoll of a pool out of the world again.
+fn park(world: &mut World, input: &SimInput, r: usize) {
+    for bone in &input.ragdolls[r].bones {
+        let h = world.handles[bone.body];
+        let rb = &mut world.w.bodies[h];
+        rb.set_linvel(Vector::ZERO, false);
+        rb.set_angvel(Vector::ZERO, false);
+        rb.set_body_type(RigidBodyType::KinematicPositionBased, false);
+        rb.set_enabled(false);
+        let colliders: Vec<ColliderHandle> = rb.colliders().to_vec();
+        for ch in colliders {
+            world.w.colliders[ch].set_enabled(false);
+        }
+        world.released[bone.body] = false;
+    }
 }
 
 /// A body as agents see it: its box (px), how it moves (px/s).
@@ -325,6 +393,8 @@ impl Herd {
                     walked: 0.0,
                     phase: (rng.signed() + 1.0) / 2.0,
                     down: None,
+                    fell: None,
+                    fall: None,
                     proxy,
                     path: Vec::new(),
                     dodged: None,
@@ -348,6 +418,9 @@ impl Herd {
             sample: 0,
             proxies,
             quiet: false,
+            falls: vec![Vec::new(); input.crowds.len()],
+            held: input.crowds.iter().map(|c| vec![None; c.pool.len()]).collect(),
+            lain: Vec::new(),
         }
     }
 
@@ -361,13 +434,13 @@ impl Herd {
         let agents = self.agents.iter().zip(&input.crowds).map(|(herd, c)| {
             let range = 2.0 * (2.2 * c.speed * horizon + 8.0 * c.radius);
             herd.iter().map(|a| Agent {
-                at: a.at, vel: a.vel, heading: a.heading, speed: a.speed, walked: a.walked, phase: a.phase, down: a.down, proxy: a.proxy, path: a.path.clone(), dodged: a.dodged, guard: a.guard, wary: a.wary,
+                at: a.at, vel: a.vel, heading: a.heading, speed: a.speed, walked: a.walked, phase: a.phase, down: a.down, fell: a.fell, fall: a.fall, proxy: a.proxy, path: a.path.clone(), dodged: a.dodged, guard: a.guard, wary: a.wary,
                 idle: a.idle || near.is_some_and(|near| !near.iter().any(|p| len2([p[0] - a.at[0], p[1] - a.at[1]]) < range)),
                 now: a.now, next: a.next,
                 track: Track { id: String::new(), from: 0, rest: a.track.rest, samples: Vec::new(), clock: Vec::new() },
             }).collect()
         }).collect();
-        Herd { agents, events: Vec::new(), rows: Vec::new(), guards: Vec::new(), slots: Vec::new(), taken: Vec::new(), sample: self.sample, proxies: HashMap::new(), quiet: true }
+        Herd { agents, events: Vec::new(), rows: Vec::new(), guards: Vec::new(), slots: Vec::new(), taken: Vec::new(), sample: self.sample, proxies: HashMap::new(), quiet: true, falls: self.falls.clone(), held: Vec::new(), lain: self.lain.iter().map(|b| Block { body: b.body, lo: b.lo, hi: b.hi, vel: b.vel, fixed: b.fixed, shaped: b.shaped }).collect() }
     }
 
     /// How many of its agents steer (in a try's copy: those near enough).
@@ -432,26 +505,21 @@ impl Herd {
         }
         // And who lies or is falling: each one down as the box of its
         // bones, whatever its height (a wall to plan round once it lies).
-        // (Every crowd's fallen are in every crowd's way.)
-        let mut lying: Vec<Block> = Vec::new();
+        // (Every crowd's fallen are in every crowd's way; one whose
+        // ragdoll was given on lies where it lay.)
+        let mut lying: Vec<Block> = self.lain.iter().map(|b| Block { body: b.body, lo: b.lo, hi: b.hi, vel: [0.0; 3], fixed: false, shaped: false }).collect();
         for (n, c) in input.crowds.iter().enumerate() {
             for (k, a) in self.agents[n].iter().enumerate() {
-                let ragdoll = if c.instanced { self.slots.get(n).and_then(|s| c.pool.get(*s.get(k)? as usize)).copied() } else { c.agents[k].ragdoll };
+                let ragdoll = if c.instanced { a.fall.and_then(|f| self.falls[n].get(f)).filter(|f| f.end == u32::MAX).map(|f| c.pool[f.slot]) } else { c.agents[k].ragdoll };
                 let (Some(_), Some(r)) = (a.down, ragdoll) else { continue };
-                let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-                for bone in &input.ragdolls[r].bones {
-                    for &col in world.w.bodies[world.handles[bone.body]].colliders() {
-                        let aabb = world.w.colliders[col].compute_aabb();
-                        for x in 0..3 {
-                            lo[x] = lo[x].min(aabb.mins[x] as f64 * u);
-                            hi[x] = hi[x].max(aabb.maxs[x] as f64 * u);
-                        }
-                    }
-                }
-                let root = input.ragdolls[r].bones[0].body;
-                let v = world.w.bodies[world.handles[root]].linvel();
-                if lo[0] <= hi[0] {
-                    lying.push(Block { body: root, lo, hi, vel: [v.x as f64 * u, v.y as f64 * u, v.z as f64 * u], fixed: false, shaped: false });
+                lying.extend(bones_box(world, input, r));
+            }
+            // Since when each that is down has lain still (no bone of it
+            // faster than 20 px/s).
+            if !self.quiet {
+                for f in self.falls[n].iter_mut().filter(|f| f.end == u32::MAX) {
+                    let fastest = input.ragdolls[c.pool[f.slot]].bones.iter().map(|b| world.w.bodies[world.handles[b.body]].linvel().length() as f64 * u).fold(0.0, f64::max);
+                    f.still = if fastest < 20.0 { f.still.or(Some(sample)) } else { None };
                 }
             }
         }
@@ -740,7 +808,8 @@ impl Herd {
     /// sample the step is in, `t` its time.
     /// Returns, for each ragdoll let go, the turns that have its motors
     /// hold the pose it was let go in.
-    pub fn knocks(&mut self, input: &SimInput, world: &mut World, k: u32, t: f64) -> Vec<(usize, Vec<Option<[f64; 4]>>)> {
+    /// `rising`: per ragdoll, whether it is getting up now.
+    pub fn knocks(&mut self, input: &SimInput, world: &mut World, k: u32, t: f64, rising: &dyn Fn(usize) -> bool) -> Vec<(usize, Vec<Option<[f64; 4]>>)> {
         let mut held = Vec::new();
         let u = world.unit;
         let mut struck: Vec<(usize, usize, usize, f64)> = Vec::new();
@@ -753,6 +822,11 @@ impl Herd {
                 let Some((n, a)) = mine.and_then(|h| self.proxies.get(&h).copied()).filter(|&(n, a)| self.agents[n][a].down.is_none()) else { continue };
                 let Some(body) = other.and_then(|h| world.handles.iter().position(|x| *x == h)) else { continue };
                 if !world.released[body] {
+                    continue;
+                }
+                // (One getting up knocks no one down: its limbs are
+                // moved by its motors and the hand that helps it.)
+                if input.crowds.iter().flat_map(|c| &c.pool).any(|&r| rising(r) && input.ragdolls[r].bones.iter().any(|b| b.body == body)) {
                     continue;
                 }
                 let v = world.before.get(body).copied().unwrap_or(Vector::ZERO);
@@ -770,6 +844,7 @@ impl Herd {
             let c = &input.crowds[n];
             let agent = &mut self.agents[n][a];
             agent.down = Some(k + 1);
+            agent.fell = agent.fell.or(agent.down);
             agent.next = agent.now;
             let who = if c.instanced { format!("{}#{a}", c.id) } else { agent.track.id.clone() };
             self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "knock".into(), a: who, b: input.bodies[body].id.clone(), speed: speed.round() });
@@ -780,15 +855,43 @@ impl Herd {
             }
             // Its own ragdoll, or the next of the pool while there is one.
             let (ragdoll, local) = if c.instanced {
-                let slot = self.taken[n];
-                if slot < c.pool.len() {
+                // The next of the pool never used; else one whose agent
+                // has got up; else the one that has lain still longest, a
+                // second or more, and is not getting up: its agent lies
+                // on as it lay, and its ragdoll falls again as this one.
+                let mut slot = (self.taken[n] < c.pool.len()).then_some(self.taken[n]);
+                if slot.is_some() {
                     self.taken[n] += 1;
-                    self.slots[n][a] = slot as u32;
                 }
-                (c.pool.get(slot).copied(), &c.local)
+                slot = slot.or_else(|| self.held[n].iter().position(|f| f.is_none()));
+                if slot.is_none() {
+                    let a_second = input.rate.round().max(1.0) as u32;
+                    let longest = (0..c.pool.len()).filter_map(|s| {
+                        let since = self.falls[n][self.held[n][s]?].still?;
+                        (k + 1 >= since + a_second && !rising(c.pool[s])).then_some((since, s))
+                    }).min();
+                    if let Some((_, s)) = longest {
+                        let f = self.held[n][s].take().unwrap();
+                        self.falls[n][f].end = k + 1;
+                        self.lain.extend(bones_box(world, input, c.pool[s]));
+                        park(world, input, c.pool[s]);
+                        slot = Some(s);
+                    }
+                }
+                if let Some(s) = slot {
+                    let f = self.falls[n].len();
+                    self.falls[n].push(Fall { agent: a, slot: s, from: k + 1, to: u32::MAX, end: u32::MAX, still: None });
+                    self.held[n][s] = Some(f);
+                    self.agents[n][a].fall = Some(f);
+                    if self.slots[n][a] == u32::MAX {
+                        self.slots[n][a] = f as u32;
+                    }
+                }
+                (slot.map(|s| c.pool[s]), &c.local)
             } else {
                 (c.agents[a].ragdoll, &c.agents[a].local)
             };
+            let agent = &self.agents[n][a];
             let Some(r) = ragdoll else { continue };
             let cycle = local.first().map_or(1, |l| l.len().max(2) - 1) as f64;
             let turns = agent.walked / c.stride + agent.phase;
@@ -797,17 +900,39 @@ impl Herd {
             let root = Pose { p: [root.translation.x as f64 * u, root.translation.y as f64 * u, root.translation.z as f64 * u], q: [root.rotation.x as f64, root.rotation.y as f64, root.rotation.z as f64, root.rotation.w as f64] };
             // Samples of the clip a second, as it was walking.
             let pace = len2(agent.vel) / c.stride * cycle;
+            let between = |p: &Pose, q: &Pose, f: f64| {
+                let s = if (0..4).map(|x| p.q[x] * q.q[x]).sum::<f64>() < 0.0 { -1.0 } else { 1.0 };
+                let turn: [f64; 4] = std::array::from_fn(|x| p.q[x] + (s * q.q[x] - p.q[x]) * f);
+                let l = turn.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+                Pose { p: std::array::from_fn(|x| p.p[x] + (q.p[x] - p.p[x]) * f), q: turn.map(|v| v / l) }
+            };
+            // Each bone in the agent's frame as the walk has it, and, with
+            // its guard up, as far toward the guard's pose as that is up:
+            // joint by joint, for the bones the pose takes.
+            let bones = &input.ragdolls[r].bones;
+            let walk: Vec<Pose> = local.iter().map(|l| {
+                let i = (at.floor() as usize).min(l.len() - 1);
+                between(&l[i], &l[(i + 1).min(l.len() - 1)], at - i as f64)
+            }).collect();
+            let mut stand: Vec<Pose> = walk.clone();
+            if c.instanced && agent.guard > 0.0 && c.guard_pose.len() == bones.len() {
+                for b in 0..bones.len() {
+                    let (pose, takes) = &c.guard_pose[b];
+                    stand[b] = match (bones[b].parent.filter(|p| *p < b), *takes) {
+                        (Some(p), true) => stand[p].then(&between(&walk[p].inverse().then(&walk[b]), &c.guard_pose[p].0.inverse().then(pose), agent.guard)),
+                        (Some(p), false) => stand[p].then(&walk[p].inverse().then(&walk[b])),
+                        (None, true) => between(&walk[b], pose, agent.guard),
+                        (None, false) => walk[b],
+                    };
+                }
+            }
             let mut placed: Vec<Pose> = Vec::with_capacity(local.len());
-            for (bone, local) in input.ragdolls[r].bones.iter().zip(local) {
+            for ((bone, local), stand) in bones.iter().zip(local).zip(&stand) {
                 let i = (at.floor() as usize).min(local.len() - 1);
                 let j = (i + 1).min(local.len() - 1);
-                let f = at - i as f64;
                 let (p, q) = (&local[i], &local[j]);
                 let s = if (0..4).map(|x| p.q[x] * q.q[x]).sum::<f64>() < 0.0 { -1.0 } else { 1.0 };
-                let mut turn: [f64; 4] = std::array::from_fn(|x| p.q[x] + (s * q.q[x] - p.q[x]) * f);
-                let l = turn.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
-                turn = turn.map(|v| v / l);
-                let here = root.then(&Pose { p: std::array::from_fn(|x| p.p[x] + (q.p[x] - p.p[x]) * f), q: turn });
+                let here = root.then(stand);
                 placed.push(here);
                 // Its own swing in the clip: how it moves and turns from
                 // this sample of the cycle to the next, at the agent's pace.
@@ -829,6 +954,12 @@ impl Herd {
                     world.w.colliders[ch].set_enabled(true);
                 }
                 world.released[bone.body] = true;
+                // (One that will get up is read before the next step:
+                // where its weight is has to be where it was put.)
+                if input.ragdolls[r].hold.is_some() {
+                    let World { w, .. } = world;
+                    w.bodies[h].recompute_mass_properties_from_colliders(&w.colliders);
+                }
             }
             // Each bone's turn against its parent as it fell, on top of
             // how it is bound (what its motors aim for from now).
@@ -844,18 +975,25 @@ impl Herd {
 
     /// The agents' tracks (after the last `plan`), and for each bone body
     /// let go the sample it was let go at.
-    pub fn finish(mut self, input: &SimInput) -> (Vec<Track>, Vec<(usize, u32)>, Vec<HerdTrack>) {
+    /// And every fall of an instance, for its bones' tracks.
+    pub fn finish(mut self, input: &SimInput) -> (Vec<Track>, Vec<(usize, u32)>, Vec<HerdTrack>, Vec<Fell>) {
         let mut tracks = Vec::new();
         let mut released = Vec::new();
         let mut herds = Vec::new();
+        let mut fell = Vec::new();
         for (n, herd) in self.agents.into_iter().enumerate() {
             let c = &input.crowds[n];
             if c.instanced {
-                for (k, a) in herd.iter().enumerate() {
-                    if let (Some(at), Some(&r)) = (a.down, c.pool.get(self.slots[n][k] as usize)) {
-                        released.extend(input.ragdolls[r].bones.iter().map(|b| (b.body, at)));
+                // (A ragdoll's own tracks are its first fall's.)
+                let falls = std::mem::take(&mut self.falls[n]);
+                for (f, fall) in falls.iter().enumerate() {
+                    if f < c.pool.len() {
+                        released.extend(input.ragdolls[c.pool[fall.slot]].bones.iter().map(|b| (b.body, fall.from)));
                     }
+                    fell.push(Fell { crowd: n, fall: f, ragdoll: c.pool[fall.slot], from: fall.from, end: fall.end });
                 }
+                // (Said in the bake only when `down` and `slot` do not say it all.)
+                let told = falls.iter().enumerate().any(|(f, fall)| fall.to != u32::MAX || fall.end != u32::MAX || f >= c.pool.len());
                 let Some(first) = c.agents.first() else { continue };
                 herds.push(HerdTrack {
                     id: c.id.clone(),
@@ -864,9 +1002,10 @@ impl Herd {
                     y: first.start.p[1],
                     q: first.start.q,
                     samples: std::mem::take(&mut self.rows[n]),
-                    down: herd.iter().map(|a| a.down.unwrap_or(u32::MAX)).collect(),
+                    down: herd.iter().map(|a| a.fell.unwrap_or(u32::MAX)).collect(),
                     slot: std::mem::take(&mut self.slots[n]),
                     guard: std::mem::take(&mut self.guards[n]),
+                    falls: if told { falls.iter().enumerate().map(|(f, fall)| [fall.agent as u32, fall.from, fall.to, f as u32]).collect() } else { Vec::new() },
                 });
                 continue;
             }
@@ -877,6 +1016,47 @@ impl Herd {
                 tracks.push(a.track);
             }
         }
-        (tracks, released, herds)
+        (tracks, released, herds, fell)
+    }
+
+    /// After a sample's steps: those of the fallen that have got up
+    /// (`risen`: per ragdoll) walk again from where they stand, and give
+    /// their ragdolls back. Returns the ragdolls given back.
+    pub fn rises(&mut self, input: &SimInput, world: &mut World, risen: &dyn Fn(usize) -> bool, k: u32, t: f64) -> Vec<usize> {
+        let mut back = Vec::new();
+        for (n, c) in input.crowds.iter().enumerate().filter(|(_, c)| c.instanced) {
+            for s in 0..c.pool.len() {
+                let (Some(f), true) = (self.held[n][s], risen(c.pool[s])) else { continue };
+                let r = c.pool[s];
+                let who = self.falls[n][f].agent;
+                // Where it stands: its root bone, and the agent's place
+                // that has the clip's first moment put it there.
+                let hips = world.pose(input.ragdolls[r].bones[0].body);
+                let Some(first) = c.local.first().and_then(|l| l.first()) else { continue };
+                let q = lahza_motion_core::sim::quat_mul(hips.q, [-first.q[0], -first.q[1], -first.q[2], first.q[3]]);
+                let f3 = lahza_motion_core::sim::quat_rotate(q, [c.facing[0], 0.0, c.facing[1]]);
+                let l = len2([f3[0], f3[2]]).max(1e-9);
+                let a = &mut self.agents[n][who];
+                a.heading = [f3[0] / l, f3[2] / l];
+                let turned = place(c, who, [0.0; 2], a.heading);
+                let off = lahza_motion_core::sim::quat_rotate(turned.q, first.p);
+                a.at = [hips.p[0] - off[0], hips.p[2] - off[2]];
+                (a.vel, a.walked, a.phase, a.down, a.fall, a.guard) = ([0.0; 2], 0.0, 0.0, None, None, 0.0);
+                a.path.clear();
+                a.next = place(c, who, a.at, a.heading);
+                let proxy = a.proxy;
+                world.w.bodies[proxy].set_position(pose(&a.next, world.unit), true);
+                let colliders: Vec<ColliderHandle> = world.w.bodies[proxy].colliders().to_vec();
+                for h in colliders {
+                    world.w.colliders[h].set_enabled(true);
+                }
+                (self.falls[n][f].to, self.falls[n][f].end) = (k + 1, k + 1);
+                self.held[n][s] = None;
+                park(world, input, r);
+                back.push(r);
+                self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "up".into(), a: format!("{}#{who}", c.id), b: String::new(), speed: 0.0 });
+            }
+        }
+        back
     }
 }

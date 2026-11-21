@@ -242,11 +242,32 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
             if !herd.is_empty() {
                 // (One knocked down holds, as far as its crowd's ragdolls
                 // do, the pose it fell in.)
-                for (rig, held) in herd.knocks(input, &mut take.world, k, input.start + (k as f64 + (s + 1) as f64 / n as f64) / input.rate) {
+                let brains = &take.brains;
+                let knocked = herd.knocks(input, &mut take.world, k, input.start + (k as f64 + (s + 1) as f64 / n as f64) / input.rate, &|rig| brains[rig].rising());
+                for (rig, held) in knocked {
+                    // (A fall is a ragdoll's first, whoever fell as it before.)
+                    let mut before = std::mem::replace(&mut take.brains[rig], behaviour::Brain::new(input, &input.ragdolls[rig]));
+                    take.world.events.append(&mut before.events);
                     take.turns[rig] = Some(held);
                 }
             }
             steps += 1;
+        }
+        if !herd.is_empty() {
+            // One that gets up is its motors' and the clip's, not the
+            // pose it fell in; once up it is an agent again.
+            for (rig, r) in input.ragdolls.iter().enumerate() {
+                if r.hold.is_some() && take.brains[rig].rising() {
+                    take.turns[rig] = None;
+                }
+            }
+            let brains = &take.brains;
+            let back = herd.rises(input, &mut take.world, &|rig| brains[rig].risen, k, input.start + (k + 1) as f64 / input.rate);
+            for rig in back {
+                let mut before = std::mem::replace(&mut take.brains[rig], behaviour::Brain::new(input, &input.ragdolls[rig]));
+                take.world.events.append(&mut before.events);
+                take.turns[rig] = None;
+            }
         }
     }
     record(&take.world, &mut tracks);
@@ -255,10 +276,36 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
     events.append(&mut herd.events);
     // A crowd's agents, and the bones of those knocked down from when
     // they were (the others' stay their agents').
-    let (agents, let_go, herds) = herd.finish(input);
+    let (agents, let_go, herds, fell) = herd.finish(input);
     for (body, at) in let_go {
         if let Some(track) = dynamic.iter().position(|&i| i == body) {
             tracks[track].from = at;
+        }
+    }
+    // A fall on a ragdoll that fell before has tracks of its own (the
+    // ragdoll's, from that fall); and after a fall's end (it rose, or
+    // its ragdoll was given on) its bones stay as they were then.
+    let mut later: Vec<Track> = Vec::new();
+    let stay = |samples: &mut [[f32; 7]], end: u32| {
+        // (Sample `end` is already the next fall's, where there is one.)
+        if let (Some(&at), true) = (samples.get((end as usize).wrapping_sub(1)), (end as usize) < samples.len()) {
+            samples[end as usize..].iter_mut().for_each(|s| *s = at);
+        }
+    };
+    for f in fell.iter().filter(|f| f.fall >= input.crowds[f.crowd].pool.len()) {
+        for bone in &input.ragdolls[f.ragdoll].bones {
+            let Some(track) = dynamic.iter().position(|&i| i == bone.body) else { continue };
+            let name = tracks[track].id.split_once('/').map_or("", |x| x.1);
+            let mut own = Track { id: format!("{}#{}/{name}", input.crowds[f.crowd].id, f.fall), from: f.from, rest: tracks[track].rest, samples: tracks[track].samples.clone(), clock: Vec::new() };
+            stay(&mut own.samples, f.end);
+            later.push(own);
+        }
+    }
+    for f in fell.iter().filter(|f| f.fall < input.crowds[f.crowd].pool.len()) {
+        for bone in &input.ragdolls[f.ragdoll].bones {
+            if let Some(track) = dynamic.iter().position(|&i| i == bone.body) {
+                stay(&mut tracks[track].samples, f.end);
+            }
         }
     }
     // A particle's track begins with its first life. The sample before a
@@ -281,6 +328,7 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
     // (Bones never let go have nothing to say: their agents place them.)
     tracks.retain(|t| t.from != u32::MAX);
     tracks.extend(agents);
+    tracks.extend(later);
     for b in &mut take.brains {
         events.append(&mut b.events);
     }

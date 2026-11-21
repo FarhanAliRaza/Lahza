@@ -837,10 +837,22 @@ pub struct CrowdRagdoll {
     /// How hard one knocked down holds the pose it fell in (0: limp).
     #[serde(default)]
     pub strength: f64,
-    /// Instances: how many can be down as ragdolls at once in a take (the
-    /// ones knocked after that stop where they stand).
+    /// Instances: how many can be falling as ragdolls at once in a take.
+    /// One that has got up, or has lain still a second, gives its ragdoll
+    /// to the next knocked down (and lies as it lay); with none to give,
+    /// one knocked stops where it stands.
     #[serde(default = "crowd_fallen")]
     pub max: u32,
+    /// The character's feet (bone layer ids), where its bones' names do
+    /// not tell (as a ragdoll's `feet`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feet: Vec<String>,
+    /// Instances: one knocked down gets up again and walks on, as the
+    /// `get_up` behaviour does it; these are that behaviour's params
+    /// (`wait`, `time`, `help`, `way`; `{}` for its defaults, with `way`
+    /// `near`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get_up: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 fn crowd_dodge() -> f64 {
@@ -1086,9 +1098,24 @@ pub struct HerdTrack {
     /// Per sample, per agent, when the crowd has a guard: how far it has
     /// taken its guard's pose (0..1). Empty otherwise.
     pub guard: Vec<f32>,
+    /// When one got up again, or a ragdoll of the pool was used twice:
+    /// every fall as (agent, the sample from which it is down, the sample
+    /// from which it walks again or `u32::MAX`, which fall of the take it
+    /// is: its bones are tracks `<id>#<that>/<bone layer>`). Empty
+    /// otherwise: `down` and `slot` say it all.
+    pub falls: Vec<[u32; 4]>,
 }
 
 impl HerdTrack {
+    /// The fall agent `k` is down in at sample position `x`: the number
+    /// its bones' tracks are named by.
+    pub fn fallen(&self, k: usize, x: f64) -> Option<u32> {
+        if self.falls.is_empty() {
+            return (x >= self.down[k] as f64 && self.slot[k] != u32::MAX).then(|| self.slot[k]);
+        }
+        self.falls.iter().find(|f| f[0] as usize == k && x >= f[1] as f64 && x < f[2] as f64).map(|f| f[3])
+    }
+
     /// How far agent `k` has its guard up at sample position `x` (0..1).
     pub fn guard_at(&self, k: usize, x: f64) -> f64 {
         let n = self.count as usize;
@@ -1256,6 +1283,14 @@ impl Bake {
                 o.extend_from_slice(&v.to_le_bytes());
             }
         }
+        // (And the falls of those that have any, marked by the top bit.)
+        for (k, h) in self.herds.iter().enumerate().filter(|(_, h)| !h.falls.is_empty()) {
+            o.extend_from_slice(&(k as u32 | 1 << 31).to_le_bytes());
+            o.extend_from_slice(&(h.falls.len() as u32).to_le_bytes());
+            for v in h.falls.iter().flatten() {
+                o.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         o
     }
 
@@ -1329,10 +1364,16 @@ impl Bake {
                     *m = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
                 }
                 let [down, slot] = marks;
-                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot, guard: Vec::new() });
+                herds.push(HerdTrack { id, count, rest: Mat4(f[..16].try_into().unwrap()), y: f[16], q: f[17..21].try_into().unwrap(), samples, down, slot, guard: Vec::new(), falls: Vec::new() });
             }
             while !r.0.is_empty() {
                 let (k, n) = (r.u32()? as usize, r.u32()? as usize);
+                if k >> 31 == 1 {
+                    let raw = r.take(n.checked_mul(16).ok_or("the bake is cut short")?)?;
+                    let herd = herds.get_mut(k & 0x7fff_ffff).ok_or("the bake has falls for no crowd")?;
+                    herd.falls = raw.chunks_exact(16).map(|c| std::array::from_fn(|i| u32::from_le_bytes(c[i * 4..i * 4 + 4].try_into().unwrap()))).collect();
+                    continue;
+                }
                 let raw = r.take(n.checked_mul(4).ok_or("the bake is cut short")?)?;
                 let herd = herds.get_mut(k).ok_or("the bake has a guard for no crowd")?;
                 herd.guard = raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
@@ -1554,6 +1595,9 @@ pub struct RagdollInput {
     pub feet: Option<Vec<usize>>,
     pub hands: Option<Vec<(usize, bool)>>,
     pub head: Option<usize>,
+    /// A crowd's that gets up: its bones are at full strength, and while
+    /// it is not rising its motors pull this hard (0..1).
+    pub hold: Option<f64>,
 }
 
 /// A crowd's agent: where it starts and goes, and its skeleton.
@@ -1597,6 +1641,10 @@ pub struct CrowdInput {
     /// Seconds ahead an agent raises its guard at what is coming (None:
     /// it has no guard).
     pub guard: Option<f64>,
+    /// With a guard and ragdolls: per bone of the pool's ragdolls, its
+    /// place in the agent's frame in the guard's pose, and whether the
+    /// pose takes it (one knocked down with its guard up falls from it).
+    pub guard_pose: Vec<(Pose, bool)>,
 }
 
 /// Everything a bake is made from: the document's simulation resolved to
@@ -1832,6 +1880,10 @@ impl SimInput {
                 h.opt(r.hands.as_ref().map(|f| f.iter().flat_map(|&(b, left)| [b as f64, left as u8 as f64]).collect::<Vec<_>>()).as_deref());
                 h.u64(r.head.map(|b| b as u64 + 1).unwrap_or(0));
             }
+            if let Some(hold) = r.hold {
+                h.str("hold");
+                h.f(hold);
+            }
         }
         h.u64(self.crowds.len() as u64);
         for c in &self.crowds {
@@ -1842,6 +1894,13 @@ impl SimInput {
             if let Some(ahead) = c.guard {
                 h.str("guard");
                 h.f(ahead);
+            }
+            if !c.guard_pose.is_empty() {
+                h.str("guard pose");
+                for (p, takes) in &c.guard_pose {
+                    h.pose(p);
+                    h.u64(*takes as u64);
+                }
             }
             h.u64(c.instanced as u64);
             h.u64(c.pool.len() as u64);
@@ -1959,7 +2018,7 @@ mod tests {
         // two agents, three samples; the second turns the short way
         // round through ±π, and its clip wraps without running back.
         let (pi, y) = (std::f32::consts::PI, 800.0);
-        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0], guard: Vec::new() };
+        let herd = HerdTrack { id: "walkers".into(), count: 2, rest: Mat4::scale(3.0, 3.0, 3.0), y, q: [0.0, 0.0, 0.0, 1.0], falls: Vec::new(), samples: vec![[0.0, 0.0, 0.0, 0.2], [5.0, 5.0, pi - 0.1, 0.9], [10.0, 0.0, 0.0, 0.3], [5.0, 9.0, 0.1 - pi, 0.1], [20.0, 0.0, 0.0, 0.4], [5.0, 13.0, 0.1 - pi, 0.2]], down: vec![u32::MAX, 2], slot: vec![u32::MAX, 0], guard: Vec::new() };
         let with = Bake { herds: vec![herd], ..bake.clone() };
         let bytes = with.to_bytes();
         assert_eq!(Bake::from_bytes(&bytes).unwrap(), with);

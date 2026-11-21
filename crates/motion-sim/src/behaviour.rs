@@ -154,8 +154,9 @@ pub struct Brain {
     /// The height of its weight over its feet, and the way its trunk
     /// pointed, when it was let go (px; the scene's axes).
     stand: Option<(f64, V)>,
-    /// When it fell, if it has.
+    /// When it fell, if it has; and whether it has got up since.
     pub fallen: Option<f64>,
+    pub risen: bool,
     down_since: Option<f64>,
     /// How it stood when let go; since when it has lain still; its rise.
     stood: Option<Stood>,
@@ -250,7 +251,7 @@ impl Brain {
         let mut rng = crate::world::Rng(input.seed ^ (which + 1).wrapping_mul(0x8cb92ba72f3d8dd7) ^ 0x7175_6972_6b);
         let v = input.vary.clamp(0.0, 1.0);
         let quirk = Quirk { late: v * (rng.signed() + 1.0) / 12.0, stride: 1.0 + v * 0.25 * rng.signed(), ready: 1.0 + v * 0.25 * rng.signed(), gain: 1.0 + v * 0.15 * rng.signed() };
-        Brain { quirk, caps, feet, swivel: vec![0.0; arms.len()], sent: vec![None; arms.len()], arms, head: r.head.or_else(|| (0..r.bones.len()).find(|&b| has(b, "head"))), stand: None, fallen: None, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
+        Brain { quirk, caps, feet, swivel: vec![0.0; arms.len()], sent: vec![None; arms.len()], arms, head: r.head.or_else(|| (0..r.bones.len()).find(|&b| has(b, "head"))), stand: None, fallen: None, risen: false, down_since: None, stood: None, still_since: None, rising: None, step: None, step_ready: 0.0, hit: None, seen: 0, aimed: vec![None; r.bones.len()], taken: vec![None; r.behaviours.len()], events: Vec::new() }
     }
 
     /// A bone's joint targets that point arm `arm` at `target` (px): the
@@ -644,6 +645,7 @@ impl Brain {
                             // Up: what share of its weight the force carried.
                             self.events.push(SimEvent { t: (t * 1000.0).round() / 1000.0, kind: "rise".into(), a: r.id.clone(), b: String::new(), speed: (share * 100.0).round() });
                             (self.fallen, self.down_since, self.rising, self.still_since) = (None, None, None, None);
+                            self.risen = true;
                         } else if f >= 1.6 {
                             // Not up: it lies again, and tries again.
                             (self.rising, self.still_since) = (None, None);
@@ -873,6 +875,11 @@ impl Brain {
                 (None, None) => {}
             }
         }
+        // (A crowd's that gets up: as soft as its crowd has its fallen,
+        // but while it rises.)
+        if let (Some(hold), None) = (r.hold, &self.rising) {
+            drive.scale.iter_mut().for_each(|s| *s *= hold);
+        }
         drive
     }
 }
@@ -914,6 +921,11 @@ impl Brain {
         if let Some(sent) = self.sent.get_mut(arm) {
             *sent = Some((to, until));
         }
+    }
+
+    /// Whether it is getting up now.
+    pub fn rising(&self) -> bool {
+        self.rising.is_some()
     }
 
     /// Whether a step may begin at `t` (none is under way, and the last

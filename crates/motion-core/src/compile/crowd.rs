@@ -39,6 +39,9 @@ impl Compiled {
                 self.herd_input(i, n, c, character, clip.unwrap_or(sim.start), &flat, &worlds_at, input, errors);
                 continue;
             }
+            if c.ragdoll.as_ref().is_some_and(|r| r.get_up.is_some()) {
+                errors.push(format!("{what}.ragdoll.get_up: only a crowd of instances (\"character\") has its fallen get up: an agent that is a layer is its bones' own tracks from its fall on, and they are not given back"));
+            }
             if c.guard.is_some() {
                 errors.push(format!("{what}.guard: only a crowd of instances (\"character\") has a guard: its agents share the character's poses, which is what a second pose is blended with"));
             }
@@ -92,7 +95,7 @@ impl Compiled {
                 };
                 agents.push(AgentInput { id: a.clone(), start: pose, rest, goal: c.goals[k % c.goals.len()], ragdoll, local });
             }
-            input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: false, pool: Vec::new(), local: Vec::new(), speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0), guard: None });
+            input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: false, pool: Vec::new(), local: Vec::new(), speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0), guard: None, guard_pose: Vec::new() });
         }
     }
 
@@ -175,6 +178,23 @@ impl Compiled {
                 }
             }
         }
+        // The guard's pose, bone by bone, for one knocked down in it.
+        let mut guard_pose: Vec<(Pose, bool)> = Vec::new();
+        if let (Some(at), Some(g), false) = (scene.sim.crowd_guards.get(n).copied().flatten(), &c.guard, bones.is_empty()) {
+            let f = worlds_at(at, &wanted);
+            let root = decompose(f[character]).0.inverse();
+            let parents = &input.ragdolls[pool[0]].bones;
+            for (b, id) in bones.iter().enumerate() {
+                // (It takes a bone it names, and all that hang from one.)
+                let mut cur = Some(b);
+                let mut takes = g.bones.is_empty();
+                while let (Some(x), false) = (cur, takes) {
+                    takes = g.bones.iter().any(|n| n == &bones[x]);
+                    cur = parents[x].parent;
+                }
+                guard_pose.push((root.then(&decompose(f[id.as_str()]).0), takes));
+            }
+        }
         let agents = starts
             .iter()
             .enumerate()
@@ -190,7 +210,7 @@ impl Compiled {
                 local: Vec::new(),
             })
             .collect();
-        input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: true, pool, local, speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0), guard: c.guard.as_ref().map(|g| g.ahead.max(0.0)) });
+        input.crowds.push(CrowdInput { id: c.id.clone(), agents, instanced: true, pool, local, speed: c.speed, vary: c.vary.clamp(0.0, 0.9), radius: c.radius, height: c.height.unwrap_or(c.radius * 6.0), stride: c.stride, cycle: c.cycle, clip_at, facing: c.facing, knock: c.knock, plan: c.plan, dodge: c.dodge.max(0.0), guard: c.guard.as_ref().map(|g| g.ahead.max(0.0)), guard_pose });
     }
 }
 
@@ -516,7 +536,7 @@ pub(super) fn emit_agents(l: &CLayer, h: &CHerd, t: f64, step: Option<Step>, spa
         by_rank.min(by_depth)
     };
     for (rank, &(depth, k, world, phase, turned)) in agents.iter().enumerate() {
-        let fallen = (x >= herd.down[k] as f64 && herd.slot[k] != u32::MAX).then(|| h.slots.get(herd.slot[k] as usize)).flatten();
+        let fallen = herd.fallen(k, x).and_then(|fall| h.slots.get(fall as usize));
         let solid = if fallen.is_some() { 1.0 } else { shown(rank, depth) };
         if solid < 1.0 {
             // A picture of it: the character seen from where the camera

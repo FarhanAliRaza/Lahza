@@ -10,7 +10,11 @@ it. A ball is thrown through them at 2 s: they step out of its line
 (DODGE=0: they do not look, and whoever it strikes goes down as a
 ragdoll of the pool). WALL=1 stands a wall across their way. GUARD=1
 gives the character a second pose, arms up before its face, keyed at
-7.5 s, which an agent takes while the ball is coming at it. Bakes,
+7.5 s, which an agent takes while the ball is coming at it (one struck
+with it up falls from it). UP=1: those knocked down get up again and
+walk on; POOL=n ragdolls in the pool (12), one that has got up or lain
+still a second falling again for the next. LEN, and AT=t,t,… for the
+sheet's frames. Bakes,
 checks (CHECK=1), writes a contact sheet,
 and times the bake and (TIME=1) a second of export on the CPU renderer.
 """
@@ -30,7 +34,7 @@ BIN = sys.argv[3] if len(sys.argv) > 3 else os.path.join(HERE, "../../target/rel
 PROJECT = os.path.join(OUT, "herd.lahza")
 BACKEND = "--gpu" if os.environ.get("GPU") else "--cpu"
 FULL = int(os.environ.get("FULL", "150"))
-W, H, UNIT, FLOOR, LEN = 1280, 720, 90, 560, 8.0
+W, H, UNIT, FLOOR, LEN = 1280, 720, 90, 560, float(os.environ.get("LEN", "8.0"))
 
 
 def run(*args):
@@ -90,6 +94,10 @@ if os.environ.get("WALL"):
          "body": {"type": "fixed"}})
 if os.environ.get("DODGE"):
     crowd["dodge"] = float(os.environ["DODGE"])
+if os.environ.get("UP"):
+    crowd["ragdoll"]["get_up"] = {}
+if os.environ.get("POOL"):
+    crowd["ragdoll"]["max"] = int(os.environ["POOL"])
 apply([{"op": "add_scene", "scene": scene}])
 # One character, where the field's corner is: its level, turn and scale are every agent's.
 run("motion", "model-import", PROJECT, model, "--scene", "s1", "--id", "figure", "--unit", str(UNIT), "--position", f"{W / 2},{FLOOR}", "--z", "0")
@@ -104,13 +112,14 @@ if os.environ.get("GUARD"):
 began = time.time()
 baked = json.loads(run("motion", "bake", PROJECT))["scenes"][0]
 knocked = [e["a"] for e in baked["events"] if e["kind"] == "knock"]
-print(f"baked {N} agents: {baked['bodies']} bodies, {baked['steps']} steps in {baked['seconds']} s ({time.time() - began:.1f} s with the file), {baked['bytes']} bytes, {baked['tracks']} tracks; knocked down: {knocked}")
+risen = [f"{e['a']} {e['t']:.1f} s" for e in baked["events"] if e["kind"] == "up"]
+print(f"baked {N} agents: {baked['bodies']} bodies, {baked['steps']} steps in {baked['seconds']} s ({time.time() - began:.1f} s with the file), {baked['bytes']} bytes, {baked['tracks']} tracks; knocked down: {knocked}; up again: {risen}")
 if os.environ.get("CHECK"):
     began = time.time()
     print(run("motion", "check", PROJECT, BACKEND).strip(), f"({time.time() - began:.1f} s)")
 sheet = os.path.join(OUT, "herd.png")
 began = time.time()
-run("motion", "snapshot", PROJECT, BACKEND, "--sheet", "--at", "0.5,2.2,2.6,3.2,5.0,7.5", "-o", sheet)
+run("motion", "snapshot", PROJECT, BACKEND, "--sheet", "--at", os.environ.get("AT", "0.5,2.2,2.6,3.2,5.0,7.5"), "-o", sheet)
 print(f"wrote {sheet} (6 frames in {time.time() - began:.1f} s)")
 if os.environ.get("TIME"):
     out = os.path.join(OUT, "second.mp4")
