@@ -147,11 +147,12 @@ impl Search {
         let l = now.heading;
         let may_step = l > 0.05 * stand.height && take.brains[rig].can_step(t);
         let foot_at = |f: usize| crate::behaviour::bone_origin(&take.world, r, f);
-        // What stands in reach of a hand on the side it is falling to:
+        // What stands in reach of a hand on the side it is falling to
+        // (once its weight is headed a tenth of its height off its feet):
         // per arm, the nearest point of a fixed body that is no floor (it
         // is a quarter of its height or more above its feet).
         let mut holds: Vec<Hold> = Vec::new();
-        if self.reach && l > 0.05 * stand.height {
+        if self.reach && l > 0.1 * stand.height {
             use rapier3d::prelude::*;
             let u = take.world.unit;
             let up = input.gravity.map(|g| -g / (input.gravity.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9)));

@@ -98,6 +98,96 @@ fn pushed(speed: f64, controller: Value, behaviours: Value, seconds: f64) -> (Ba
     bake_with(&input, &mut core_meshes, &fixture).unwrap()
 }
 
+/// `pushed`, with a wall standing `gap` px past its right shoulder.
+fn pushed_at_a_wall(speed: f64, controller: Value, gap: f64, seconds: f64) -> (Bake, Stats) {
+    let doll = json!({"strength": 1, "controller": controller,
+        "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+        "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}, {"bone": "upper", "swing": 150, "twist": 90}, {"bone": "fore", "swing": 140, "hinge": [1, 0, 0]}],
+        "hits": [{"at": 0.5, "bone": "chest", "velocity": [speed, 0, 0]}]});
+    let mut p = figure_scene(json!({}), doll, json!({"ground": {"y": 809.5, "friction": 0.9}}), seconds);
+    p.scenes[0].layers.push(serde_json::from_value(json!({"id": "wall", "kind": "mesh", "mesh": {"type": "box", "size": [100, 700], "depth": 600}, "transform": {"position": [1010.0 + gap + 50.0, 460]}, "body": {"type": "fixed", "friction": 0.9}})).unwrap());
+    let (input, errors) = Compiled::new(&p).sim_input(0, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    bake_with(&input, &mut core_meshes, &fixture).unwrap()
+}
+
+#[test]
+fn a_step_swung_by_its_own_leg_holds_less_than_a_foot_carried() {
+    // `swing`: a plan's step is the leg's own. Its thigh and shin are
+    // aimed so the ankle follows the step's arc; no force is on the foot.
+    // It stands a 600 px/s shove, stepping; at 700 it falls, where the
+    // carried foot of the default holds 1400 (the foot, still under its
+    // share of the weight, rises 14 px and goes 7 px in a third of a
+    // second: nothing takes the weight off it first).
+    let (swung, _) = pushed(600.0, json!({"type": "search", "swing": true}), json!([]), 4.0);
+    let strides = swung.events.iter().filter(|e| e.kind == "step").count();
+    assert!(drop(&swung) < 10.0 && strides >= 1, "its hips came down {:.0} px, {strides} steps", drop(&swung));
+    let (lost, _) = pushed(700.0, json!({"type": "search", "swing": true}), json!([]), 4.0);
+    let (carried, _) = pushed(700.0, json!({"type": "search"}), json!([]), 4.0);
+    assert!(drop(&lost) > 150.0 && drop(&carried) < 10.0, "swung {:.0} px, carried {:.0} px", drop(&lost), drop(&carried));
+    assert_eq!(crate::behaviour_tests::pin(&swung), (56948, 6899699882014676470), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+}
+
+#[test]
+fn a_hand_goes_to_a_wall_it_is_shoved_at() {
+    // A wall 120 px past its right shoulder, a shove at it. With `reach`
+    // a plan may send a hand to what stands within an arm's reach on the
+    // side it is falling to. Shoved at 700 px/s the hand is on the wall
+    // a quarter second sooner and its head never is, where without its
+    // head meets the wall. At 1400 px/s the hand is sent as soon (0.03 s
+    // after the shove) and is there half a second sooner, but the head
+    // is there first all the same: an arm takes a fifth of a second.
+    for speed in [700.0, 1400.0] {
+        let touched = |bake: &Bake, part: &str| bake.events.iter().find(|e| e.kind == "touch" && [e.a.as_str(), e.b.as_str()].contains(&"wall") && (e.a.starts_with(part) || e.b.starts_with(part))).map(|e| e.t);
+        let (plain, _) = pushed_at_a_wall(speed, json!({"type": "search"}), 120.0, 4.0);
+        assert!(touched(&plain, "head").is_some() && !plain.events.iter().any(|e| e.kind == "reach"), "{speed}: without, its head never met the wall");
+        let (bake, _) = pushed_at_a_wall(speed, json!({"type": "search", "reach": true}), 120.0, 4.0);
+        let sent: Vec<(f64, &str, &str)> = bake.events.iter().filter(|e| e.kind == "reach").map(|e| (e.t, e.a.as_str(), e.b.as_str())).collect();
+        eprintln!("{speed}: sent {sent:?}; hand on the wall at {:?}, head {:?} (without: hand {:?}, head {:?})", touched(&bake, "hand"), touched(&bake, "head"), touched(&plain, "hand"), touched(&plain, "head"));
+        // (Sent once it is shoved, not before: standing, nothing is reached for.)
+        assert!(!sent.is_empty() && sent[0].0 >= 0.5 && sent[0].0 < 0.75 && sent[0].1 == "hand_r" && sent[0].2 == "wall", "{speed}: {sent:?}");
+        let hand = touched(&bake, "hand").expect("the hand never met the wall");
+        assert!(hand < sent[0].0 + 0.3 && hand < touched(&plain, "hand").unwrap() - 0.2, "{speed}: hand at {hand}");
+        assert_eq!(touched(&bake, "head").is_none(), speed == 700.0, "{speed}: head at {:?}", touched(&bake, "head"));
+        assert!(drop(&bake) < 10.0 && drop(&plain) < 10.0);
+        if speed == 700.0 {
+            assert_eq!(crate::behaviour_tests::pin(&bake), (57024, 15177861413076167383), "the bake changed: if the simulator or the format did, bakes are stale and this number is the new one");
+        }
+    }
+}
+
+/// What agents that steer in a search's tries cost:
+/// `cargo test --release -p lahza-motion-sim measure_steering_in_tries -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn measure_steering_in_tries() {
+    for (count, area) in [(0, [0.0; 4]), (100, [400.0, -400.0, 1500.0, 400.0]), (1000, [-2000.0, -2000.0, 4000.0, 2000.0]), (5000, [-6000.0, -6000.0, 8000.0, 6000.0])] {
+        for straight in [false, true] {
+            let doll = json!({"strength": 1, "controller": {"type": "search"},
+                "shapes": [{"bone": "foot", "shape": {"type": "box", "size": [44, 24, 130], "offset": [0, 12, -20]}}],
+                "limits": [{"bone": "shin", "swing": 130, "hinge": [-1, 0, 0]}, {"bone": "thigh", "swing": 70}],
+                "hits": [{"at": 0.5, "bone": "chest", "velocity": [700, 0, 0]}]});
+            let mut sim = json!({"ground": {"y": 809.5, "friction": 0.9}});
+            if count > 0 {
+                sim["crowds"] = json!([{"id": "walkers", "character": "a0", "count": count, "area": area, "march": [0, 600], "radius": 30, "speed": 160, "stride": 140, "cycle": 1.0}]);
+            }
+            let mut p = figure_scene(json!({}), doll, sim, 4.0);
+            p.scenes[0].layers.push(serde_json::from_value(crate::crowd_tests::agent(0, 300.0, 0.0)).unwrap());
+            let (input, errors) = Compiled::new(&p).sim_input(0, None);
+            assert!(errors.is_empty(), "{errors:?}");
+            if straight {
+                std::env::set_var("LAHZA_SIM_TRY_STRAIGHT", "1");
+            }
+            let (bake, stats) = bake_with(&input, &mut core_meshes, &fixture).unwrap();
+            std::env::remove_var("LAHZA_SIM_TRY_STRAIGHT");
+            println!("{count:4} agents, in a try {}: bake {:.1} s, {:.1} s of it in tries ({} steps tried on {} threads); hips drop {:.0} px", if straight { "carried straight on" } else { "steering" }, stats.seconds, stats.search_seconds, stats.tried_steps, stats.search_threads, drop(&bake));
+            if count == 0 {
+                break;
+            }
+        }
+    }
+}
+
 fn drop(bake: &Bake) -> f64 {
     let n = bake.tracks[0].samples.len();
     pose(bake, "hips", n - 1).p[1] - pose(bake, "hips", 0).p[1]

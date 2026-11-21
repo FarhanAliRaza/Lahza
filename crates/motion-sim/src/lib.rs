@@ -194,7 +194,9 @@ pub fn bake_watched(input: &SimInput, meshes: Meshes, files: Files, watch: Watch
             Some(Mind::Search(s)) if take.world.released[input.ragdolls[rig].bones[0].body] => Some((rig, s.horizon)),
             _ => None,
         }).collect();
-        take.crowd = (!herd.is_empty() && !searching.is_empty()).then(|| {
+        // (`LAHZA_SIM_TRY_STRAIGHT`: they are carried straight on instead,
+        // to measure what the steering costs.)
+        take.crowd = (!herd.is_empty() && !searching.is_empty() && std::env::var_os("LAHZA_SIM_TRY_STRAIGHT").is_none()).then(|| {
             let near: Vec<[f64; 2]> = searching.iter().map(|(rig, _)| take.world.pose(input.ragdolls[*rig].bones[0].body).p).map(|p| [p[0], p[2]]).collect();
             herd.fork(input, Some(&near), searching.iter().map(|s| s.1).fold(0.0, f64::max))
         });
