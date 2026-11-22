@@ -3772,6 +3772,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lahza-motion-track"
+version = "0.1.0"
+
+[[package]]
 name = "lahza-native"
 version = "0.1.0"
 dependencies = [

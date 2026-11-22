@@ -1,0 +1,8 @@
+[package]
+name = "lahza-motion-track"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Motion engine tracking: a flat region of footage followed frame by frame, and the camera it implies"
+
+[dependencies]
