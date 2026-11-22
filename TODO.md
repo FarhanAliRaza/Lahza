@@ -2376,14 +2376,36 @@ is still.
    from the prompt bar ("put the mug on the table"), a bar while it
    runs.
 3. **Mattes for what passes in front** (a hand over the table) and for
-   the person: a prompted model through `ort`, EdgeTAM or SAM 2 for a
-   click, SAM 3.1 when the agent names the thing. Baked as a matte pass
-   beside the footage; also what would let a blank surface under a
-   moving camera, or things moving on a surface under a moving camera,
-   be followed (the matte kept out of the fit). The webcam's person
-   model (PPHumanSeg, bundled) is a first thing to try for people. Run
-   on every Nth frame and carried between by the tracked motion, if
-   that holds up when measured.
+   the person: a prompted model through `ort`. This is what stops a
+   placed thing being drawn over what should cover it, and what
+   lighting a person starts from. Two ways without a new model were
+   tried on the real clips and neither is kept:
+   - *No model*: the surface laid flat in every frame, its own look
+     taken as each point's middle value over forty frames, and a frame's
+     difference from that called "in front" (a shadow told apart as the
+     same colour dimmer, texture that still shows as surface). It found
+     the apple and the cups, with holes; it left bands where a thing
+     had stood for much of the shot (they are in the plate); it missed
+     skin against a pink wall; and it ends at the marked region's edge,
+     while what stands on a table rises past it. 4 to 13 s a clip. Not
+     good enough to composite with, so it was taken out again.
+   - *The webcam's person model* (PPHumanSeg, bundled, Apache-2.0,
+     192 × 192, about 25 ms a frame on a cloud CPU): on the same clips
+     it found one child of two, called red cups held in the hand a
+     person, and left patches on the wall and the table. Fit for a
+     webcam, not for footage.
+   So this needs a real segmentation model. Read from the
+   repositories themselves: **EdgeTAM** is Apache-2.0, code and
+   weights, and its 56 MB checkpoint is in its git repository (the one
+   to take first: a click or a box, then followed, made for small
+   machines); **SAM 2** is Apache-2.0, code and weights; SAM 3 and 3.1
+   are under Meta's own SAM License. The work: export to ONNX, the
+   memory loop in Rust through `ort`, a matte pass written beside the
+   footage, the two layers that use it (the footage again, shown only
+   inside the matte, laid over what was placed). Run on every Nth
+   frame and carried between by the tracked motion, if that holds up
+   when measured. The matte would also let a blank surface under a
+   moving camera be followed (kept out of the fit).
 4. **A depth and a normal pass** for a clip: Video Depth Anything
    Small, normals from the depth's slope, baked at half size. Depth
    Pro on one frame for the table's real distance and size (and the
@@ -2416,14 +2438,23 @@ here; other hosts are closed to this environment.
 
 ### For the owner to decide
 
-- Licences before any model is bundled or fetched. Video Depth
-  Anything: Apache-2.0 for Small only (Base and Large are
-  non-commercial). SAM 2 and EdgeTAM: to confirm. SAM 3, 3.1 and SAM
-  3D: Meta's own "SAM License" (reported royalty-free, commercial use
-  allowed, terms Meta may change, a gated download). MapAnything:
-  Apache-2.0 by its paper, to confirm in its repository. Depth Pro: its
-  model cards name two different Apple licences. VGGT, CoTracker3: not
-  checked.
+- Licences before any model is bundled or fetched. Read from each
+  repository's own LICENSE and README (November 2026):
+  - EdgeTAM: Apache-2.0, code and checkpoints.
+  - SAM 2: Apache-2.0, code and checkpoints.
+  - Video Depth Anything: Small is Apache-2.0; Base and Large are
+    CC-BY-NC-4.0.
+  - MapAnything: code Apache-2.0; two models, `facebook/map-anything`
+    (CC-BY-NC-4.0) and `facebook/map-anything-apache` (Apache-2.0).
+  - VGGT: its own "VGGT License", commercial use allowed (not
+    military) with the VGGT-1B-Commercial checkpoint only.
+  - SAM 3, 3.1: Meta's "SAM License" (their own terms; reported
+    royalty-free with commercial use allowed; a gated download).
+  - Depth Pro: Apple's own licence for code and weights (use, change
+    and redistribute allowed, the notice kept, no use of Apple's
+    name); to be read in full before it is relied on.
+  - CoTracker3: CC-BY-NC. Not usable in a product.
+  Not read: SAM 3D, TAPNext, Depth Anything V2.
 - Whether models are bundled (the matting model is, 6 MB) or fetched on
   first use (as the speech models are).
 
