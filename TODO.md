@@ -135,6 +135,12 @@ in), since none of it can be seen from a container:
 9. NVIDIA's licence for the Ray Reconstruction shim: to read and decide
    (packaging/ngx/README.md).
 
+Started since (its own section, "Tracking footage"): following a plane
+in a video with no model, the scene camera from it, so a 3D thing
+stands on a table that is in the footage; then mattes, a depth and a
+normal pass, and lighting footage with the scene's lights, which need
+models and the owner's word on their licences.
+
 Not done, and why:
 - A trained policy for ragdolls: a GPU simulator, motion capture and
   days of training. Its interface and the no-training search are there.
@@ -2238,6 +2244,109 @@ with a mouse on a real desktop.
   a desktop: the file chooser itself (a portal dialog: `add_motion_lut`
   behind it was run with a path). The picker was dragged by the X
   server's pointer under Xvfb (xdotool), not by a hand.
+
+## Tracking footage: things placed in a video, and footage lit
+
+Asked for: put something on a table that is in a video; light a person
+who is in a video. Both need to know, frame by frame, where a thing in
+the footage is. What the engine had before this section: `track` (a
+colour blob, or a box matched frame to frame, translation only: made to
+measure a reference, not to hold a layer on footage), `fit_camera` (the
+scene camera for known 3D points in one frame), the plane's homography
+(`space.rs`), a shadow catcher, person matting for the webcam
+(PPHumanSeg through ONNX Runtime), footage decoded in order.
+
+### How others do it (looked up, November 2026)
+
+- After Effects' 3D Camera Tracker and Blender: hundreds of points
+  followed, then the whole camera solved; three points picked make a
+  plane, with a solid, a null and a shadow catcher on it. The whole
+  shot is analysed and solved, and bad points are cleaned by hand.
+- Mocha: a flat region followed as one plane, out as a corner pin; the
+  camera solved from planes. Cheaper and steadier than points.
+- Resolve's Relight and Beeble's SwitchLight: a model gives normals and
+  depth per frame (Beeble: albedo, roughness and specular too), and
+  ordinary lights shade them.
+- Models. Points: TAPNext (per frame), CoTracker3 (windows). Masks:
+  SAM 2 and the small EdgeTAM (a click, then followed); SAM 3 and 3.1
+  (Meta, November 2025 and March 2026: a text prompt, "the table").
+  Depth: Video Depth Anything (steady over time), Apple's Depth Pro
+  (one image, metric, 0.3 s for 2.25 MP on a GPU by its paper). Camera
+  and depth from a set of frames: MapAnything, VGGT, ViPE (3 to 5
+  frames a second on an RTX 5090 by its own paper), MegaSaM (slower).
+  One image to geometry: SAM 3D Objects and SAM 3D Body (Meta,
+  November 2025), Apple's SHARP (a still to 3D Gaussians).
+- Not looked at: the "Vork" motion engine the owner named. Nothing was
+  found under that spelling; it needs its exact name or a link.
+- Not worth it: the codec's motion vectors. ffmpeg gives them only
+  after a full decode, so they save nothing, and they are noisy.
+
+### The plan: the cheapest thing that answers the request
+
+1. **A plane track, with no model** (started; the first piece). A flat
+   region marked in one frame (four corners) is followed as one plane
+   by aligning the picture itself (all of the region's gradients, as
+   Mocha does, so a table with little on it still holds), coarse to
+   fine, against the marked frame so it does not drift. Out: the four
+   corners per frame, and how sure. A new crate with no GPU and no
+   model, at about 640 px wide.
+2. **The camera from the plane.** For "put it on the table" the whole
+   camera solve is not needed: the plane's corners per frame give the
+   camera against the table, with the focal length from the marked
+   rectangle itself. The scene camera gets keys (it has every freedom
+   needed: orbit, roll, dolly, position, field of view; `fit_camera`
+   gains roll), the footage stays in screen space, and whatever is 3D
+   in the scene stands on the plane, with a shadow catcher under it.
+3. **The tool and the words for the agent**: `track_plane` (video,
+   corners, the frame they were marked on, the range; `scene` for the
+   camera's keys as `edit_apply` ops), in the tool list, the docs and
+   the editor agent's instructions.
+4. **In the editor**: click a surface in the preview to mark it, see
+   the track over the footage, track from the prompt bar ("put the mug
+   on the table"), a bar while it runs.
+5. **Mattes for what passes in front** (a hand over the table) and for
+   the person: a prompted model through `ort`, EdgeTAM or SAM 2 for a
+   click, SAM 3.1 when the agent names the thing. Baked as a matte pass
+   beside the footage. Run on every Nth frame and carried between by
+   the tracked motion, if that holds up when measured.
+6. **A depth and a normal pass** for a clip: Video Depth Anything
+   Small, normals from the depth's slope, baked at half size. Depth
+   Pro on one frame for the table's real distance and size (and the
+   focal length, if its estimate is what is recalled).
+7. **A `relight` effect on a video layer**: the scene's own lights
+   shade the footage through the normal pass, inside the matte.
+8. **A subject's track**: where the person is per frame (from the
+   matte), as keys a light or a label follows.
+9. **A whole camera solve**, for a moving shot where things must hold
+   anywhere and not on one surface: point tracks and bundle adjustment
+   with the people masked out, or MapAnything on a few frames with the
+   tracks carrying the frames between.
+10. **Geometry from one frame**: SAM 3D Body for the person (better
+    normals, real shadows), SAM 3D Objects for the table. Both work a
+    frame at a time, so they jitter unless held to the tracks; no speed
+    was found for either. To try once 5 to 7 are there.
+11. **Tracks kept as a bake** (`track/<clip>…`, read as animated
+    values) in place of a key per frame, if keys prove heavy in a long
+    clip.
+
+What makes it fast: no camera solve where a plane is enough; one
+decode at a small size for every target; nothing tracked while the
+editor draws (a track is keys, or a bake); models on a few frames.
+None of this has a measured number yet: each item is to give its own,
+and to say whose machine it was.
+
+### For the owner to decide
+
+- Licences before any model is bundled or fetched. Video Depth
+  Anything: Apache-2.0 for Small only (Base and Large are
+  non-commercial). SAM 2 and EdgeTAM: to confirm. SAM 3, 3.1 and SAM
+  3D: Meta's own "SAM License" (reported royalty-free, commercial use
+  allowed, terms Meta may change, a gated download). MapAnything:
+  Apache-2.0 by its paper, to confirm in its repository. Depth Pro: its
+  model cards name two different Apple licences. VGGT, CoTracker3: not
+  checked.
+- Whether models are bundled (the matting model is, 6 MB) or fetched on
+  first use (as the speech models are).
 
 ## Slang
 
