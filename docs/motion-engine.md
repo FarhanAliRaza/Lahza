@@ -196,6 +196,10 @@ lahza motion track-plane shot.mp4 --corners 412,300,905,318,960,560,380,540 --at
     --project comp.lahza --scene s1 --apply
 ```
 
+With a file, `corners` and the times are the video's own. Give `layer` (a video layer of the project) in place of `video` and they are what the editor shows: corners in canvas pixels, as a snapshot has them, and `at`, `from`, `to` in timeline seconds. The layer's own placement and timing are then used: footage drawn smaller or off centre gets the scene camera's lens shift, and footage that starts later gets its keys there.
+
+In the editor, Alt+click on the preview marks a point on the picture (up to four, numbered; Esc clears them; they belong to the frame they were put on). A request sent from the prompt bar carries them, so "put a mug on this surface" with four points going round the table is all there is to say.
+
 [`examples/track/table.py`](../examples/track/table.py) makes its own footage (a table under a moving camera), tracks it and stands a box, a ball and a cylinder on it. [`examples/track/verify.py`](../examples/track/verify.py) checks any track against its footage: it warps each frame's region back onto the marked one and measures what is left, with a search of its own.
 
 Measured, on a cloud container's CPU, decoding included:

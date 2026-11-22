@@ -1145,13 +1145,16 @@ fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
     assert!(video.exists(), "the shot was not rendered");
     // The table's corners in the scene, and where a frame shows them.
     let table = [[290.0, 140.0], [990.0, 140.0], [990.0, 580.0], [290.0, 580.0]];
+    // Where the scene puts them (measured from the canvas's corner), and
+    // the pixels of the video that show them (counted: half a pixel less).
     let seen = |t: f64| table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap());
+    let pixels = |q: [[f64; 2]; 4]| q.map(|p| [p[0] - 0.5, p[1] - 0.5]);
     let marked_at = 1.0;
     // Another project: the footage, and what is to stand on the table.
     tb.call("project_create", json!({"path": "comp", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
     tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
     let out = tb.call("track_plane", json!({
-        "video": video.display().to_string(), "corners": seen(marked_at), "at": marked_at, "detail": true,
+        "video": video.display().to_string(), "corners": pixels(seen(marked_at)), "at": marked_at, "detail": true,
         "camera": {"scene": "s1"}, "apply": true
     })).unwrap().json;
     let frames = out["track"].as_array().unwrap();
@@ -1159,7 +1162,7 @@ fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
     assert_eq!(frames.len(), (seconds * fps) as usize);
     let mut worst = 0.0f64;
     for f in frames {
-        let want = seen(f["t"].as_f64().unwrap());
+        let want = pixels(seen(f["t"].as_f64().unwrap()));
         for k in 0..4 {
             let got = [f["corners"][k][0].as_f64().unwrap(), f["corners"][k][1].as_f64().unwrap()];
             worst = worst.max(((got[0] - want[k][0]).powi(2) + (got[1] - want[k][1]).powi(2)).sqrt());
@@ -1213,7 +1216,7 @@ fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
     let on_table = [[340.0, 190.0], [930.0, 160.0], [960.0, 520.0], [420.0, 560.0]];
     let seen_points = |t: f64| on_table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap());
     let out = tb.call("track_plane", json!({
-        "video": video.display().to_string(), "corners": seen_points(marked_at), "at": marked_at, "camera": {"scene": "s1"}, "apply": true
+        "video": video.display().to_string(), "corners": pixels(seen_points(marked_at)), "at": marked_at, "camera": {"scene": "s1"}, "apply": true
     })).unwrap().json;
     assert_eq!(out["found"], out["frames"]);
     assert_eq!(out["camera"]["plane"], "motion", "{}", out["camera"]);
@@ -1331,7 +1334,9 @@ fn a_shaky_noisy_shot_with_an_arm_over_the_table_is_followed() {
         return;
     }
     let table = [[290.0, 140.0], [990.0, 140.0], [990.0, 580.0], [290.0, 580.0]];
-    let seen = |t: f64| table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap());
+    // The pixels of the video that show the table's corners (counted:
+    // half a pixel less than the scene's own measure).
+    let seen = |t: f64| table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap()).map(|p| [p[0] - 0.5, p[1] - 0.5]);
     let marked_at = 0.2;
     tb.call("project_create", json!({"path": "comp", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
     tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
@@ -1402,5 +1407,86 @@ fn a_blank_table_under_a_still_camera_stays_where_it_was_marked() {
     // look is followed, and here that is the cups.
     let out = tb.call("track_plane", json!({"video": video, "corners": corners, "at": 1.0, "moving": true, "detail": true})).unwrap().json;
     assert_eq!(out["camera_still_frames"], 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// track_plane on a video layer: the footage sits smaller and off centre
+/// in the comp and starts half a second in. The corners are given as the
+/// canvas shows them, on the timeline second they were marked; the layer's
+/// own placement and timing put the camera's keys where they belong.
+#[test]
+fn a_plane_is_tracked_through_a_video_layer_as_the_canvas_shows_it() {
+    use lahza_motion_core::camfit::{project, CameraParams};
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("tracklayer");
+    let (w, h, seconds) = (1280.0, 720.0, 1.2);
+    tb.call("project_create", json!({"path": "shot", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    std::fs::create_dir_all(dir.join("shot.lahza/assets")).unwrap();
+    table_png(&dir.join("shot.lahza/assets/table.png"), 700, 440);
+    table_png(&dir.join("shot.lahza/assets/floor.png"), 2000, 1400);
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * (t / seconds);
+    let truth = |t: f64| CameraParams { fov: 45.0, orbit: [lerp(-10.0, 8.0, t), lerp(-54.0, -50.0, t)], dolly: lerp(0.0, 60.0, t), position: Some([lerp(610.0, 660.0, t), lerp(375.0, 355.0, t)]), shift: [0.0, 0.0], rotation: lerp(-2.0, 2.0, t) };
+    let key = |f: &dyn Fn(&CameraParams) -> serde_json::Value| json!({"keys": [{"at": 0, "v": f(&truth(0.0))}, {"at": seconds, "v": f(&truth(seconds))}]});
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "background": "#2a2f3a"},
+        {"op": "set", "target": "s1.camera", "value": {"fov": 45, "orbit": key(&|c| json!(c.orbit)), "dolly": key(&|c| json!(c.dolly)), "position": key(&|c| json!(c.position)), "rotation": key(&|c| json!(c.rotation))}},
+        {"op": "add", "id": "floor", "kind": "image", "src": "assets/floor.png", "three_d": true, "transform": {"position": [640, 360], "z": 260, "opacity": 0.55}},
+        {"op": "add", "id": "table", "kind": "image", "src": "assets/table.png", "three_d": true, "transform": {"position": [640, 360]}}
+    ]})).unwrap();
+    tb.call("render", json!({"output": "shot.mp4", "wait": true, "audio": false})).unwrap();
+    // The comp: the footage at three quarters of its size, off centre,
+    // from half a second in.
+    tb.call("project_create", json!({"path": "comp", "duration": 2, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    let (scale, corner, starts) = (0.75, [250.0, 130.0], 0.5);
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1"},
+        {"op": "add", "id": "footage", "kind": "video", "src": "../shot.mp4", "space": "screen", "mute": true, "size": [w * scale, h * scale],
+         "time": {"start": starts}, "transform": {"position": [corner[0] + w * scale / 2.0, corner[1] + h * scale / 2.0]}}
+    ]})).unwrap();
+    // Where the comp's canvas shows a point of the footage (both
+    // measured from their corners), and the snapshot's pixel there
+    // (counted: half a pixel less).
+    let on_canvas = |p: [f64; 2]| [p[0] * scale + corner[0], p[1] * scale + corner[1]];
+    let table = [[290.0, 140.0], [990.0, 140.0], [990.0, 580.0], [290.0, 580.0]];
+    let seen = |source: f64| table.map(|p| on_canvas(project(&truth(source), w, h, [p[0], p[1], 0.0]).unwrap()));
+    let playhead = 1.1;
+    let out = tb.call("track_plane", json!({"layer": "footage", "corners": seen(playhead - starts).map(|p| [p[0] - 0.5, p[1] - 0.5]), "at": playhead, "camera": {"scene": "s1"}, "apply": true})).unwrap().json;
+    assert_eq!(out["found"], out["frames"], "{}", out["lost"]);
+    assert_eq!(out["camera"]["plane"], "rectangle", "{}", out["camera"]);
+    assert!(out.get("footage").is_none(), "the layer is already placed");
+    let scene: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("comp.lahza/scenes/s1.json")).unwrap()).unwrap();
+    let cam = &scene["camera"];
+    let rect: Vec<[f64; 2]> = serde_json::from_value(out["camera"]["rect"].clone()).unwrap();
+    let keys = cam["orbit"]["keys"].as_array().unwrap();
+    assert!((keys[0]["at"].as_f64().unwrap() - starts).abs() < 1e-6, "the first key is where the footage starts on the timeline: {}", keys[0]);
+    let mut worst = 0.0f64;
+    for i in (0..keys.len()).step_by(6) {
+        let v = |name: &str| cam[name]["keys"][i]["v"].clone();
+        let t = keys[i]["at"].as_f64().unwrap();
+        let solved = CameraParams {
+            fov: cam["fov"].as_f64().unwrap(),
+            orbit: [v("orbit")[0].as_f64().unwrap(), v("orbit")[1].as_f64().unwrap()],
+            dolly: v("dolly").as_f64().unwrap(),
+            position: Some([v("position")[0].as_f64().unwrap(), v("position")[1].as_f64().unwrap()]),
+            // The footage's middle is not the canvas's: the lens is shifted.
+            shift: [cam["shift"][0].as_f64().unwrap(), cam["shift"][1].as_f64().unwrap()],
+            rotation: v("rotation").as_f64().unwrap(),
+        };
+        let want = seen(t - starts);
+        for k in 0..4 {
+            let got = project(&solved, w, h, [rect[k][0], rect[k][1], 0.0]).unwrap();
+            worst = worst.max(((got[0] - want[k][0]).powi(2) + (got[1] - want[k][1]).powi(2)).sqrt());
+        }
+    }
+    eprintln!("through the layer: the scene's rectangle within {worst:.2} px of the table as the comp shows it; lens {}", out["camera"]["fov"]);
+    assert!(worst < 0.8, "the scene's rectangle is up to {worst:.2} px from the table");
+    // The footage is drawn at three quarters, so its 45° lens is wider
+    // against the canvas; and it looks through the footage's middle.
+    let wider = (2.0 * ((22.5f64).to_radians().tan() / scale).atan()).to_degrees();
+    assert!((out["camera"]["fov"].as_f64().unwrap() - wider).abs() < 1.0, "lens {} for {wider:.1}", out["camera"]["fov"]);
+    assert!((cam["shift"][0].as_f64().unwrap() - (corner[0] + w * scale / 2.0 - w / 2.0)).abs() < 0.01 && (cam["shift"][1].as_f64().unwrap() - (corner[1] + h * scale / 2.0 - h / 2.0)).abs() < 0.01, "{}", cam["shift"]);
     let _ = std::fs::remove_dir_all(&dir);
 }

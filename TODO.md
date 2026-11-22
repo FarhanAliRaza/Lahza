@@ -2371,10 +2371,22 @@ is still.
    says nothing of the tilt, and the tool says so. Left: the lens from
    motion is rough (four points say little of it): a better one from
    the whole region's points, or from Depth Pro on one frame (item 4).
-2. **In the editor**: click a surface in the preview to mark it (snap
-   to a corner near the click), see the track over the footage, track
-   from the prompt bar ("put the mug on the table"), a bar while it
-   runs.
+2. **In the editor.** Done: Alt+click on the preview marks points on
+   the picture (up to four, numbered, on one frame; Esc clears), and a
+   request from the prompt bar carries them ("this surface"), with the
+   frame's second. `track_plane` takes `layer` (the footage's video
+   layer) in place of a file: corners as the canvas shows them,
+   timeline seconds, the layer's own placement and timing (footage
+   drawn smaller or off centre: the scene camera's lens shift, and its
+   lens is that much wider against the canvas; a test places it at
+   three quarters, off centre, half a second in: the scene's rectangle
+   within 0.11 px). A half-pixel slip between counted pixels and the
+   canvas's measure was found by that test and put right. Left: a mark
+   snapped to a corner near the click; the track drawn over the
+   footage (its corners, where it was lost); a bar while it runs; a
+   real request with marks sent to the agent on the desktop (it costs
+   money: not run here); a layer whose placement is keyed (the
+   placement at the marked frame is used for every frame).
 3. **Mattes for what passes in front** (a hand over the table) and for
    the person: a prompted model through `ort`. This is what stops a
    placed thing being drawn over what should cover it, and what
@@ -2424,9 +2436,7 @@ is still.
    was found for either. To try once 3 to 5 are there.
 9. **Tracks kept as a bake** (`track/<clip>…`, read as animated
    values) in place of a key per frame, if keys prove heavy in a long
-   clip. Also: the footage's own placement read from its layer (now
-   taken as fitted in the canvas, or given), a finer pass at the
-   source's size over the region, the corners smoothed over time if a
+   clip. Also: a finer pass at the source's size over the region, the corners smoothed over time if a
    placed thing is seen to shimmer.
 
 Not known yet, and for the owner's machine or footage: how it does on

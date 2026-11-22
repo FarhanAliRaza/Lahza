@@ -463,6 +463,9 @@ impl Studio {
             }
             let length = editor.project().settings.duration;
             about.span = self.motion_agent.span.map(|(a, b)| ((a - offset).clamp(0.0, length), (b - offset).clamp(0.0, length))).filter(|(a, b)| b > a);
+            let (marks, at) = editor.marks();
+            about.marks = marks.to_vec();
+            about.marks_at = at;
         } else {
             about.playhead = Some((self.video_position, 0));
             about.span = self.motion_agent.span;

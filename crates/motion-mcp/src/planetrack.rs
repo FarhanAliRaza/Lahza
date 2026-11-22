@@ -11,7 +11,7 @@ use lahza_motion_core::space;
 use lahza_motion_track::image::Gray;
 use lahza_motion_track::plane::{Options, PlaneTracker};
 use lahza_motion_track::still::{StillTest, STILL};
-use lahza_motion_track::{convex, rect, signed_area2, Quad};
+use lahza_motion_track::{convex, rect, signed_area2, Quad, H3};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -233,9 +233,17 @@ pub enum Corners {
     Points,
 }
 
-/// Solves the camera for a track. The footage is taken to be drawn at
-/// `scale` canvas pixels per source pixel with its corner at `offset`
-/// (as a screen-space layer). `size`: the marked shape's height in the
+/// Where footage drawn at `scale` canvas pixels per source pixel, with
+/// its corner at `offset`, puts a source pixel on the canvas. A track's
+/// corners count pixels (pixel 0's middle is at 0); the canvas is
+/// measured from its corner (that middle is at half a pixel), as the
+/// scene's own coordinates are.
+pub fn placed(scale: f64, offset: [f64; 2]) -> H3 {
+    H3([scale, 0.0, 0.5 * scale + offset[0], 0.0, scale, 0.5 * scale + offset[1], 0.0, 0.0, 1.0])
+}
+
+/// Solves the camera for a track. `place` puts a source pixel of the
+/// footage on the canvas (`placed`, or its layer's own placement). `size`: the marked shape's height in the
 /// scene (default: what makes the camera stand at its natural distance
 /// on the marked frame, dolly 0).
 ///
@@ -243,8 +251,8 @@ pub enum Corners {
 /// (one frame is enough), or, when they are not, from the camera's own
 /// motion (`tilt`), which needs the camera to have changed its place.
 #[allow(clippy::too_many_arguments)]
-pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov: Option<f64>, aspect: Option<f64>, size: Option<f64>, corners: Corners) -> Result<Solve, String> {
-    let rectangle = if corners == Corners::Points { None } else { Some(solve_as(track, canvas, scale, offset, fov, aspect, size, false, false)) };
+pub fn solve(track: &Track, canvas: (f64, f64), place: H3, fov: Option<f64>, aspect: Option<f64>, size: Option<f64>, corners: Corners) -> Result<Solve, String> {
+    let rectangle = if corners == Corners::Points { None } else { Some(solve_as(track, canvas, place, fov, aspect, size, false, false)) };
     // A real rectangle's corners leave next to nothing; four points that
     // are not one cannot be seen as one from every frame.
     let fits = |s: &Solve| s.cameras.iter().map(|c| c.2).sum::<f64>() / s.cameras.len().max(1) as f64;
@@ -256,7 +264,7 @@ pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fo
             // second try after a rectangle that does not fit, it only has
             // to fit much better (a lens given a little wrong leaves both
             // off, the rectangle far more).
-            let by_motion = solve_as(track, canvas, scale, offset, fov, aspect, size, true, corners == Corners::Auto);
+            let by_motion = solve_as(track, canvas, place, fov, aspect, size, true, corners == Corners::Auto);
             match (rectangle, by_motion) {
                 (Some(Ok(r)), Ok(m)) => Ok(if fits(&m) < fits(&r) * 0.5 { m } else { r }),
                 (_, Ok(m)) => Ok(m),
@@ -268,13 +276,18 @@ pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fo
 }
 
 #[allow(clippy::too_many_arguments)]
-fn solve_as(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov: Option<f64>, aspect: Option<f64>, size: Option<f64>, by_motion: bool, unsure_too: bool) -> Result<Solve, String> {
+fn solve_as(track: &Track, canvas: (f64, f64), place: H3, fov: Option<f64>, aspect: Option<f64>, size: Option<f64>, by_motion: bool, unsure_too: bool) -> Result<Solve, String> {
     let (w, h) = canvas;
-    let centre = [w / 2.0, h / 2.0];
+    // The lens looks through the middle of the footage, which need not
+    // be the middle of the canvas: the scene camera's lens shift makes up
+    // the difference.
+    let middle = [w / 2.0, h / 2.0];
+    let centre = place.apply([track.info.width as f64 / 2.0 - 0.5, track.info.height as f64 / 2.0 - 0.5]);
+    let shift = [centre[0] - middle[0], centre[1] - middle[1]];
     // Clockwise as seen, so the scene's −z is the side the camera is on.
     let clockwise = signed_area2(&track.frames[track.marked].corners) > 0.0;
     let on_canvas = |f: &Frame| -> Quad {
-        let q = f.corners.map(|p| [(p[0] + 0.5) * scale - 0.5 + offset[0], (p[1] + 0.5) * scale - 0.5 + offset[1]]);
+        let q = f.corners.map(|p| place.apply(p));
         if clockwise { q } else { [q[0], q[3], q[2], q[1]] }
     };
     let found: Vec<usize> = (0..track.frames.len()).filter(|&i| track.frames[i].found).collect();
@@ -337,8 +350,8 @@ fn solve_as(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov
             space::focal(h, fov) / distance.max(1e-9)
         }
     };
-    let world: Quad = unit.map(|p| [centre[0] + p[0] * size, centre[1] + p[1] * size]);
-    let rect: Quad = [[centre[0] - aspect * size / 2.0, centre[1] - size / 2.0], [centre[0] + aspect * size / 2.0, centre[1] - size / 2.0], [centre[0] + aspect * size / 2.0, centre[1] + size / 2.0], [centre[0] - aspect * size / 2.0, centre[1] + size / 2.0]];
+    let world: Quad = unit.map(|p| [middle[0] + p[0] * size, middle[1] + p[1] * size]);
+    let rect: Quad = [[middle[0] - aspect * size / 2.0, middle[1] - size / 2.0], [middle[0] + aspect * size / 2.0, middle[1] - size / 2.0], [middle[0] + aspect * size / 2.0, middle[1] + size / 2.0], [middle[0] - aspect * size / 2.0, middle[1] + size / 2.0]];
     let free = Free { fov: false, shift: false, roll: true, ..Free::default() };
     let mut cameras: Vec<(usize, CameraParams, f64)> = Vec::with_capacity(found.len());
     // From the marked frame outwards, each way, so every frame starts
@@ -355,7 +368,7 @@ fn solve_as(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov
         }
         let image = on_canvas(&track.frames[i]);
         let marks: Vec<Mark> = (0..4).map(|k| Mark { world: [world[k][0], world[k][1], 0.0], image: image[k] }).collect();
-        let closed = rect::pose(&world, &image, centre, focal).and_then(|p| camfit::from_pose(p.r, p.t, w, h, fov));
+        let closed = rect::pose(&world, &image, centre, focal).and_then(|p| camfit::from_pose(p.r, p.t, w, h, fov)).map(|c| CameraParams { shift, ..c });
         let mut best: Option<(CameraParams, f64)> = None;
         // The neighbour's camera first: of two that fit as well, the one
         // that carries on.

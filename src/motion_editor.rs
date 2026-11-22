@@ -434,6 +434,12 @@ pub(crate) struct MotionEditor {
     selected: Option<String>,
     canvas_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     drag: Option<Drag>,
+    /// Points marked on the picture (Alt+click), in canvas pixels, and
+    /// the time of the frame they were marked on: "here", "this surface"
+    /// for a request (four going round a surface are what `track_plane`
+    /// follows).
+    marks: Vec<[f64; 2]>,
+    marks_at: f64,
     /// The project as a drag shows it (unsaved): a copy made at the drag's
     /// first tick, in which each tick replaces the one layer it changes.
     preview_project: Option<Project>,
@@ -809,6 +815,8 @@ impl MotionEditor {
             selected: None,
             canvas_bounds: Arc::default(),
             drag: None,
+            marks: Vec::new(),
+            marks_at: 0.0,
             preview_project: None,
             comparing: false,
             quality: motion_preview::quality(),
@@ -1354,6 +1362,12 @@ impl MotionEditor {
     /// The canvas handles Delete; the studio owns playback, undo and the
     /// timeline keys.
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && !self.marks.is_empty() {
+            self.marks.clear();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if !matches!(event.keystroke.key.as_str(), "delete" | "backspace") {
             return;
         }
@@ -1457,6 +1471,22 @@ impl MotionEditor {
 
     pub(crate) fn selected(&self) -> Option<&str> {
         self.selected.as_deref()
+    }
+
+    /// The points marked on the picture and the time of their frame.
+    pub(crate) fn marks(&self) -> (&[[f64; 2]], f64) {
+        (&self.marks, self.marks_at)
+    }
+
+    pub(crate) fn clear_marks(&mut self) {
+        self.marks.clear();
+    }
+
+    /// Marks a point of the picture (canvas pixels) on the frame shown.
+    pub(crate) fn mark(&mut self, at: [f64; 2]) {
+        let now = self.time();
+        self.marks = marked(std::mem::take(&mut self.marks), self.marks_at, at, now, (self.project.settings.width as f64, self.project.settings.height as f64));
+        self.marks_at = now;
     }
 
     pub(crate) fn select(&mut self, id: Option<String>) {
@@ -1788,6 +1818,12 @@ impl MotionEditor {
                     window.focus(&this.focus);
                     let (x, y) = (f32::from(e.position.x), f32::from(e.position.y));
                     let Some((px_, py_)) = this.project_point(x, y) else { return };
+                    if e.modifiers.alt {
+                        // A mark on the picture, not a layer picked.
+                        this.mark([px_, py_]);
+                        cx.notify();
+                        return;
+                    }
                     this.selected = this.hit(px_, py_);
                     if let Some(id) = this.selected.clone() {
                         let (origin, _) = this.eval::<Vec2>(&id, "transform.position", Vec2::ZERO);
@@ -1831,10 +1867,49 @@ impl MotionEditor {
                 );
             }
         }
+        // The marks: a numbered dot each (the order is the order a
+        // surface's corners are followed in).
+        if let Some(b) = canvas_bounds.filter(|_| !self.marks.is_empty()) {
+            let (bw, bh) = (f64::from(b.size.width), f64::from(b.size.height));
+            let k = (bw / w).min(bh / h);
+            let (ox, oy) = ((bw - w * k) / 2.0, (bh - h * k) / 2.0);
+            let stale = (self.time() - self.marks_at).abs() > 1e-6;
+            for (i, m) in self.marks.iter().enumerate() {
+                area = area.child(
+                    div()
+                        .absolute()
+                        .left(px((ox + m[0] * k - 9.0) as f32))
+                        .top(px((oy + m[1] * k - 9.0) as f32))
+                        .size(px(18.0))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(gpui::white())
+                        // Dimmer away from the frame they were marked on.
+                        .bg(if stale { theme::accent().opacity(0.45) } else { theme::accent() })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(gpui::white())
+                        .child(format!("{}", i + 1)),
+                );
+            }
+        }
         area
     }
 
 
+}
+
+/// The marks after one more is put at `at` on the frame at `now`: up to
+/// four are kept; a fifth, or one on another frame, starts again (marks
+/// belong to one frame). Kept inside the canvas.
+fn marked(mut marks: Vec<[f64; 2]>, marks_at: f64, at: [f64; 2], now: f64, canvas: (f64, f64)) -> Vec<[f64; 2]> {
+    if marks.len() >= 4 || (!marks.is_empty() && (now - marks_at).abs() > 1e-6) {
+        marks.clear();
+    }
+    marks.push([at[0].clamp(0.0, canvas.0), at[1].clamp(0.0, canvas.1)]);
+    marks
 }
 
 impl Render for MotionEditor {
@@ -2040,6 +2115,22 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Alt+click marks: up to four, on one frame.
+    #[test]
+    fn marks_are_up_to_four_on_one_frame() {
+        let canvas = (1280.0, 720.0);
+        let mut m = Vec::new();
+        for (i, p) in [[10.0, 10.0], [200.0, 12.0], [210.0, 150.0], [5.0, 140.0]].into_iter().enumerate() {
+            m = marked(m, 1.0, p, 1.0, canvas);
+            assert_eq!(m.len(), i + 1);
+        }
+        // A fifth starts again; so does one on another frame; one outside
+        // the picture is brought to its edge.
+        assert_eq!(marked(m.clone(), 1.0, [50.0, 50.0], 1.0, canvas), vec![[50.0, 50.0]]);
+        assert_eq!(marked(m[..2].to_vec(), 1.0, [50.0, 50.0], 1.5, canvas), vec![[50.0, 50.0]]);
+        assert_eq!(marked(Vec::new(), 0.0, [-20.0, 900.0], 0.0, canvas), vec![[0.0, 720.0]]);
+    }
+
     /// Opens the real window, waits for a rendered frame, and drives the
     /// editor: hit-testing, value scrubbing, key retiming (with beat snap),
     /// undo/redo and live reload of an agent's edit.
@@ -2118,8 +2209,17 @@ mod tests {
                         editor.undo(true);
                         let json = serde_json::to_value(find_layer(&editor.project, "box").unwrap()).unwrap();
                         assert_eq!(json["transform"]["position"]["keys"][1]["at"], "beat:4");
+                        // Four marks on the picture (Alt+click puts them
+                        // through the same call), on the frame shown.
+                        for p in [[100.0, 80.0], [400.0, 90.0], [420.0, 300.0], [90.0, 280.0]] {
+                            editor.mark(p);
+                        }
+                        let (marks, at) = editor.marks();
+                        assert_eq!((marks.len(), at), (4, editor.time()));
                     })
                     .unwrap();
+                // The marks are drawn with the frame (numbered dots).
+                draw(cx);
                 // An agent edits the project on disk; the editor picks it up.
                 let mut agent = Toolbox::new();
                 agent.call("edit_apply", json!({"project": project, "ops": [{"op": "add", "scene": "s1", "id": "dot", "kind": "shape", "shape": "circle", "fill": "#ffffff"}]})).unwrap();

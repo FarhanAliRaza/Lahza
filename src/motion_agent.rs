@@ -259,7 +259,7 @@ Do not guess an edit's form. Every edit is edit_apply with \"ops\": a list of ob
 {\"op\": \"add\", \"scene\": \"<scene id>\", \"id\": …, \"kind\": \"shape\" | \"text\" | …, …the layer's fields}; {\"op\": \"remove\", \"id\": …}. \
 A shape layer's \"shape\" is one of circle, rect, capsule, ring, arc, polygon, star, line, path, field (an ellipse is a circle whose \"size\" has a width and a height that differ). Colours are \"#rrggbb\": a text's is \"color\", a shape's is \"fill\". \
 Before changing a layer read it as it is (timeline_get with full: true shows the JSON that edit_apply edits) rather than trying a form; lahza://schema and lahza://catalog have every field, op and kind, where you can read resources. \
-To put something on a surface that is in footage (a table, a wall, a floor): look at a frame of it (snapshot), then track_plane with \"corners\", the four corners of a real rectangle on that surface in the video's own pixels, going round it, \"at\" the frame's second, and \"camera\": {\"scene\": …} with \"apply\": true (\"moving\": true only if the surface itself is carried about; read the result's \"warning\" if there is one); then add 3D layers on the rectangle it returns (z = 0 is the surface, toward the viewer is −z) and keep the footage's layer in \"space\": \"screen\". \
+To put something on a surface that is in footage (a table, a wall, a floor): track_plane with \"layer\" (the footage's video layer), \"corners\" (four points going round the surface as the canvas shows them: the points marked on the picture if there are four, else read off a snapshot; a real rectangle's corners if the surface has one), \"at\" (the timeline second of that frame), and \"camera\": {\"scene\": …} with \"apply\": true (\"moving\": true only if the surface itself is carried about; read the result's \"warning\" if there is one); then add 3D layers on the rectangle it returns (z = 0 is the surface, toward the viewer is −z) and keep the footage's layer in \"space\": \"screen\". \
 End with one or two plain sentences saying what you changed.";
 
 impl ClaudeCode {
@@ -566,6 +566,10 @@ pub(crate) struct About {
     pub playhead: Option<(f64, i64)>,
     pub scene: Option<String>,
     pub has_picture: bool,
+    /// Points marked on the picture (canvas pixels) and the second of
+    /// the frame they were marked on: "here", "this surface".
+    pub marks: Vec<[f64; 2]>,
+    pub marks_at: f64,
 }
 
 /// The message for the agent: what is pointed at, then the words.
@@ -600,6 +604,14 @@ pub(crate) fn compose(about: &About, words: &str) -> String {
     }
     if about.has_picture {
         lines.push("The picture is the frame at the playhead as it is now.".into());
+    }
+    if !about.marks.is_empty() {
+        let points = about.marks.iter().map(|m| format!("[{:.0}, {:.0}]", m[0], m[1])).collect::<Vec<_>>().join(", ");
+        lines.push(if about.marks.len() == 4 {
+            format!("Marked on the picture (\"this surface\", \"here\"), four points going round a surface, in canvas pixels, on the frame at {:.2} s: {points}. They are track_plane's \"corners\", with \"layer\" (the footage's video layer) and \"at\": {:.2}.", about.marks_at, about.marks_at)
+        } else {
+            format!("Marked on the picture (\"here\"), in canvas pixels, on the frame at {:.2} s: {points}.", about.marks_at)
+        });
     }
     lines.push(String::new());
     lines.push(words.trim().to_string());
@@ -842,6 +854,7 @@ not json at all
             playhead: Some((2.1, 63)),
             scene: Some("s1".into()),
             has_picture: true,
+            ..Default::default()
         };
         assert_eq!(
             compose(&about, "  make this one bolder "),
@@ -850,6 +863,12 @@ not json at all
         let recording = About { recording: Some("/work/talk.lahzarec".into()), span: Some((4.0, 9.0)), ..Default::default() };
         let text = compose(&recording, "five seconds of a map here");
         assert!(text.contains("project_create") && text.contains("recording_place at start 4.00"), "{text}");
+        // Four points marked on the picture are a surface's corners.
+        let marked = About { project: Some("/work/p.lahza".into()), marks: vec![[412.0, 300.4], [905.0, 318.0], [960.0, 560.0], [380.0, 540.0]], marks_at: 1.5, ..Default::default() };
+        let text = compose(&marked, "put a mug here");
+        assert!(text.contains("four points going round a surface") && text.contains("[412, 300], [905, 318], [960, 560], [380, 540]") && text.contains("\"at\": 1.50"), "{text}");
+        let one = About { marks: vec![[10.0, 20.0]], marks_at: 0.0, ..Default::default() };
+        assert!(compose(&one, "x").contains("Marked on the picture (\"here\"), in canvas pixels, on the frame at 0.00 s: [10, 20]."));
         let several = About { layers: vec![("a".into(), "shape".into()), ("b".into(), "text".into())], ..Default::default() };
         assert!(compose(&several, "align").starts_with("Selected layers (\"these\"): a (shape), b (text)."));
     }

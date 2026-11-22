@@ -359,16 +359,18 @@ pub fn tool_defs() -> Vec<ToolDef> {
             name: "track_plane",
             description: "Follow a flat surface in footage (a table top, a wall, a floor, a screen) as one plane, so things can be put on it. Mark it once: `corners`, four [x, y] in source pixels going round a real rectangle on the surface (its top-left, top-right, bottom-right, bottom-left as it lies there: the table's own corners, a book, a tile, a screen), on the frame at `at` seconds. The region is followed both ways from that frame over `from`..`to` by aligning the picture itself (no model; brightness changes and things passing over it are allowed for). A blank surface has nothing of its own to follow: with a still camera (a tripod) that does not matter, since the corners are then held where they were marked (`camera_still_frames`); with a moving camera the result carries a `warning` when `texture` is low. Returns frames and how many were found, the stretches `lost`, and with `detail` the corners per frame. No rectangle on the surface (a worktop, a round table)? Mark any four points on it, well apart: when the camera changes its place during the shot, how the surface lies is read from that motion instead (`camera.plane` says \"motion\"; the lens is then rough unless `fov` is given), and `camera.points` are the four points on z = 0 with `camera.rect` the box round them. With `camera`: {scene} it also solves the scene camera per frame (orbit, rotation, dolly, position; the lens `fov` measured from the rectangle's perspective, or given, or assumed when the rectangle is seen too squarely) so the rectangle is `camera.rect` on the scene's z = 0: put 3D layers there (a mesh at z = −half its height stands on the surface; toward the viewer is −z; a `plane` mesh with material preset \"shadow\" at z = 0 takes their shadows), and keep the footage's video layer in \"space\": \"screen\", drawn as `footage` says. `apply` writes the camera keys; otherwise they come back as edit_apply `ops`. Mark corners from a snapshot or frame of the footage; a larger rectangle with more in it holds better.",
             schema: obj(json!({
-                "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project)"},
-                "corners": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "four [x, y] in source pixels, going round the rectangle"},
-                "at": {"type": "number", "description": "source seconds of the frame the corners were marked on (default `from`)"},
+                "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project); or give `layer`"},
+                "layer": {"type": "string", "description": "a video layer of the project, in place of `video`: then `corners` are as the canvas shows them (a snapshot's pixels, at the project's size) and `at`, `from`, `to` are timeline seconds (`at`: the playhead). The layer's own placement and timing are used"},
+                "corners": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "four [x, y] going round the rectangle: source pixels with `video`, canvas pixels with `layer`"},
+                "corners_in": {"type": "string", "enum": ["canvas", "source"], "description": "with `layer`: what the corners are in (default canvas)"},
+                "at": {"type": "number", "description": "the second of the frame the corners were marked on: source seconds with `video` (default `from`), timeline seconds with `layer` (required)"},
                 "from": {"type": "number", "default": 0}, "to": {"type": "number"},
                 "width": {"type": "integer", "description": "width to follow at (default 640, more when the region is small)"},
                 "moving": {"type": "boolean", "default": false, "description": "the surface itself moves in the scene (a thing carried, a held screen). Default false: a surface of the scene, so on frames where the camera has not moved since the marked frame the corners stay where they were marked, whatever moves over the surface"},
                 "detail": {"type": "boolean", "default": false, "description": "also return every frame's corners and score"},
                 "camera": {"type": "object", "description": "{scene: id, at: timeline seconds at which source second `from` plays (default `from`), scale: canvas px per source px and offset: [x, y] of the footage's corner (default: fitted in the canvas, centred), fov: degrees if known, aspect: the rectangle's real width ÷ height if known, size: its height in scene px, corners: \"rectangle\" | \"points\" | \"auto\" (default): what the marked corners are}"},
                 "apply": {"type": "boolean", "default": false, "description": "write the camera keys to the scene"},
-                "project": {"type": "string"}}), &["video", "corners"]),
+                "project": {"type": "string"}}), &["corners"]),
             read_only: false,
         },
         ToolDef {
@@ -3280,14 +3282,71 @@ impl Toolbox {
 
     fn track_plane(&mut self, args: &Value) -> ToolResult {
         use crate::planetrack;
-        let video = self.input_file(get_str(args, "video").ok_or("track_plane needs \"video\"")?);
-        let corners: Vec<[f64; 2]> = serde_json::from_value(args.get("corners").cloned().unwrap_or(Value::Null)).map_err(|_| "track_plane needs \"corners\": four [x, y] in source pixels, going round the rectangle")?;
-        let corners: [[f64; 2]; 4] = corners.try_into().map_err(|_| "corners: exactly four [x, y]")?;
-        let from = get_f64(args, "from").unwrap_or(0.0).max(0.0);
-        let at = get_f64(args, "at").unwrap_or(from);
+        let corners: Vec<[f64; 2]> = serde_json::from_value(args.get("corners").cloned().unwrap_or(Value::Null)).map_err(|_| "track_plane needs \"corners\": four [x, y], going round the rectangle")?;
+        let mut corners: [[f64; 2]; 4] = corners.try_into().map_err(|_| "corners: exactly four [x, y]")?;
         let width = args.get("width").and_then(Value::as_u64).map(|w| w as u32);
+        // The footage: a file, with corners and times its own; or a video
+        // layer of the project, with corners as the canvas shows them and
+        // times the timeline's (what a snapshot and the playhead give).
+        struct OnLayer {
+            /// Source pixel → canvas.
+            place: lahza_motion_track::H3,
+            /// Timeline seconds of a source second.
+            when: Box<dyn Fn(f64) -> f64>,
+        }
+        let mut on_layer: Option<OnLayer> = None;
+        let (video, from, at, to) = match get_str(args, "layer") {
+            None => {
+                let video = self.input_file(get_str(args, "video").ok_or("track_plane needs \"video\" (a file) or \"layer\" (a video layer of the project)")?);
+                let from = get_f64(args, "from").unwrap_or(0.0).max(0.0);
+                (video, from, get_f64(args, "at").unwrap_or(from), get_f64(args, "to"))
+            }
+            Some(id) => {
+                let dir = self.dir(args)?;
+                let compiled = self.compiled(&dir);
+                let at = get_f64(args, "at").ok_or("with \"layer\", \"at\" is the timeline second the corners were marked on (the playhead)")?;
+                fn find<'a>(layers: &'a [lahza_motion_core::compile::LayerState], id: &str) -> Option<&'a lahza_motion_core::compile::LayerState> {
+                    layers.iter().find_map(|l| match &l.content {
+                        _ if &*l.id == id => Some(l),
+                        lahza_motion_core::compile::Content::Group(inner) => find(inner, id),
+                        _ => None,
+                    })
+                }
+                let source = |t: f64| -> Option<(String, f64, Option<[f64; 2]>, [f64; 9])> {
+                    let frame = compiled.frame(t);
+                    let l = find(&frame.layers, id)?;
+                    match &l.content {
+                        lahza_motion_core::compile::Content::Video(v) => Some((v.src.to_string(), v.source_time, v.size.map(|s| [s.x(), s.y()]), l.matrix.0)),
+                        _ => None,
+                    }
+                };
+                let (src, marked_source, size, matrix) = source(at).ok_or(format!("no video layer '{id}' is shown at {at} s"))?;
+                let video = self.file_in(&dir, &src)?;
+                let info = crate::measure::probe(&video)?;
+                let (sw, sh) = (info.width as f64, info.height as f64);
+                let [w, h] = size.unwrap_or([sw, sh]);
+                // Source pixel (counted, pixel 0's middle at 0) → the
+                // layer's own space (its picture centred on its origin)
+                // → canvas (measured from its corner).
+                let to_local = lahza_motion_track::H3([w / sw, 0.0, 0.5 * w / sw - w / 2.0, 0.0, h / sh, 0.5 * h / sh - h / 2.0, 0.0, 0.0, 1.0]);
+                let place = lahza_motion_track::H3(matrix).then(to_local);
+                // How fast the source runs on the timeline, from a second
+                // either side.
+                let rate = source(at + 0.5).zip(source(at - 0.5)).map(|(a, b)| a.1 - b.1).or(source(at + 0.5).map(|a| (a.1 - marked_source) * 2.0)).or(source(at - 0.5).map(|b| (marked_source - b.1) * 2.0)).filter(|r| r.abs() > 1e-6).unwrap_or(1.0);
+                let to_source = move |t: f64| marked_source + (t - at) * rate;
+                let from = get_f64(args, "from").map(to_source).unwrap_or(0.0).max(0.0);
+                let to = get_f64(args, "to").map(to_source);
+                if get_str(args, "corners_in") != Some("source") {
+                    let back = place.inverse().ok_or("the layer is drawn edge on: its corners cannot be read back")?;
+                    // A snapshot's pixels are counted too.
+                    corners = corners.map(|p| back.apply([p[0] + 0.5, p[1] + 0.5]));
+                }
+                on_layer = Some(OnLayer { place, when: Box::new(move |source: f64| at + (source - marked_source) / rate) });
+                (video, from, marked_source, to)
+            }
+        };
         let moving = args.get("moving").and_then(Value::as_bool).unwrap_or(false);
-        let track = planetrack::track(&video, corners, at, from, get_f64(args, "to"), width, moving, Default::default())?;
+        let track = planetrack::track(&video, corners, at, from, to, width, moving, Default::default())?;
         let found: Vec<&planetrack::Frame> = track.frames.iter().filter(|f| f.found).collect();
         // Stretches not found, in source seconds.
         let mut lost: Vec<Value> = Vec::new();
@@ -3341,12 +3400,19 @@ impl Toolbox {
             Some("points") => planetrack::Corners::Points,
             Some(other) => return Err(format!("camera.corners: \"rectangle\", \"points\" or \"auto\", not \"{other}\"")),
         };
-        let solve = planetrack::solve(&track, (w, h), scale, offset, get_f64(cam, "fov"), get_f64(cam, "aspect"), get_f64(cam, "size"), corners_are)?;
+        let place = on_layer.as_ref().map_or(planetrack::placed(scale, offset), |l| l.place);
+        let solve = planetrack::solve(&track, (w, h), place, get_f64(cam, "fov"), get_f64(cam, "aspect"), get_f64(cam, "size"), corners_are)?;
         let compiled = self.compiled(&dir);
         let sc = compiled.scenes.iter().find(|s| &*s.id == scene).ok_or(format!("no scene '{scene}'"))?;
         // Source seconds → the scene's own time.
         let timeline = get_f64(cam, "at").unwrap_or(from);
-        let when = |i: usize| round(timeline + (track.frames[i].t - track.frames[0].t) - sc.start + sc.pre_roll);
+        let when = |i: usize| {
+            let t = match &on_layer {
+                Some(l) => (l.when)(track.frames[i].t),
+                None => timeline + (track.frames[i].t - track.frames[0].t),
+            };
+            round(t - sc.start + sc.pre_roll)
+        };
         let keys = |v: &dyn Fn(&lahza_motion_core::camfit::CameraParams) -> Value| -> Value {
             if solve.cameras.len() == 1 {
                 v(&solve.cameras[0].1)
@@ -3358,7 +3424,7 @@ impl Toolbox {
         let ops = vec![
             set("fov", json!(round(solve.fov))),
             set("zoom", json!(1)),
-            set("shift", json!([0, 0])),
+            set("shift", json!(solve.cameras[0].1.shift.map(round))),
             set("orbit", keys(&|c| json!([round(c.orbit[0]), round(c.orbit[1])]))),
             set("rotation", keys(&|c| json!(round(c.rotation)))),
             set("dolly", keys(&|c| json!(round(c.dolly)))),
@@ -3373,7 +3439,9 @@ impl Toolbox {
             "frames": solve.cameras.len(),
             "error_px": {"mean": round(errors.iter().sum::<f64>() / errors.len().max(1) as f64), "worst": round(errors.iter().copied().fold(0.0, f64::max))},
         });
-        out["footage"] = json!({"space": "screen", "size": [round(sw * scale), round(sh * scale)], "position": [round(offset[0] + sw * scale / 2.0), round(offset[1] + sh * scale / 2.0)]});
+        if on_layer.is_none() {
+            out["footage"] = json!({"space": "screen", "size": [round(sw * scale), round(sh * scale)], "position": [round(offset[0] + sw * scale / 2.0), round(offset[1] + sh * scale / 2.0)]});
+        }
         if errors.iter().sum::<f64>() / errors.len().max(1) as f64 > 2.0 {
             out["camera"]["warning"] = json!("the camera does not fit the track well (see error_px): the corners are not a real rectangle's and the camera's motion did not settle how the surface lies. Things placed will slide. Mark the corners of a real rectangle on the surface, or give camera.fov");
         }
