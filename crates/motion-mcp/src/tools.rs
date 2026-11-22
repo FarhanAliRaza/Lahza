@@ -254,6 +254,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
             schema: obj(json!({"frames": {"type": "array", "items": {"type": "object", "properties": {"at": time, "marks": {"type": "array", "items": {"type": "object", "properties": {"world": {"type": "array", "items": {"type": "number"}}, "image": {"type": "array", "items": {"type": "number"}}}}}}}},
                 "start": {"type": "object", "description": "camera to start from: fov, orbit, dolly, position, shift (default the default camera)"},
                 "fix": {"type": "array", "items": {"type": "string", "enum": ["fov", "orbit", "dolly", "position", "shift"]}, "description": "parameters to keep (default [\"shift\"])"},
+                "roll": {"type": "boolean", "default": false, "description": "also solve the camera's roll (its `rotation`); wants four marks or more"},
                 "scene": {"type": "string", "description": "scene whose camera the ops set"}, "apply": {"type": "boolean"}}), &["frames"]),
             read_only: false,
         },
@@ -353,6 +354,21 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "width": {"type": "integer", "description": "processing width (default source, at most 960)"},
                 "keys": {"type": "object", "description": "{scale: canvas px per source px (default 1), offset: [x, y], at: timeline seconds of `from` (default 0), base_scale: 1, rotate: true, layer: id} → keys and ops"}}), &["video"]),
             read_only: true,
+        },
+        ToolDef {
+            name: "track_plane",
+            description: "Follow a flat surface in footage (a table top, a wall, a floor, a screen) as one plane, so things can be put on it. Mark it once: `corners`, four [x, y] in source pixels going round a real rectangle on the surface (its top-left, top-right, bottom-right, bottom-left as it lies there: the table's own corners, a book, a tile, a screen), on the frame at `at` seconds. The region is followed both ways from that frame over `from`..`to` by aligning the picture itself (no model; brightness changes and things passing over it are allowed for). Returns frames and how many were found, the stretches `lost`, and with `detail` the corners per frame. With `camera`: {scene} it also solves the scene camera per frame (orbit, rotation, dolly, position; the lens `fov` measured from the rectangle's perspective, or given, or assumed when the rectangle is seen too squarely) so the rectangle is `camera.rect` on the scene's z = 0: put 3D layers there (a mesh at z = −half its height stands on the surface; toward the viewer is −z; a `plane` mesh with material preset \"shadow\" at z = 0 takes their shadows), and keep the footage's video layer in \"space\": \"screen\", drawn as `footage` says. `apply` writes the camera keys; otherwise they come back as edit_apply `ops`. Mark corners from a snapshot or frame of the footage; a larger rectangle with more in it holds better.",
+            schema: obj(json!({
+                "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project)"},
+                "corners": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "four [x, y] in source pixels, going round the rectangle"},
+                "at": {"type": "number", "description": "source seconds of the frame the corners were marked on (default `from`)"},
+                "from": {"type": "number", "default": 0}, "to": {"type": "number"},
+                "width": {"type": "integer", "description": "width to follow at (default 640, more when the region is small)"},
+                "detail": {"type": "boolean", "default": false, "description": "also return every frame's corners and score"},
+                "camera": {"type": "object", "description": "{scene: id, at: timeline seconds at which source second `from` plays (default `from`), scale: canvas px per source px and offset: [x, y] of the footage's corner (default: fitted in the canvas, centred), fov: degrees if known, aspect: the rectangle's real width ÷ height if known, size: its height in scene px}"},
+                "apply": {"type": "boolean", "default": false, "description": "write the camera keys to the scene"},
+                "project": {"type": "string"}}), &["video", "corners"]),
+            read_only: false,
         },
         ToolDef {
             name: "fit_curve",
@@ -527,6 +543,7 @@ impl Toolbox {
             "sim_bake" => self.sim_bake(&args),
             "blender_run" => self.blender_run(&args),
             "track" => self.track(&args),
+            "track_plane" => self.track_plane(&args),
             "fit_curve" => self.fit_curve(&args),
             other => Err(format!("unknown tool '{other}'")),
         }
@@ -1600,6 +1617,9 @@ impl Toolbox {
             dolly: !fixed.iter().any(|f| f == "dolly"),
             position: !fixed.iter().any(|f| f == "position"),
             shift: !fixed.iter().any(|f| f == "shift"),
+            // Roll stays put unless asked for: three marks do not tell it
+            // from a turn and a slide.
+            roll: args.get("roll").and_then(Value::as_bool).unwrap_or(false),
         };
         let mut rows = Vec::new();
         let mut solved = Vec::new();
@@ -1643,6 +1663,9 @@ impl Toolbox {
             }
             if free.shift {
                 ops.push(set("shift", keys(&|c| json!([round(c.shift[0]), round(c.shift[1])]))));
+            }
+            if free.roll {
+                ops.push(set("rotation", keys(&|c| json!(round(c.rotation)))));
             }
             if args.get("apply").and_then(Value::as_bool).unwrap_or(false) {
                 self.call("edit_apply", json!({"project": dir.display().to_string(), "ops": ops.clone()}))?;
@@ -3250,6 +3273,103 @@ impl Toolbox {
                 out["ops"] = json!(map.iter().map(|(path, v)| json!({"op": "set", "target": format!("{layer}.{path}"), "value": v})).collect::<Vec<_>>());
             }
             out["keys"] = keys;
+        }
+        Ok(Output::json(out))
+    }
+
+    fn track_plane(&mut self, args: &Value) -> ToolResult {
+        use crate::planetrack;
+        let video = self.input_file(get_str(args, "video").ok_or("track_plane needs \"video\"")?);
+        let corners: Vec<[f64; 2]> = serde_json::from_value(args.get("corners").cloned().unwrap_or(Value::Null)).map_err(|_| "track_plane needs \"corners\": four [x, y] in source pixels, going round the rectangle")?;
+        let corners: [[f64; 2]; 4] = corners.try_into().map_err(|_| "corners: exactly four [x, y]")?;
+        let from = get_f64(args, "from").unwrap_or(0.0).max(0.0);
+        let at = get_f64(args, "at").unwrap_or(from);
+        let width = args.get("width").and_then(Value::as_u64).map(|w| w as u32);
+        let track = planetrack::track(&video, corners, at, from, get_f64(args, "to"), width, Default::default())?;
+        let found: Vec<&planetrack::Frame> = track.frames.iter().filter(|f| f.found).collect();
+        // Stretches not found, in source seconds.
+        let mut lost: Vec<Value> = Vec::new();
+        let mut run: Option<(f64, f64)> = None;
+        for f in &track.frames {
+            match (f.found, run) {
+                (false, None) => run = Some((f.t, f.t)),
+                (false, Some((a, _))) => run = Some((a, f.t)),
+                (true, Some((a, b))) => {
+                    lost.push(json!([round(a), round(b)]));
+                    run = None;
+                }
+                (true, None) => {}
+            }
+        }
+        if let Some((a, b)) = run {
+            lost.push(json!([round(a), round(b)]));
+        }
+        let mean = |v: &dyn Fn(&planetrack::Frame) -> f64| found.iter().map(|f| v(f)).sum::<f64>() / found.len().max(1) as f64;
+        let mut out = json!({
+            "video": video.display().to_string(), "size": [track.info.width, track.info.height], "fps": round(track.info.fps),
+            "followed_at": [track.size.0, track.size.1], "frames": track.frames.len(), "found": found.len(), "lost": lost,
+            "match": {"mean": round(mean(&|f| f.agree)), "least": round(found.iter().map(|f| f.agree).fold(1.0, f64::min))},
+            "template_retaken": track.retakes,
+            "seconds": round(track.seconds), "frames_per_second": round(track.frames.len() as f64 / track.seconds.max(1e-9)),
+        });
+        if args.get("detail").and_then(Value::as_bool).unwrap_or(false) {
+            out["track"] = json!(track.frames.iter().map(|f| if f.found {
+                json!({"t": round(f.t), "frame": f.frame, "found": true, "corners": f.corners.map(|p| [round(p[0]), round(p[1])]), "match": round(f.agree), "visible": round(f.visible)})
+            } else {
+                json!({"t": round(f.t), "frame": f.frame, "found": false})
+            }).collect::<Vec<_>>());
+        }
+        let Some(cam) = args.get("camera").filter(|c| c.is_object()) else { return Ok(Output::json(out)) };
+        let scene = get_str(cam, "scene").ok_or("camera needs \"scene\"")?.to_string();
+        let dir = self.dir(args)?;
+        let project = self.state(&dir).project.clone();
+        let (w, h) = (project.settings.width as f64, project.settings.height as f64);
+        let (sw, sh) = (track.info.width as f64, track.info.height as f64);
+        let scale = get_f64(cam, "scale").unwrap_or((w / sw).min(h / sh));
+        let offset = match cam.get("offset").and_then(Value::as_array) {
+            Some(a) if a.len() == 2 => [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)],
+            _ => [(w - sw * scale) / 2.0, (h - sh * scale) / 2.0],
+        };
+        let solve = planetrack::solve(&track, (w, h), scale, offset, get_f64(cam, "fov"), get_f64(cam, "aspect"), get_f64(cam, "size"))?;
+        let compiled = self.compiled(&dir);
+        let sc = compiled.scenes.iter().find(|s| &*s.id == scene).ok_or(format!("no scene '{scene}'"))?;
+        // Source seconds → the scene's own time.
+        let timeline = get_f64(cam, "at").unwrap_or(from);
+        let when = |i: usize| round(timeline + (track.frames[i].t - track.frames[0].t) - sc.start + sc.pre_roll);
+        let keys = |v: &dyn Fn(&lahza_motion_core::camfit::CameraParams) -> Value| -> Value {
+            if solve.cameras.len() == 1 {
+                v(&solve.cameras[0].1)
+            } else {
+                json!({"keys": solve.cameras.iter().map(|(i, c, _)| json!({"at": when(*i), "v": v(c)})).collect::<Vec<_>>()})
+            }
+        };
+        let set = |name: &str, value: Value| json!({"op": "set", "target": format!("{scene}.camera.{name}"), "value": value});
+        let ops = vec![
+            set("fov", json!(round(solve.fov))),
+            set("zoom", json!(1)),
+            set("shift", json!([0, 0])),
+            set("orbit", keys(&|c| json!([round(c.orbit[0]), round(c.orbit[1])]))),
+            set("rotation", keys(&|c| json!(round(c.rotation)))),
+            set("dolly", keys(&|c| json!(round(c.dolly)))),
+            set("position", keys(&|c| json!(c.position.map(|p| [round(p[0]), round(p[1])])))),
+        ];
+        let errors: Vec<f64> = solve.cameras.iter().map(|c| c.2).collect();
+        let rect = solve.rect.map(|p| [round(p[0]), round(p[1])]);
+        out["camera"] = json!({
+            "scene": scene, "fov": round(solve.fov), "lens": solve.lens, "perspective": round(solve.strength),
+            "rect": rect, "rect_size": [round(rect[1][0] - rect[0][0]), round(rect[3][1] - rect[0][1])], "aspect": round(solve.aspect),
+            "frames": solve.cameras.len(),
+            "error_px": {"mean": round(errors.iter().sum::<f64>() / errors.len().max(1) as f64), "worst": round(errors.iter().copied().fold(0.0, f64::max))},
+        });
+        out["footage"] = json!({"space": "screen", "size": [round(sw * scale), round(sh * scale)], "position": [round(offset[0] + sw * scale / 2.0), round(offset[1] + sh * scale / 2.0)]});
+        if solve.lens == "assumed" {
+            out["camera"]["note"] = json!("the rectangle is seen too squarely to measure the lens: 39.6° was assumed; give camera.fov, or camera.aspect (the rectangle's real width ÷ height), for the true one");
+        }
+        if args.get("apply").and_then(Value::as_bool).unwrap_or(false) {
+            self.call("edit_apply", json!({"project": dir.display().to_string(), "ops": ops}))?;
+            out["applied"] = json!(true);
+        } else {
+            out["ops"] = json!(ops);
         }
         Ok(Output::json(out))
     }

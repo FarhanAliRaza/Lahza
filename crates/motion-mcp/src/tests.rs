@@ -875,7 +875,7 @@ fn fit_camera_solves_and_sets_the_scene_camera() {
     let (mut tb, dir) = toolbox("fitcam");
     tb.call("project_create", json!({"path": "shot", "duration": 2, "width": 1920, "height": 1080})).unwrap();
     tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
-    let truth = CameraParams { fov: 45.0, orbit: [12.0, -8.0], dolly: 200.0, position: Some([1000.0, 500.0]), shift: [0.0, 0.0] };
+    let truth = CameraParams { fov: 45.0, orbit: [12.0, -8.0], dolly: 200.0, position: Some([1000.0, 500.0]), shift: [0.0, 0.0], rotation: 0.0 };
     let pts = [[300.0, 200.0, 0.0], [1500.0, 260.0, 120.0], [900.0, 800.0, -200.0], [400.0, 900.0, 300.0], [1700.0, 950.0, 0.0], [960.0, 500.0, 600.0]];
     let marks: Vec<_> = pts.iter().map(|&p| json!({"world": p, "image": project(&truth, 1920.0, 1080.0, p).unwrap()})).collect();
     let out = tb.call("fit_camera", json!({"frames": [{"at": 0.5, "marks": marks}], "scene": "s1", "apply": true})).unwrap().json;
@@ -1061,4 +1061,149 @@ fn review_renders_scenes_cuts_and_phone_sheets() {
         assert!(dir.join("sheets").join(f).is_file(), "{f}");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A table's texture: soft noise, with blocks and discs on it.
+fn table_png(path: &std::path::Path, w: u32, h: u32) {
+    let hash = |x: i64, y: i64, s: u64| -> f64 {
+        let mut v = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ s.wrapping_mul(0x1656_67B1_9E37_79F9);
+        v ^= v >> 31;
+        v = v.wrapping_mul(0x7FB5_D329_728E_A185);
+        v ^= v >> 27;
+        (v >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let noise = |x: f64, y: f64, cell: f64, s: u64| -> f64 {
+        let (fx, fy) = (x / cell, y / cell);
+        let (ix, iy) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - ix, fy - iy);
+        let (sx, sy) = (tx * tx * (3.0 - 2.0 * tx), ty * ty * (3.0 - 2.0 * ty));
+        let (ix, iy) = (ix as i64, iy as i64);
+        let top = hash(ix, iy, s) + (hash(ix + 1, iy, s) - hash(ix, iy, s)) * sx;
+        let bottom = hash(ix, iy + 1, s) + (hash(ix + 1, iy + 1, s) - hash(ix, iy + 1, s)) * sx;
+        top + (bottom - top) * sy
+    };
+    let img = image::RgbaImage::from_fn(w, h, |x, y| {
+        let (x, y) = (x as f64, y as f64);
+        let mut v = 0.45 * noise(x, y, 90.0, 1) + 0.3 * noise(x, y, 31.0, 2) + 0.25 * noise(x, y, 11.0, 3);
+        let (cx, cy) = ((x / 70.0).floor() as i64, (y / 70.0).floor() as i64);
+        if hash(cx, cy, 9) < 0.5 {
+            let (ox, oy) = ((cx as f64 + 0.3 + 0.4 * hash(cx, cy, 10)) * 70.0, (cy as f64 + 0.3 + 0.4 * hash(cx, cy, 11)) * 70.0);
+            let r = 9.0 + 12.0 * hash(cx, cy, 12);
+            let d = if hash(cx, cy, 13) < 0.5 { ((x - ox).abs() - r).max((y - oy).abs() - r * 0.7) } else { ((x - ox).powi(2) + (y - oy).powi(2)).sqrt() - r };
+            let cover = (0.5 - d / 2.0).clamp(0.0, 1.0);
+            v += (0.1 + 0.8 * hash(cx, cy, 14) - v) * cover;
+        }
+        let g = (40.0 + 180.0 * v) as u8;
+        image::Rgba([g, (g as f64 * 0.86) as u8, (g as f64 * 0.7) as u8, 255])
+    });
+    img.save(path).unwrap();
+}
+
+/// track_plane, end to end: a textured table drawn by the engine under a
+/// camera that orbits, rolls, dollies and slides is rendered to a video;
+/// its corners are marked on the middle frame; the track finds them on
+/// every frame, the lens is measured from the rectangle, and the solved
+/// camera, applied to another project's scene, puts that scene's
+/// rectangle (and a point standing above it) where the table is.
+#[test]
+fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
+    use lahza_motion_core::camfit::{project, CameraParams};
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("trackplane");
+    let (w, h, fps, seconds) = (1280.0, 720.0, 30.0, 2.0);
+    tb.call("project_create", json!({"path": "shot", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    std::fs::create_dir_all(dir.join("shot.lahza/assets")).unwrap();
+    table_png(&dir.join("shot.lahza/assets/table.png"), 700, 440);
+    table_png(&dir.join("shot.lahza/assets/floor.png"), 2000, 1400);
+    // The camera at a time: what the keys below say, read the same way.
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * (t / seconds);
+    let truth = |t: f64| CameraParams {
+        fov: 45.0,
+        orbit: [lerp(-14.0, 12.0, t), lerp(-56.0, -48.0, t)],
+        dolly: lerp(0.0, 110.0, t),
+        position: Some([lerp(600.0, 680.0, t), lerp(380.0, 350.0, t)]),
+        shift: [0.0, 0.0],
+        rotation: lerp(-3.0, 4.0, t),
+    };
+    let key = |f: &dyn Fn(&CameraParams) -> serde_json::Value| json!({"keys": [{"at": 0, "v": f(&truth(0.0))}, {"at": seconds, "v": f(&truth(seconds))}]});
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "background": "#2a2f3a"},
+        {"op": "set", "target": "s1.camera", "value": {
+            "fov": 45, "orbit": key(&|c| json!(c.orbit)), "dolly": key(&|c| json!(c.dolly)),
+            "position": key(&|c| json!(c.position)), "rotation": key(&|c| json!(c.rotation))}},
+        // A floor under the table, darker, so the table's edge is an edge
+        // and what is outside the region is not the region.
+        {"op": "add", "id": "floor", "kind": "image", "src": "assets/floor.png", "three_d": true,
+         "transform": {"position": [640, 360], "z": 260, "opacity": 0.55}},
+        {"op": "add", "id": "table", "kind": "image", "src": "assets/table.png", "three_d": true, "transform": {"position": [640, 360]}}
+    ]})).unwrap();
+    tb.call("render", json!({"output": "shot.mp4", "wait": true, "audio": false})).unwrap();
+    let video = dir.join("shot.mp4");
+    assert!(video.exists(), "the shot was not rendered");
+    // The table's corners in the scene, and where a frame shows them.
+    let table = [[290.0, 140.0], [990.0, 140.0], [990.0, 580.0], [290.0, 580.0]];
+    let seen = |t: f64| table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap());
+    let marked_at = 1.0;
+    // Another project: the footage, and what is to stand on the table.
+    tb.call("project_create", json!({"path": "comp", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
+    let out = tb.call("track_plane", json!({
+        "video": video.display().to_string(), "corners": seen(marked_at), "at": marked_at, "detail": true,
+        "camera": {"scene": "s1"}, "apply": true
+    })).unwrap().json;
+    let frames = out["track"].as_array().unwrap();
+    assert_eq!(out["found"], out["frames"], "{}", serde_json::to_string(&json!({"lost": out["lost"], "match": out["match"]})).unwrap());
+    assert_eq!(frames.len(), (seconds * fps) as usize);
+    let mut worst = 0.0f64;
+    for f in frames {
+        let want = seen(f["t"].as_f64().unwrap());
+        for k in 0..4 {
+            let got = [f["corners"][k][0].as_f64().unwrap(), f["corners"][k][1].as_f64().unwrap()];
+            worst = worst.max(((got[0] - want[k][0]).powi(2) + (got[1] - want[k][1]).powi(2)).sqrt());
+        }
+    }
+    eprintln!("corners within {worst:.2} px of 1280; {} frames a second; lens {} at {}°; camera error {}", out["frames_per_second"], out["camera"]["lens"], out["camera"]["fov"], out["camera"]["error_px"]);
+    assert!(worst < 0.6, "corners up to {worst:.2} px off");
+    assert_eq!(out["camera"]["lens"], "measured", "{}", out["camera"]);
+    let fov = out["camera"]["fov"].as_f64().unwrap();
+    assert!((fov - 45.0).abs() < 1.0, "lens {fov}°, the shot's is 45°");
+    assert!((out["camera"]["aspect"].as_f64().unwrap() - 700.0 / 440.0).abs() < 0.05, "{}", out["camera"]);
+    assert_eq!(out["applied"], true);
+    // The scene's camera now: its keys, read at a frame.
+    let scene: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("comp.lahza/scenes/s1.json")).unwrap()).unwrap();
+    let cam = &scene["camera"];
+    let at = |name: &str, i: usize| cam[name]["keys"][i]["v"].clone();
+    let rect: Vec<[f64; 2]> = serde_json::from_value(out["camera"]["rect"].clone()).unwrap();
+    let (rc, rh) = ([(rect[0][0] + rect[2][0]) / 2.0, (rect[0][1] + rect[2][1]) / 2.0], rect[3][1] - rect[0][1]);
+    let (mut worst_on, mut worst_above) = (0.0f64, 0.0f64);
+    for i in (0..frames.len()).step_by(7) {
+        let t = cam["orbit"]["keys"][i]["at"].as_f64().unwrap();
+        let orbit = at("orbit", i);
+        let position = at("position", i);
+        let solved = CameraParams {
+            fov: cam["fov"].as_f64().unwrap(),
+            orbit: [orbit[0].as_f64().unwrap(), orbit[1].as_f64().unwrap()],
+            dolly: at("dolly", i).as_f64().unwrap(),
+            position: Some([position[0].as_f64().unwrap(), position[1].as_f64().unwrap()]),
+            shift: [0.0, 0.0],
+            rotation: at("rotation", i).as_f64().unwrap(),
+        };
+        let want = seen(t);
+        for k in 0..4 {
+            let got = project(&solved, w, h, [rect[k][0], rect[k][1], 0.0]).unwrap();
+            worst_on = worst_on.max(((got[0] - want[k][0]).powi(2) + (got[1] - want[k][1]).powi(2)).sqrt());
+        }
+        // Something standing on the table's middle, 0.4 of its depth
+        // tall: its top, in the shot and in the solved scene.
+        let top = project(&truth(t), w, h, [640.0, 360.0, -0.4 * 440.0]).unwrap();
+        let got = project(&solved, w, h, [rc[0], rc[1], -0.4 * rh]).unwrap();
+        worst_above = worst_above.max(((got[0] - top[0]).powi(2) + (got[1] - top[1]).powi(2)).sqrt());
+    }
+    eprintln!("the solved scene's rectangle within {worst_on:.2} px, a point above it within {worst_above:.2} px");
+    assert!(worst_on < 0.8, "the scene's rectangle is up to {worst_on:.2} px from the table");
+    assert!(worst_above < 1.5, "a point above the table is up to {worst_above:.2} px off");
+    let _ = std::fs::remove_dir_all(&dir);
 }

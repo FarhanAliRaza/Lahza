@@ -11,6 +11,7 @@ exporter are unchanged.
 | [`crates/motion-core`](../crates/motion-core) | Project document, rational time, stepped clocks, the measured curve presets, marker tracks, time references with sync anchors, additive tracks, per-glyph text animators, precomps, track mattes, effects, scene transitions, atomic edit ops with inverses, `check`. Pure Rust, no GPU, no I/O beyond project folders. |
 | [`crates/motion-audio`](../crates/motion-audio) | Music → marker tracks: tempo (with a tempo map when it changes), meter (3/4, 4/4), first downbeat, beat/bar/half/sixteenth/triplet grids, straight vs triplet feel, onsets per band (refined to ~1 ms), `hit`, `stop` (silence→hit), `drop` (bass dropout before a downbeat), `music.start/end`. |
 | [`crates/motion-render`](../crates/motion-render) | Display list of SDF shapes, Bézier paths, HarfBuzz-shaped SDF glyphs and images binned into 16×16 tiles; Vulkan compute rasteriser on `blade-graphics` with a CPU path that runs the same math; offscreen groups for precomps, mattes, blur/shadow/glow (large blurs at reduced resolution); shutter motion blur; frame cache; export through ffmpeg (NVENC/VAAPI/libx264, VP9, GIF) with audio mix and ducking; contact sheets. |
+| [`crates/motion-track`](../crates/motion-track) | Tracking footage: a flat region followed frame by frame as one plane (direct alignment of the picture, no model), and the lens and pose a rectangle seen in perspective implies. Pure Rust, no GPU, no I/O. |
 | [`crates/motion-mcp`](../crates/motion-mcp) | `lahza mcp` (MCP server on the official `rmcp` SDK) and `lahza motion …` (CLI). Both run one transport-free `Toolbox`. |
 
 ## Use it from an agent
@@ -168,6 +169,25 @@ Select, type, Enter. The prompt bar is the same on a motion project and on a rec
 
 `mesh` layers are real lit 3D objects rendered by the engine itself, live in the preview and identical on GPU and CPU: spheres, rounded boxes, cylinders and cones, capsules, tori and torus arcs split into coloured segments, outlines extruded with bevels (logos, letters, coins), profiles revolved about an axis, and tubes swept along paths that grow with `trim`. Materials are physically based (presets glossy, coated, metal, chrome, glass, emissive, matte, flat, shadow; roughness, clear coat, per-part materials) under the scene's lights and a procedural studio environment. Lights cast soft shadows (CPU-built shadow maps, filtered on the GPU), glass refracts and frosts what is behind it, and flat 3D layers join the meshes' depth test as cards. Meshes next to each other share a depth buffer, so they intersect correctly; they sort by depth with 2.5D planes and take effects, mattes, depth of field and motion blur like any layer. The display list bins each batch's triangles into the renderer's 16×16 tiles; each pixel finds the nearest triangle at 8 samples (watertight edges) and shades each winner once.
 
+## Things placed in footage
+
+`track_plane` follows a flat surface in a video (a table top, a wall, a floor, a screen) so that 3D layers can stand on it. Mark it once: the four corners of a real rectangle on the surface (the table's own corners, a book, a tile), in source pixels, on any one frame. The region is followed both ways from that frame by aligning the picture itself, coarse to fine, always against the marked frame, so the track does not drift. It needs no model and no GPU. Changes of brightness are taken out, and what passes over the surface is left out of the fit, so a hand over the table does not move the plane. A frame where the surface cannot be matched (a cut away, the region out of frame) is reported as lost, and the track picks up again when it comes back.
+
+With `camera: {scene}` it also solves the scene's camera for every frame. The lens is measured from the rectangle's perspective (or given as `fov`; when the rectangle is seen too squarely to tell, 39.6° is assumed and the result says so). The marked rectangle becomes `camera.rect` on the scene's z = 0:
+
+- keep the footage's video layer in `"space": "screen"`, drawn as the result's `footage` says;
+- put 3D layers on the rectangle. Toward the viewer is −z, so a box `depth` deep sits at `z: -depth / 2`;
+- a `plane` mesh with material preset `shadow` at z = 0 takes their shadows.
+
+```bash
+lahza motion track-plane shot.mp4 --corners 412,300,905,318,960,560,380,540 --at 1.5 \
+    --project comp.lahza --scene s1 --apply
+```
+
+[`examples/track/table.py`](../examples/track/table.py) makes its own footage (a table under a moving camera), tracks it and stands a box, a ball and a cylinder on it. On a cloud container's CPU that track runs at about 110 frames a second for 1280 × 720 footage, decoding included, with the corners within a quarter of a pixel and the lens within 0.1°. These are numbers on footage the engine drew; none has been taken on a camera's footage yet.
+
+Limits: one plane per scene (the camera is what moves); the surface must be flat and have something on it (a blank table top gives nothing to hold); the track follows from where the last frame was, so it does not find a surface again in a different shot of it; nothing yet hides a placed object behind what passes in front of it (that needs a matte), and footage is not relit. Both are planned in `TODO.md` ("Tracking footage").
+
 ## 3D with Blender
 
 `blender_run` runs Blender headless. It takes an agent-written `bpy` script and/or a `.blend` file, and renders a transparent PNG sequence into `assets/blender/<name>/`. A `video` layer then places it, so 3D assets composite with type, shapes, effects, mattes and 2.5D layers in one timeline. Blender handles real 3D (geometry, lights, materials); Lahza handles motion, timing and composition. Cycles works without a display. EEVEE is much faster with a GPU and a display.
@@ -193,7 +213,7 @@ Select, type, Enter. The prompt bar is the same on a motion project and on a rec
 | Masks on a layer | ◐ through track mattes; no per-layer mask paths with feather |
 | Expressions, scripting | ✘ (planned: `code_put` for expressions, shaders, WASM) |
 | Particles, repeaters, booleans, text on a path | ✘ |
-| Motion tracking, rotoscoping, keying | ✘ |
+| Motion tracking, rotoscoping, keying | ◐ a flat surface followed as a plane, and the scene camera from it (`track_plane`); no mattes, rotoscoping or keying |
 
 Against Chrome-based editors (Remotion, Hyperframes and other React or canvas tools), Lahza has these advantages:
 - Native GPU compute rendering, with the CPU path drawing the same picture.

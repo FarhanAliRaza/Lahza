@@ -14,6 +14,7 @@ lahza-motion-audio = { path = "../motion-audio" }
 lahza-motion-core = { path = "../motion-core" }
 lahza-motion-render = { path = "../motion-render" }
 lahza-motion-sim = { path = "../motion-sim" }
+lahza-motion-track = { path = "../motion-track" }
 lahza-audio-mode = { path = "../audio-mode" }
 lahza-clips = { path = "../clips" }
 lahza-model = { path = "../model" }

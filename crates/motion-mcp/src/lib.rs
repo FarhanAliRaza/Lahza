@@ -2,6 +2,7 @@
 //! the `lahza motion` command line. Both run the same [`tools::Toolbox`].
 
 pub mod measure;
+pub mod planetrack;
 pub mod server;
 pub mod tools;
 
@@ -26,6 +27,10 @@ Usage:
                      --drawn also scores one element's box)
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
+  lahza motion track-plane <video> --corners x,y,x,y,x,y,x,y [--at S] [--from S] [--to S] [--width PX] [--detail]
+                    [--project DIR --scene ID [--timeline S] [--scale S] [--offset x,y] [--fov DEG] [--aspect R] [--size PX] [--apply]]
+                    follows a flat region (four corners marked on the frame at --at) as one plane; with --scene, the scene
+                    camera per frame, so 3D layers stand on that plane (the footage layer in \"space\": \"screen\")
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
   lahza motion measure <video> cuts|events|ink|captions|curve [--from S] [--to S] [--at S] [--region x,y,w,h]
                     [--color HEX | --point x,y | --box x,y,w,h]   (curve: track it, fit an ease)
@@ -522,6 +527,43 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 a["keys"] = k;
             }
             print(&tb.call("track", a)?.json);
+        }
+        "track-plane" => {
+            let mut a = json!({"video": target.clone().ok_or("track-plane needs a video")?});
+            let nums = |s: String| -> Result<Vec<f64>, String> { s.split(',').map(|v| v.trim().parse::<f64>().map_err(|e| e.to_string())).collect() };
+            let c = nums(flag(args, "--corners").ok_or("track-plane needs --corners x,y,x,y,x,y,x,y")?)?;
+            if c.len() != 8 {
+                return Err("--corners: eight numbers, four corners going round the region".into());
+            }
+            a["corners"] = json!(c.chunks(2).map(|p| json!([p[0], p[1]])).collect::<Vec<_>>());
+            for k in ["at", "from", "to"] {
+                if let Some(v) = flag(args, &format!("--{k}")) {
+                    a[k] = json!(v.parse::<f64>().map_err(|e| e.to_string())?);
+                }
+            }
+            if let Some(v) = flag(args, "--width") {
+                a["width"] = json!(v.parse::<u64>().map_err(|e| e.to_string())?);
+            }
+            if has(args, "--detail") {
+                a["detail"] = json!(true);
+            }
+            if let Some(scene) = flag(args, "--scene") {
+                let mut cam = json!({"scene": scene});
+                for (k, name) in [("timeline", "at"), ("scale", "scale"), ("fov", "fov"), ("aspect", "aspect"), ("size", "size")] {
+                    if let Some(v) = flag(args, &format!("--{k}")) {
+                        cam[name] = json!(v.parse::<f64>().map_err(|e| e.to_string())?);
+                    }
+                }
+                if let Some(v) = flag(args, "--offset") {
+                    cam["offset"] = json!(nums(v)?);
+                }
+                a["camera"] = cam;
+                a["project"] = json!(flag(args, "--project").ok_or("--scene needs --project DIR")?);
+                if has(args, "--apply") {
+                    a["apply"] = json!(true);
+                }
+            }
+            print(&tb.call("track_plane", a)?.json);
         }
         "fit" => {
             let file = target.clone().ok_or("fit needs a samples JSON file ([[t, value], …], or a track output)")?;

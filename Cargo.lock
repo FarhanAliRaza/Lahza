@@ -3728,6 +3728,7 @@ dependencies = [
  "lahza-motion-core",
  "lahza-motion-render",
  "lahza-motion-sim",
+ "lahza-motion-track",
  "lahza-scene-model",
  "lahza-viewport",
  "rmcp",
