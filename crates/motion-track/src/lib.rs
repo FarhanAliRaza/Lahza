@@ -13,6 +13,7 @@ pub mod image;
 pub mod plane;
 pub mod rect;
 pub mod still;
+pub mod tilt;
 
 #[cfg(test)]
 mod tests;

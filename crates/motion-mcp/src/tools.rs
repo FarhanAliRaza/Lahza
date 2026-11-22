@@ -357,7 +357,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "track_plane",
-            description: "Follow a flat surface in footage (a table top, a wall, a floor, a screen) as one plane, so things can be put on it. Mark it once: `corners`, four [x, y] in source pixels going round a real rectangle on the surface (its top-left, top-right, bottom-right, bottom-left as it lies there: the table's own corners, a book, a tile, a screen), on the frame at `at` seconds. The region is followed both ways from that frame over `from`..`to` by aligning the picture itself (no model; brightness changes and things passing over it are allowed for). A blank surface has nothing of its own to follow: with a still camera (a tripod) that does not matter, since the corners are then held where they were marked (`camera_still_frames`); with a moving camera the result carries a `warning` when `texture` is low. Returns frames and how many were found, the stretches `lost`, and with `detail` the corners per frame. With `camera`: {scene} it also solves the scene camera per frame (orbit, rotation, dolly, position; the lens `fov` measured from the rectangle's perspective, or given, or assumed when the rectangle is seen too squarely) so the rectangle is `camera.rect` on the scene's z = 0: put 3D layers there (a mesh at z = −half its height stands on the surface; toward the viewer is −z; a `plane` mesh with material preset \"shadow\" at z = 0 takes their shadows), and keep the footage's video layer in \"space\": \"screen\", drawn as `footage` says. `apply` writes the camera keys; otherwise they come back as edit_apply `ops`. Mark corners from a snapshot or frame of the footage; a larger rectangle with more in it holds better.",
+            description: "Follow a flat surface in footage (a table top, a wall, a floor, a screen) as one plane, so things can be put on it. Mark it once: `corners`, four [x, y] in source pixels going round a real rectangle on the surface (its top-left, top-right, bottom-right, bottom-left as it lies there: the table's own corners, a book, a tile, a screen), on the frame at `at` seconds. The region is followed both ways from that frame over `from`..`to` by aligning the picture itself (no model; brightness changes and things passing over it are allowed for). A blank surface has nothing of its own to follow: with a still camera (a tripod) that does not matter, since the corners are then held where they were marked (`camera_still_frames`); with a moving camera the result carries a `warning` when `texture` is low. Returns frames and how many were found, the stretches `lost`, and with `detail` the corners per frame. No rectangle on the surface (a worktop, a round table)? Mark any four points on it, well apart: when the camera changes its place during the shot, how the surface lies is read from that motion instead (`camera.plane` says \"motion\"; the lens is then rough unless `fov` is given), and `camera.points` are the four points on z = 0 with `camera.rect` the box round them. With `camera`: {scene} it also solves the scene camera per frame (orbit, rotation, dolly, position; the lens `fov` measured from the rectangle's perspective, or given, or assumed when the rectangle is seen too squarely) so the rectangle is `camera.rect` on the scene's z = 0: put 3D layers there (a mesh at z = −half its height stands on the surface; toward the viewer is −z; a `plane` mesh with material preset \"shadow\" at z = 0 takes their shadows), and keep the footage's video layer in \"space\": \"screen\", drawn as `footage` says. `apply` writes the camera keys; otherwise they come back as edit_apply `ops`. Mark corners from a snapshot or frame of the footage; a larger rectangle with more in it holds better.",
             schema: obj(json!({
                 "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project)"},
                 "corners": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "four [x, y] in source pixels, going round the rectangle"},
@@ -366,7 +366,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
                 "width": {"type": "integer", "description": "width to follow at (default 640, more when the region is small)"},
                 "moving": {"type": "boolean", "default": false, "description": "the surface itself moves in the scene (a thing carried, a held screen). Default false: a surface of the scene, so on frames where the camera has not moved since the marked frame the corners stay where they were marked, whatever moves over the surface"},
                 "detail": {"type": "boolean", "default": false, "description": "also return every frame's corners and score"},
-                "camera": {"type": "object", "description": "{scene: id, at: timeline seconds at which source second `from` plays (default `from`), scale: canvas px per source px and offset: [x, y] of the footage's corner (default: fitted in the canvas, centred), fov: degrees if known, aspect: the rectangle's real width ÷ height if known, size: its height in scene px}"},
+                "camera": {"type": "object", "description": "{scene: id, at: timeline seconds at which source second `from` plays (default `from`), scale: canvas px per source px and offset: [x, y] of the footage's corner (default: fitted in the canvas, centred), fov: degrees if known, aspect: the rectangle's real width ÷ height if known, size: its height in scene px, corners: \"rectangle\" | \"points\" | \"auto\" (default): what the marked corners are}"},
                 "apply": {"type": "boolean", "default": false, "description": "write the camera keys to the scene"},
                 "project": {"type": "string"}}), &["video", "corners"]),
             read_only: false,
@@ -3335,7 +3335,13 @@ impl Toolbox {
             Some(a) if a.len() == 2 => [a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)],
             _ => [(w - sw * scale) / 2.0, (h - sh * scale) / 2.0],
         };
-        let solve = planetrack::solve(&track, (w, h), scale, offset, get_f64(cam, "fov"), get_f64(cam, "aspect"), get_f64(cam, "size"))?;
+        let corners_are = match get_str(cam, "corners") {
+            None | Some("auto") => planetrack::Corners::Auto,
+            Some("rectangle") => planetrack::Corners::Rectangle,
+            Some("points") => planetrack::Corners::Points,
+            Some(other) => return Err(format!("camera.corners: \"rectangle\", \"points\" or \"auto\", not \"{other}\"")),
+        };
+        let solve = planetrack::solve(&track, (w, h), scale, offset, get_f64(cam, "fov"), get_f64(cam, "aspect"), get_f64(cam, "size"), corners_are)?;
         let compiled = self.compiled(&dir);
         let sc = compiled.scenes.iter().find(|s| &*s.id == scene).ok_or(format!("no scene '{scene}'"))?;
         // Source seconds → the scene's own time.
@@ -3361,12 +3367,16 @@ impl Toolbox {
         let errors: Vec<f64> = solve.cameras.iter().map(|c| c.2).collect();
         let rect = solve.rect.map(|p| [round(p[0]), round(p[1])]);
         out["camera"] = json!({
-            "scene": scene, "fov": round(solve.fov), "lens": solve.lens, "perspective": round(solve.strength),
+            "scene": scene, "fov": round(solve.fov), "lens": solve.lens, "perspective": round(solve.strength), "plane": solve.plane,
             "rect": rect, "rect_size": [round(rect[1][0] - rect[0][0]), round(rect[3][1] - rect[0][1])], "aspect": round(solve.aspect),
+            "points": solve.points.map(|p| [round(p[0]), round(p[1])]),
             "frames": solve.cameras.len(),
             "error_px": {"mean": round(errors.iter().sum::<f64>() / errors.len().max(1) as f64), "worst": round(errors.iter().copied().fold(0.0, f64::max))},
         });
         out["footage"] = json!({"space": "screen", "size": [round(sw * scale), round(sh * scale)], "position": [round(offset[0] + sw * scale / 2.0), round(offset[1] + sh * scale / 2.0)]});
+        if errors.iter().sum::<f64>() / errors.len().max(1) as f64 > 2.0 {
+            out["camera"]["warning"] = json!("the camera does not fit the track well (see error_px): the corners are not a real rectangle's and the camera's motion did not settle how the surface lies. Things placed will slide. Mark the corners of a real rectangle on the surface, or give camera.fov");
+        }
         if solve.lens == "assumed" {
             out["camera"]["note"] = json!("the rectangle is seen too squarely to measure the lens: 39.6° was assumed; give camera.fov, or camera.aspect (the rectangle's real width ÷ height), for the true one");
         }

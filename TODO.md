@@ -138,9 +138,9 @@ in), since none of it can be seen from a container:
 Since (its own section, "Tracking footage"): a plane in a video is
 followed with no model and the scene camera solved from it, so a 3D
 thing stands on a table that is in the footage (`track_plane`; run on
-five real clips as well as made-up ones). Left there: the surface's
-tilt from the camera's motion where there is no rectangle to mark, the
-editor's side, then mattes, a depth and a normal pass and lighting
+five real clips as well as made-up ones; on a surface with no
+rectangle to mark, how it lies is read from the camera's own motion).
+Left there: the editor's side, then mattes, a depth and a normal pass and lighting
 footage with the scene's lights, which need models and the owner's
 word on their licences.
 
@@ -2306,11 +2306,13 @@ scene camera for known 3D points in one frame), the plane's homography
   with a scene the camera's keys for every frame. In the tool list,
   the docs ("Things placed in footage") and the editor agent's
   instructions.
-- Tests: 15 in `motion-track` on made-up footage with the answer known
+- Tests: 17 in `motion-track` on made-up footage with the answer known
   (a plane that slides, turns, grows and tilts; backwards; a changing
   light with a block crossing; a patterned thing crossing; 25 px a
   frame; a push in to three and five times; a cut away and back; a
-  still camera against one that moved); three end to end in
+  still camera against one that moved; the tilt and the lens from a
+  camera moving, and none claimed from one that only turns); three end
+  to end in
   `motion-mcp` (a table drawn by the engine under a moving camera:
   corners within 0.24 px of 1280, the lens 44.99° for 45°, a point
   above the table within 0.17 px; the same shaken, blurred, noisy,
@@ -2348,14 +2350,27 @@ is still.
 
 ### Left, in the order it would be done
 
-1. **The surface's tilt from the camera's own motion**, for a surface
-   with no rectangle on it (a worktop, a round table). Four points
-   that only look square give no camera: on the worktop, 10 to 40 px
-   of error whatever the lens. With the camera moving, the tracked
-   homographies say how the plane lies (the one tilt for which the
-   marked points keep one shape in every frame), and with enough turn
-   the lens too. No model. Without it, placing something on real
-   footage needs a real rectangle to mark.
+1. Done: **the surface's tilt from the camera's own motion**
+   (`motion-track`'s `tilt`), for a surface with no rectangle on it (a
+   worktop, a round table). Four points that only look square, taken
+   as a rectangle, give no camera: on the worktop, 10 to 40 px of
+   error whatever the lens. With the camera changing its place there
+   is one tilt for which the marked points keep one shape in every
+   frame; it is searched (and the lens with it, unless given), and
+   `track_plane` turns to it by itself when the corners do not fit a
+   rectangle (`camera.plane`: "rectangle" or "motion"). On the engine's
+   shot: lens 46.6° for 45°, the points within 0.18 px, a point 150 px
+   above the table within 5 px (0.17 px with a real rectangle: the
+   plane is right, the lens rough). On the hand-held worktop clip the
+   solved camera fits the four tracked points to 0.25 px on average
+   and 0.46 at worst, and two regions marked apart give the lens as
+   31° and 32°. A box, a ball and a cylinder were stood on that
+   worktop and looked at over the five seconds: they stay where they
+   stand, with their shadows; where the box goes behind the apple it
+   is drawn over it (no matte yet, item 3). A camera that only turns
+   says nothing of the tilt, and the tool says so. Left: the lens from
+   motion is rough (four points say little of it): a better one from
+   the whole region's points, or from Depth Pro on one frame (item 4).
 2. **In the editor**: click a surface in the preview to mark it (snap
    to a corner near the click), see the track over the footage, track
    from the prompt bar ("put the mug on the table"), a bar while it

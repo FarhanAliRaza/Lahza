@@ -180,7 +180,12 @@ How it follows:
 - **A camera on a tripod settles a blank surface.** A white table with cups and hands on it has nothing of its own to follow. When the scene behind has not moved since the marked frame, the corners stay where they were marked (`camera_still_frames`). Say `moving: true` when the surface itself moves in the scene (a thing carried, a held screen).
 - **It says when it does not know.** A frame where the surface cannot be matched (a cut away, the region out of frame) is `lost`, and the track picks up when it comes back. With a moving camera and a surface that has little of its own on it (`texture`), the result carries a `warning`.
 
-With `camera: {scene}` it also solves the scene's camera for every frame. The lens is measured from the rectangle's perspective (or given as `fov`; when the rectangle is seen too squarely to tell, 39.6° is assumed and the result says so). The marked rectangle becomes `camera.rect` on the scene's z = 0:
+With `camera: {scene}` it also solves the scene's camera for every frame. How the surface lies comes from one of two things, and `camera.plane` says which:
+
+- **`rectangle`**: the marked corners are a real rectangle's. Its perspective gives the lens (or give `fov`; when it is seen too squarely to tell, 39.6° is assumed and the result says so). One frame is enough, so this also works under a still camera.
+- **`motion`**: the surface has no rectangle on it (a worktop, a round table), so any four points on it were marked, well apart. While the camera changes its place, there is one tilt of the surface for which the four points keep one shape in every frame; that tilt is found, and the lens with it. It is tried by itself when the corners do not fit a rectangle. The plane comes out well (the points within a fraction of a pixel); the lens only roughly, so things standing tall are a little off unless `fov` is given. A camera that only turns on the spot says nothing of the tilt, and the tool says so.
+
+The marked shape becomes `camera.points` on the scene's z = 0, with `camera.rect` the box round them:
 
 - keep the footage's video layer in `"space": "screen"`, drawn as the result's `footage` says;
 - put 3D layers on the rectangle. Toward the viewer is −z, so a box `depth` deep sits at `z: -depth / 2`;
@@ -199,7 +204,8 @@ Measured, on a cloud container's CPU, decoding included:
 |---|---|
 | The engine's own shot, 1280 × 720, H.264 | corners within 0.24 px, lens 44.99° for 45°, a point standing above the table within 0.17 px; about 50 frames a second |
 | The same with a shaking camera, motion blur, noise, a small bitrate and an arm crossing the table | every frame found; corners 0.7 px off on average, 1.4 px at worst |
-| A hand-held phone shot of a stone worktop with an apple on it (1296 × 720, 10 fps, 5 s) | every frame found; 0.4 px of slip over any second, about 1 px from the marked frame after 4.8 s; 50 frames a second |
+| The same shot from four points that are no rectangle's, by the camera's motion | lens 46.6° for 45°; the points within 0.18 px, a point 150 px above the table within 5 px |
+| A hand-held phone shot of a stone worktop with an apple on it (1296 × 720, 10 fps, 5 s) | every frame found; 0.4 px of slip over any second, about 1 px from the marked frame after 4.8 s; 50 frames a second. Camera by motion from four points: it fits them to 0.25 px on average, 0.46 at worst; two regions marked apart give the lens as 31° and 32° |
 | A wall behind children jumping, the camera pushing in (960 × 540, 200 frames) | every frame found; 0.4 px of slip over any ten frames, 1.2 px at worst |
 | Three tripod shots of a table with hands, cups, blocks and a kettle moving on it, two of the tables blank white | corners held where marked, to 0.1 px |
 
@@ -208,7 +214,7 @@ The real clips are demo footage of two public research repositories; they are no
 Limits:
 
 - One plane per scene (the camera is what moves).
-- The camera needs a real rectangle on the surface. Four points that only look square give no usable camera (on the worktop above, 10 to 40 px of error): the surface's tilt would have to come from the camera's own motion, which is not done yet.
+- Under a still camera the surface needs a real rectangle to mark (four points that only look square, taken as one, were 10 to 40 px off on the worktop above). Under a moving one any four points do, with a rougher lens.
 - A surface with nothing of its own on it, under a moving camera, cannot be followed by its look.
 - The track follows from where the last frame was, so it does not find a surface again in a different shot of it.
 - Nothing yet hides a placed object behind what passes in front of it (that needs a matte), and footage is not relit.

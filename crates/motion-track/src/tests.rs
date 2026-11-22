@@ -483,3 +483,67 @@ fn measure_the_cost_of_a_frame() {
     let ms = start.elapsed().as_secs_f64() * 1000.0 / 120.0;
     println!("{ms:.2} ms a frame at 640 x 360 ({:.0} frames a second), worst corner {worst_error:.3} px, {} retakes", 1000.0 / ms, tracker.rekeys);
 }
+
+// ---------------------------------------------------------------- tilt
+
+/// Four points of no particular shape on a plane, seen from places a
+/// camera moved through, each half a pixel off: with the lens known the
+/// plane's normal comes back within a degree; with the lens searched
+/// too, within two degrees, and the lens itself only roughly (within an
+/// eighth: four points say little of it).
+#[test]
+fn the_tilt_and_the_lens_come_from_the_camera_moving() {
+    use crate::tilt;
+    let (centre, height, f) = ([960.0, 540.0], 1080.0, 1400.0);
+    let world: Quad = [[-140.0, -90.0], [170.0, -120.0], [120.0, 110.0], [-160.0, 60.0]];
+    let mut views = Vec::new();
+    let mut first = None;
+    for i in 0..24 {
+        let a = i as f64;
+        // The camera goes round the points and in, and looks at them.
+        let pose = rect::Pose { r: mul(rot_z(a * 0.4), mul(rot_x(52.0 - a * 0.5), rot_y(-22.0 + a * 1.8))), t: [30.0 - a * 3.0, 15.0 + a, 900.0 - a * 9.0] };
+        first.get_or_insert(pose);
+        views.push(std::array::from_fn(|k| {
+            let p = pose.project([world[k][0], world[k][1], 0.0], centre, f).unwrap();
+            [p[0] + hash(i, k as i64, 21) - 0.5, p[1] + hash(i, k as i64, 22) - 0.5]
+        }));
+    }
+    // The plane's normal toward the camera, in the first view's space.
+    let r = first.unwrap().r;
+    let truth = [-r[0][2], -r[1][2], -r[2][2]];
+    let angle = |n: [f64; 3]| (n[0] * truth[0] + n[1] * truth[1] + n[2] * truth[2]).clamp(-1.0, 1.0).acos().to_degrees();
+    // The lens known.
+    let known = tilt::from_motion(&views, 0, centre, height, Some(f)).unwrap();
+    assert!(known.sure(), "{known:?}");
+    assert!(angle(known.normal) < 1.0, "{:.2}° off: {known:?}", angle(known.normal));
+    // The lens searched too.
+    let found = tilt::from_motion(&views, 0, centre, height, None).unwrap();
+    assert!(found.sure(), "{found:?}");
+    assert!(angle(found.normal) < 2.0, "{:.2}° off: {found:?}", angle(found.normal));
+    assert!((found.focal - f).abs() / f < 0.125, "lens {} for {f}", found.focal);
+    // The shape is the points' own, up to its size and a turn: its sides
+    // are in the world's proportions.
+    let side = |q: &Quad, k: usize| ((q[k][0] - q[(k + 1) % 4][0]).powi(2) + (q[k][1] - q[(k + 1) % 4][1]).powi(2)).sqrt();
+    for k in 1..4 {
+        let (got, want) = (side(&known.shape, k) / side(&known.shape, 0), side(&world, k) / side(&world, 0));
+        assert!((got - want).abs() < 0.02, "side {k}: {got:.3} for {want:.3}");
+    }
+}
+
+/// A camera that only turns on the spot shows nothing of the tilt: no
+/// claim is made.
+#[test]
+fn a_camera_turning_on_the_spot_says_nothing_of_the_tilt() {
+    use crate::tilt;
+    let (centre, height, f) = ([960.0, 540.0], 1080.0, 1400.0);
+    let world: Quad = [[-140.0, -90.0], [170.0, -120.0], [120.0, 110.0], [-160.0, 60.0]];
+    let base = rect::Pose { r: mul(rot_x(50.0), rot_y(-15.0)), t: [20.0, 10.0, 900.0] };
+    let views: Vec<Quad> = (0..20).map(|i| {
+        // The same place, the camera turned: every point's ray turned.
+        let turn = mul(rot_y(i as f64 * 0.6), rot_x(i as f64 * 0.3));
+        let pose = rect::Pose { r: mul(turn, base.r), t: std::array::from_fn(|r| (0..3).map(|c| turn[r][c] * base.t[c]).sum()) };
+        std::array::from_fn(|k| pose.project([world[k][0], world[k][1], 0.0], centre, f).unwrap())
+    }).collect();
+    let got = tilt::from_motion(&views, 0, centre, height, Some(f)).unwrap();
+    assert!(!got.sure(), "{got:?}");
+}

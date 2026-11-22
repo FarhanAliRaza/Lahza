@@ -198,14 +198,22 @@ pub fn track(video: &Path, corners: Quad, at: f64, from: f64, to: Option<f64>, w
 /// The scene camera a track implies.
 pub struct Solve {
     pub fov: f64,
-    /// "given", "measured" (from the rectangle's perspective) or
-    /// "assumed" (the rectangle is seen too squarely to tell).
+    /// "given", "measured" (from the rectangle's perspective, or from
+    /// the camera's motion) or "assumed" (neither could tell).
     pub lens: &'static str,
-    /// How much perspective the measure rests on (see `rect::Lens`).
+    /// How much perspective the rectangle's measure rests on (see
+    /// `rect::Lens`).
     pub strength: f64,
-    /// The real rectangle's width ÷ height.
+    /// How the surface's lie was read: "rectangle" (the marked corners
+    /// are a real rectangle's) or "motion" (four points of no known
+    /// shape, the tilt from the camera's own motion).
+    pub plane: &'static str,
+    /// The marked shape's width ÷ height on the surface (a rectangle's
+    /// proportions; for points, their bounding box's).
     pub aspect: f64,
-    /// The rectangle on the scene's z = 0, corners in the order marked.
+    /// The marked corners on the scene's z = 0, in the order marked.
+    pub points: Quad,
+    /// The rectangle round them on z = 0 (the same when they are one).
     pub rect: Quad,
     /// One camera per frame found: (index into the track's frames, the
     /// camera, reprojection error in canvas pixels).
@@ -215,13 +223,52 @@ pub struct Solve {
 /// Perspective under this says too little about the lens.
 const MIN_STRENGTH: f64 = 0.004;
 
+/// What the corners are taken to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Corners {
+    /// A real rectangle's, if that fits the track; else four points.
+    Auto,
+    Rectangle,
+    /// Four points on the surface, of no known shape.
+    Points,
+}
+
 /// Solves the camera for a track. The footage is taken to be drawn at
 /// `scale` canvas pixels per source pixel with its corner at `offset`
-/// (as a screen-space layer). `size`: the rectangle's height in the
+/// (as a screen-space layer). `size`: the marked shape's height in the
 /// scene (default: what makes the camera stand at its natural distance
 /// on the marked frame, dolly 0).
+///
+/// The surface's lie comes from the marked corners being a rectangle's
+/// (one frame is enough), or, when they are not, from the camera's own
+/// motion (`tilt`), which needs the camera to have changed its place.
 #[allow(clippy::too_many_arguments)]
-pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov: Option<f64>, aspect: Option<f64>, size: Option<f64>) -> Result<Solve, String> {
+pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov: Option<f64>, aspect: Option<f64>, size: Option<f64>, corners: Corners) -> Result<Solve, String> {
+    let rectangle = if corners == Corners::Points { None } else { Some(solve_as(track, canvas, scale, offset, fov, aspect, size, false, false)) };
+    // A real rectangle's corners leave next to nothing; four points that
+    // are not one cannot be seen as one from every frame.
+    let fits = |s: &Solve| s.cameras.iter().map(|c| c.2).sum::<f64>() / s.cameras.len().max(1) as f64;
+    match (corners, rectangle) {
+        (Corners::Rectangle, Some(r)) => r,
+        (Corners::Auto, Some(Ok(r))) if fits(&r) <= 1.0 => Ok(r),
+        (_, rectangle) => {
+            // Asked for points, the motion has to settle the tilt; as a
+            // second try after a rectangle that does not fit, it only has
+            // to fit much better (a lens given a little wrong leaves both
+            // off, the rectangle far more).
+            let by_motion = solve_as(track, canvas, scale, offset, fov, aspect, size, true, corners == Corners::Auto);
+            match (rectangle, by_motion) {
+                (Some(Ok(r)), Ok(m)) => Ok(if fits(&m) < fits(&r) * 0.5 { m } else { r }),
+                (_, Ok(m)) => Ok(m),
+                (Some(r), Err(_)) => r,
+                (None, Err(e)) => Err(e),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_as(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fov: Option<f64>, aspect: Option<f64>, size: Option<f64>, by_motion: bool, unsure_too: bool) -> Result<Solve, String> {
     let (w, h) = canvas;
     let centre = [w / 2.0, h / 2.0];
     // Clockwise as seen, so the scene's −z is the side the camera is on.
@@ -231,34 +278,67 @@ pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fo
         if clockwise { q } else { [q[0], q[3], q[2], q[1]] }
     };
     let found: Vec<usize> = (0..track.frames.len()).filter(|&i| track.frames[i].found).collect();
-    // The lens, from up to a hundred and twenty views spread over the track.
+    // Up to a hundred and twenty views spread over the track.
     let step = (found.len() / 120).max(1);
     let views: Vec<Quad> = found.iter().step_by(step).map(|&i| on_canvas(&track.frames[i])).collect();
-    let measured = rect::focal(&views, centre, h, aspect);
-    let (focal, lens, strength) = match (fov, measured) {
-        (Some(fov), m) => (space::focal(h, fov), "given", m.map_or(0.0, |m| m.strength)),
-        (None, Some(m)) if m.strength >= MIN_STRENGTH => (m.focal, "measured", m.strength),
-        (None, m) => (space::focal(h, 39.6), "assumed", m.map_or(0.0, |m| m.strength)),
+    let marked = on_canvas(&track.frames[track.marked]);
+    // The marked shape on the surface, one unit tall, about its middle;
+    // and the lens.
+    let (focal, lens, strength, unit): (f64, &'static str, f64, Quad) = if by_motion {
+        if track.still + 1 >= track.frames.len() {
+            return Err("the camera does not move, so nothing says how the surface lies: mark the corners of a real rectangle on it".into());
+        }
+        let known = fov.map(|fov| space::focal(h, fov));
+        let mut all = views.clone();
+        all.push(marked);
+        let tilt = lahza_motion_track::tilt::from_motion(&all, all.len() - 1, centre, h, known).ok_or("the surface's tilt could not be read from the track")?;
+        if !tilt.sure() && !unsure_too {
+            // The tilt stands out but nothing fits: the lens is wrong.
+            if fov.is_some() && tilt.other > 4.0 * tilt.error {
+                return Err(format!("with the lens given, no way the surface could lie fits the track (the best leaves {:.1} px): leave \"fov\" out to have it measured from the camera's motion", tilt.error));
+            }
+            return Err(format!("the camera's motion does not say how the surface lies (the best tilt leaves {:.2} px, a typical other {:.2} px): it has to change its place, not only turn. Mark the corners of a real rectangle on the surface instead", tilt.error, tilt.other));
+        }
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for p in &tilt.shape {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let tall = (hi[1] - lo[1]).max(1e-9);
+        let unit = tilt.shape.map(|p| [(p[0] - (lo[0] + hi[0]) / 2.0) / tall, (p[1] - (lo[1] + hi[1]) / 2.0) / tall]);
+        (tilt.focal, if fov.is_some() { "given" } else { "measured" }, 0.0, unit)
+    } else {
+        let measured = rect::focal(&views, centre, h, aspect);
+        let (focal, lens, strength) = match (fov, measured) {
+            (Some(fov), m) => (space::focal(h, fov), "given", m.map_or(0.0, |m| m.strength)),
+            (None, Some(m)) if m.strength >= MIN_STRENGTH => (m.focal, "measured", m.strength),
+            (None, m) => (space::focal(h, 39.6), "assumed", m.map_or(0.0, |m| m.strength)),
+        };
+        let aspect = aspect.or_else(|| rect::aspect(&views, centre, h, focal)).filter(|a| a.is_finite() && *a > 0.01 && *a < 100.0).ok_or("the rectangle's proportions could not be read: give \"aspect\" (its real width ÷ height)")?;
+        (focal, lens, strength, [[-aspect / 2.0, -0.5], [aspect / 2.0, -0.5], [aspect / 2.0, 0.5], [-aspect / 2.0, 0.5]])
     };
     let fov = (2.0 * (h / 2.0 / focal).atan()).to_degrees();
     if !(1.0..=170.0).contains(&fov) {
         return Err(format!("the lens comes out at {fov:.1}° of view: give \"fov\""));
     }
-    let aspect = aspect.or_else(|| rect::aspect(&views, centre, h, focal)).filter(|a| a.is_finite() && *a > 0.01 && *a < 100.0).ok_or("the rectangle's proportions could not be read: give \"aspect\" (its real width ÷ height)")?;
-    // The rectangle in the scene, one unit tall first, to find the size
-    // at which the camera stands at its natural distance.
-    let marked = on_canvas(&track.frames[track.marked]);
-    let unit: Quad = [[-aspect / 2.0, -0.5], [aspect / 2.0, -0.5], [aspect / 2.0, 0.5], [-aspect / 2.0, 0.5]];
-    let pose = rect::pose(&unit, &marked, centre, focal).ok_or("the marked corners do not make a rectangle seen from in front")?;
+    let aspect = {
+        let (x, y) = (unit.iter().map(|p| p[0]), unit.iter().map(|p| p[1]));
+        (x.clone().fold(f64::MIN, f64::max) - x.fold(f64::MAX, f64::min)) / (y.clone().fold(f64::MIN, f64::max) - y.fold(f64::MAX, f64::min)).max(1e-9)
+    };
+    // The size at which the camera stands at its natural distance.
+    let pose = rect::pose(&unit, &marked, centre, focal).ok_or("the marked corners are not seen from in front")?;
     let size = match size {
         Some(s) if s > 0.0 => s,
         _ => {
-            let c = camfit::from_pose(pose.r, pose.t, w, h, fov).ok_or("the marked rectangle is seen edge on")?;
+            let c = camfit::from_pose(pose.r, pose.t, w, h, fov).ok_or("the marked surface is seen edge on")?;
             let distance = space::focal(h, fov) - c.dolly;
             space::focal(h, fov) / distance.max(1e-9)
         }
     };
     let world: Quad = unit.map(|p| [centre[0] + p[0] * size, centre[1] + p[1] * size]);
+    let rect: Quad = [[centre[0] - aspect * size / 2.0, centre[1] - size / 2.0], [centre[0] + aspect * size / 2.0, centre[1] - size / 2.0], [centre[0] + aspect * size / 2.0, centre[1] + size / 2.0], [centre[0] - aspect * size / 2.0, centre[1] + size / 2.0]];
     let free = Free { fov: false, shift: false, roll: true, ..Free::default() };
     let mut cameras: Vec<(usize, CameraParams, f64)> = Vec::with_capacity(found.len());
     // From the marked frame outwards, each way, so every frame starts
@@ -300,5 +380,5 @@ pub fn solve(track: &Track, canvas: (f64, f64), scale: f64, offset: [f64; 2], fo
     if cameras.is_empty() {
         return Err("no frame of the track gave a camera".into());
     }
-    Ok(Solve { fov, lens, strength, aspect, rect: world, cameras })
+    Ok(Solve { fov, lens, strength, plane: if by_motion { "motion" } else { "rectangle" }, aspect, points: world, rect, cameras })
 }

@@ -1168,6 +1168,7 @@ fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
     eprintln!("corners within {worst:.2} px of 1280; {} frames a second; lens {} at {}°; camera error {}", out["frames_per_second"], out["camera"]["lens"], out["camera"]["fov"], out["camera"]["error_px"]);
     assert!(worst < 0.6, "corners up to {worst:.2} px off");
     assert_eq!(out["camera"]["lens"], "measured", "{}", out["camera"]);
+    assert_eq!(out["camera"]["plane"], "rectangle", "{}", out["camera"]);
     let fov = out["camera"]["fov"].as_f64().unwrap();
     assert!((fov - 45.0).abs() < 1.0, "lens {fov}°, the shot's is 45°");
     assert!((out["camera"]["aspect"].as_f64().unwrap() - 700.0 / 440.0).abs() < 0.05, "{}", out["camera"]);
@@ -1205,6 +1206,54 @@ fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
     eprintln!("the solved scene's rectangle within {worst_on:.2} px, a point above it within {worst_above:.2} px");
     assert!(worst_on < 0.8, "the scene's rectangle is up to {worst_on:.2} px from the table");
     assert!(worst_above < 1.5, "a point above the table is up to {worst_above:.2} px off");
+
+    // Four points on the table that are no rectangle's corners (a
+    // worktop has none to mark): how the table lies is read from the
+    // camera's own motion, and the lens with it, roughly.
+    let on_table = [[340.0, 190.0], [930.0, 160.0], [960.0, 520.0], [420.0, 560.0]];
+    let seen_points = |t: f64| on_table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap());
+    let out = tb.call("track_plane", json!({
+        "video": video.display().to_string(), "corners": seen_points(marked_at), "at": marked_at, "camera": {"scene": "s1"}, "apply": true
+    })).unwrap().json;
+    assert_eq!(out["found"], out["frames"]);
+    assert_eq!(out["camera"]["plane"], "motion", "{}", out["camera"]);
+    let fov = out["camera"]["fov"].as_f64().unwrap();
+    assert!((fov - 45.0).abs() < 5.0, "lens {fov}° from the camera's motion, the shot's is 45°");
+    assert!(out["camera"]["error_px"]["worst"].as_f64().unwrap() < 1.0, "{}", out["camera"]);
+    let scene: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("comp.lahza/scenes/s1.json")).unwrap()).unwrap();
+    let cam = &scene["camera"];
+    let at = |name: &str, i: usize| cam[name]["keys"][i]["v"].clone();
+    let points: Vec<[f64; 2]> = serde_json::from_value(out["camera"]["points"].clone()).unwrap();
+    // The solved scene is the table's at another size: by the ratio of
+    // the two shapes' longest sides.
+    let side = |q: &[[f64; 2]]| ((q[0][0] - q[1][0]).powi(2) + (q[0][1] - q[1][1]).powi(2)).sqrt();
+    let ratio = side(&points) / side(&on_table);
+    let mid = |q: &[[f64; 2]]| [q.iter().map(|p| p[0]).sum::<f64>() / 4.0, q.iter().map(|p| p[1]).sum::<f64>() / 4.0];
+    let (mt, ms) = (mid(&on_table), mid(&points));
+    let (mut worst_on, mut worst_above) = (0.0f64, 0.0f64);
+    for i in (0..frames.len()).step_by(7) {
+        let t = cam["orbit"]["keys"][i]["at"].as_f64().unwrap();
+        let (orbit, position) = (at("orbit", i), at("position", i));
+        let solved = CameraParams {
+            fov: cam["fov"].as_f64().unwrap(),
+            orbit: [orbit[0].as_f64().unwrap(), orbit[1].as_f64().unwrap()],
+            dolly: at("dolly", i).as_f64().unwrap(),
+            position: Some([position[0].as_f64().unwrap(), position[1].as_f64().unwrap()]),
+            shift: [0.0, 0.0],
+            rotation: at("rotation", i).as_f64().unwrap(),
+        };
+        let want = seen_points(t);
+        for k in 0..4 {
+            let got = project(&solved, w, h, [points[k][0], points[k][1], 0.0]).unwrap();
+            worst_on = worst_on.max(((got[0] - want[k][0]).powi(2) + (got[1] - want[k][1]).powi(2)).sqrt());
+        }
+        let top = project(&truth(t), w, h, [mt[0], mt[1], -150.0]).unwrap();
+        let got = project(&solved, w, h, [ms[0], ms[1], -150.0 * ratio]).unwrap();
+        worst_above = worst_above.max(((got[0] - top[0]).powi(2) + (got[1] - top[1]).powi(2)).sqrt());
+    }
+    eprintln!("from four points and the camera's motion: lens {fov:.1}°, the points within {worst_on:.2} px, a point above them within {worst_above:.2} px");
+    assert!(worst_on < 1.0, "the scene's points are up to {worst_on:.2} px from the table's");
+    assert!(worst_above < 8.0, "a point above the table is up to {worst_above:.2} px off");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
