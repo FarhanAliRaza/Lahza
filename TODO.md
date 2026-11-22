@@ -135,11 +135,14 @@ in), since none of it can be seen from a container:
 9. NVIDIA's licence for the Ray Reconstruction shim: to read and decide
    (packaging/ngx/README.md).
 
-Started since (its own section, "Tracking footage"): following a plane
-in a video with no model, the scene camera from it, so a 3D thing
-stands on a table that is in the footage; then mattes, a depth and a
-normal pass, and lighting footage with the scene's lights, which need
-models and the owner's word on their licences.
+Since (its own section, "Tracking footage"): a plane in a video is
+followed with no model and the scene camera solved from it, so a 3D
+thing stands on a table that is in the footage (`track_plane`; run on
+five real clips as well as made-up ones). Left there: the surface's
+tilt from the camera's motion where there is no rectangle to mark, the
+editor's side, then mattes, a depth and a normal pass and lighting
+footage with the scene's lights, which need models and the owner's
+word on their licences.
 
 Not done, and why:
 - A trained policy for ragdolls: a GPU simulator, motion capture and
@@ -2281,59 +2284,120 @@ scene camera for known 3D points in one frame), the plane's homography
 - Not worth it: the codec's motion vectors. ffmpeg gives them only
   after a full decode, so they save nothing, and they are noisy.
 
-### The plan: the cheapest thing that answers the request
+### Done: a plane followed with no model, and the camera from it
 
-1. **A plane track, with no model** (started; the first piece). A flat
-   region marked in one frame (four corners) is followed as one plane
-   by aligning the picture itself (all of the region's gradients, as
-   Mocha does, so a table with little on it still holds), coarse to
-   fine, against the marked frame so it does not drift. Out: the four
-   corners per frame, and how sure. A new crate with no GPU and no
-   model, at about 640 px wide.
-2. **The camera from the plane.** For "put it on the table" the whole
-   camera solve is not needed: the plane's corners per frame give the
-   camera against the table, with the focal length from the marked
-   rectangle itself. The scene camera gets keys (it has every freedom
-   needed: orbit, roll, dolly, position, field of view; `fit_camera`
-   gains roll), the footage stays in screen space, and whatever is 3D
-   in the scene stands on the plane, with a shadow catcher under it.
-3. **The tool and the words for the agent**: `track_plane` (video,
-   corners, the frame they were marked on, the range; `scene` for the
-   camera's keys as `edit_apply` ops), in the tool list, the docs and
-   the editor agent's instructions.
-4. **In the editor**: click a surface in the preview to mark it, see
-   the track over the footage, track from the prompt bar ("put the mug
-   on the table"), a bar while it runs.
-5. **Mattes for what passes in front** (a hand over the table) and for
+- `crates/motion-track`: a region marked in one frame (four corners)
+  followed as one plane by aligning the picture itself (every pixel
+  with some gradient, inverse compositional Gauss-Newton on the
+  homography, coarse to fine). Each frame is placed from the frame
+  before, then corrected by the marked frame's template while that
+  still matches closely; the template is taken again when it no longer
+  does. What covers the region is noted on a 24 × 24 grid and kept out
+  of the next step and of a retaken template. A region that grows or
+  shrinks is read from the matching level of the pyramid.
+- What a rectangle seen in perspective says (`rect`): the focal length
+  from its sides being at right angles, its proportions, the plane's
+  pose. `fit_camera`'s solver gained roll and a closed form from a
+  pose.
+- A still camera (`still`): the picture in blocks; under a tripod the
+  blocks showing the scene are unchanged whatever moves elsewhere.
+  Then a surface of the scene is where it was marked.
+- `track_plane` (tool) and `lahza motion track-plane`: the track, and
+  with a scene the camera's keys for every frame. In the tool list,
+  the docs ("Things placed in footage") and the editor agent's
+  instructions.
+- Tests: 15 in `motion-track` on made-up footage with the answer known
+  (a plane that slides, turns, grows and tilts; backwards; a changing
+  light with a block crossing; a patterned thing crossing; 25 px a
+  frame; a push in to three and five times; a cut away and back; a
+  still camera against one that moved); three end to end in
+  `motion-mcp` (a table drawn by the engine under a moving camera:
+  corners within 0.24 px of 1280, the lens 44.99° for 45°, a point
+  above the table within 0.17 px; the same shaken, blurred, noisy,
+  compressed and with an arm across it: 0.7 px on average, 1.4 at
+  worst; a blank table on a tripod with cups moved about: the corners
+  held). `examples/track/table.py` stands a box, a ball and a cylinder
+  on the tracked table (looked at).
+
+What real footage said (five clips, the demo footage of two public
+research repositories, fetched for the test and not kept in this
+repository; checked with `examples/track/verify.py`, which warps each
+frame's region back onto the marked one and measures what is left by a
+search of its own). The first version passed every made-up test and
+failed here, three ways, each now changed:
+- Against the marked frame alone, a hand-held shot of a worktop was
+  followed to 0.3 px for 1.6 s, then slipped as the view turned (the
+  match fell from 0.94 to 0.5 while every frame was still called
+  found), and a template retaken late kept 2.6 px of it. Neighbouring
+  frames matched at 0.99 throughout. So the step is now taken from the
+  frame before and the template only corrects it: 0.4 px of slip over
+  any second, about 1 px from the marked frame after 4.8 s.
+- Things moving inside the region (children in front of a wall) carried
+  the step off. Hence the cover grid, and a scale of the residuals
+  taken from their lower quartile (what covers up to two thirds of the
+  region does not reach it): 0.4 px over any ten frames, 1.2 at worst,
+  through 200 frames of a push in.
+- Two blank white tables under a tripod, with cups and a kettle moved
+  about on them, were "found" on every frame and ended 640 and 870 px
+  from where they were marked: the only things to follow were the
+  cups. Hence the still-camera test: all three tripod shots now hold
+  to 0.1 px.
+Speed on a cloud container's CPU, decoding included: 50 frames a
+second on the hand-held 1296 × 720 clip, 380 to 450 where the camera
+is still.
+
+### Left, in the order it would be done
+
+1. **The surface's tilt from the camera's own motion**, for a surface
+   with no rectangle on it (a worktop, a round table). Four points
+   that only look square give no camera: on the worktop, 10 to 40 px
+   of error whatever the lens. With the camera moving, the tracked
+   homographies say how the plane lies (the one tilt for which the
+   marked points keep one shape in every frame), and with enough turn
+   the lens too. No model. Without it, placing something on real
+   footage needs a real rectangle to mark.
+2. **In the editor**: click a surface in the preview to mark it (snap
+   to a corner near the click), see the track over the footage, track
+   from the prompt bar ("put the mug on the table"), a bar while it
+   runs.
+3. **Mattes for what passes in front** (a hand over the table) and for
    the person: a prompted model through `ort`, EdgeTAM or SAM 2 for a
    click, SAM 3.1 when the agent names the thing. Baked as a matte pass
-   beside the footage. Run on every Nth frame and carried between by
-   the tracked motion, if that holds up when measured.
-6. **A depth and a normal pass** for a clip: Video Depth Anything
+   beside the footage; also what would let a blank surface under a
+   moving camera, or things moving on a surface under a moving camera,
+   be followed (the matte kept out of the fit). The webcam's person
+   model (PPHumanSeg, bundled) is a first thing to try for people. Run
+   on every Nth frame and carried between by the tracked motion, if
+   that holds up when measured.
+4. **A depth and a normal pass** for a clip: Video Depth Anything
    Small, normals from the depth's slope, baked at half size. Depth
    Pro on one frame for the table's real distance and size (and the
    focal length, if its estimate is what is recalled).
-7. **A `relight` effect on a video layer**: the scene's own lights
+5. **A `relight` effect on a video layer**: the scene's own lights
    shade the footage through the normal pass, inside the matte.
-8. **A subject's track**: where the person is per frame (from the
+6. **A subject's track**: where the person is per frame (from the
    matte), as keys a light or a label follows.
-9. **A whole camera solve**, for a moving shot where things must hold
+7. **A whole camera solve**, for a moving shot where things must hold
    anywhere and not on one surface: point tracks and bundle adjustment
    with the people masked out, or MapAnything on a few frames with the
    tracks carrying the frames between.
-10. **Geometry from one frame**: SAM 3D Body for the person (better
-    normals, real shadows), SAM 3D Objects for the table. Both work a
-    frame at a time, so they jitter unless held to the tracks; no speed
-    was found for either. To try once 5 to 7 are there.
-11. **Tracks kept as a bake** (`track/<clip>…`, read as animated
-    values) in place of a key per frame, if keys prove heavy in a long
-    clip.
+8. **Geometry from one frame**: SAM 3D Body for the person (better
+   normals, real shadows), SAM 3D Objects for the table. Both work a
+   frame at a time, so they jitter unless held to the tracks; no speed
+   was found for either. To try once 3 to 5 are there.
+9. **Tracks kept as a bake** (`track/<clip>…`, read as animated
+   values) in place of a key per frame, if keys prove heavy in a long
+   clip. Also: the footage's own placement read from its layer (now
+   taken as fitted in the canvas, or given), a finer pass at the
+   source's size over the region, the corners smoothed over time if a
+   placed thing is seen to shimmer.
 
-What makes it fast: no camera solve where a plane is enough; one
-decode at a small size for every target; nothing tracked while the
-editor draws (a track is keys, or a bake); models on a few frames.
-None of this has a measured number yet: each item is to give its own,
-and to say whose machine it was.
+Not known yet, and for the owner's machine or footage: how it does on
+footage with fast pans and heavy motion blur, on a long clip (minutes),
+on a phone's rolling shutter while it shakes, on 4K; the thresholds
+(when the template is believed, when a camera is still) were set from
+five clips. Real clips are fetched from public GitHub repositories
+here; other hosts are closed to this environment.
 
 ### For the owner to decide
 

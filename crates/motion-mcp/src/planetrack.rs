@@ -10,6 +10,7 @@ use lahza_motion_core::camfit::{self, CameraParams, Free, Mark};
 use lahza_motion_core::space;
 use lahza_motion_track::image::Gray;
 use lahza_motion_track::plane::{Options, PlaneTracker};
+use lahza_motion_track::still::{StillTest, STILL};
 use lahza_motion_track::{convex, rect, signed_area2, Quad};
 use std::io::Read;
 use std::path::Path;
@@ -38,6 +39,12 @@ pub struct Track {
     pub marked: usize,
     /// Times the template was taken again (each adds a little drift).
     pub retakes: usize,
+    /// Frames on which the camera had not moved since the marked frame:
+    /// the corners are the marked ones there.
+    pub still: usize,
+    /// How much of the region has something on it (0–1, see
+    /// `PlaneTracker::texture`).
+    pub texture: f64,
     /// Seconds spent, decoding included.
     pub seconds: f64,
 }
@@ -56,9 +63,34 @@ fn analysis_width(source: u32, quad: &Quad) -> u32 {
     (((source as f64 * scale / 2.0).round() as u32) * 2).clamp(16, source.max(16)).min(1920)
 }
 
+/// A surface with this much of its own on it (`PlaneTracker::texture`)
+/// is followed by its look even under a still camera: its own track is
+/// then finer than "it has not moved".
+const TEXTURED: f64 = 0.6;
+
+/// One frame. Under a still camera (`stood`) a surface with little of
+/// its own on it is where it was marked (None: the marked corners); one
+/// with texture is followed all the same, and held only if that fails.
+fn one(tracker: &mut PlaneTracker, frame: &Gray, stood: bool, texture: f64) -> Option<lahza_motion_track::plane::Sample> {
+    if stood && texture < TEXTURED {
+        tracker.hold(frame);
+        return None;
+    }
+    let s = tracker.step(frame);
+    if stood && !s.found {
+        tracker.hold(frame);
+        return None;
+    }
+    Some(s)
+}
+
 /// Follows `corners` (source pixels, on the frame at `at` seconds) from
-/// `from` to `to`.
-pub fn track(video: &Path, corners: Quad, at: f64, from: f64, to: Option<f64>, width: Option<u32>, opts: Options) -> Result<Track, String> {
+/// `from` to `to`. On a frame where the camera has not moved since the
+/// marked frame the corners are the marked ones, unless `moving` says
+/// the surface itself moves in the scene (a thing carried, a held
+/// screen), when only its own look is followed.
+#[allow(clippy::too_many_arguments)]
+pub fn track(video: &Path, corners: Quad, at: f64, from: f64, to: Option<f64>, width: Option<u32>, moving: bool, opts: Options) -> Result<Track, String> {
     let started = std::time::Instant::now();
     let info = probe(video)?;
     if info.width == 0 || info.height == 0 {
@@ -110,24 +142,48 @@ pub fn track(video: &Path, corners: Quad, at: f64, from: f64, to: Option<f64>, w
     let mut back: Vec<Vec<u8>> = Vec::with_capacity(marked);
     let mut buf = vec![0u8; wu * hu];
     let mut tracker: Option<PlaneTracker> = None;
-    let mut retakes = 0;
+    let mut still_test: Option<StillTest> = None;
+    let (mut retakes, mut still, mut texture) = (0, 0usize, 0.0);
+    let held = |i: usize| Frame { frame: first + i as i64, t: (first + i as i64) as f64 / info.fps.max(1e-6), found: true, corners, score: 1.0, agree: 1.0, visible: 1.0 };
     let mut i = 0usize;
     while out.read_exact(&mut buf).is_ok() {
         if i < marked {
             back.push(buf.clone());
         } else if i == marked {
             let frame = Gray::from_luma8(wu, hu, &buf);
+            let test = (!moving).then(|| StillTest::new(&frame));
             // Backwards first, over the frames kept.
             let mut backwards = PlaneTracker::new(&frame, quad, opts)?;
-            let mut before: Vec<Frame> = back.iter().enumerate().rev().map(|(k, b)| sample(k, backwards.step(&Gray::from_luma8(wu, hu, b)))).collect();
+            texture = backwards.texture();
+            let mut before: Vec<Frame> = Vec::with_capacity(back.len());
+            for (k, b) in back.iter().enumerate().rev() {
+                let g = Gray::from_luma8(wu, hu, b);
+                let stood = test.as_ref().is_some_and(|t| t.share(&g) >= STILL);
+                still += stood as usize;
+                before.push(match one(&mut backwards, &g, stood, texture) {
+                    Some(s) => sample(k, s),
+                    None => held(k),
+                });
+            }
             before.reverse();
             retakes += backwards.rekeys;
             back = Vec::new();
             frames = before;
-            frames.push(Frame { frame: first + i as i64, t: (first + i as i64) as f64 / info.fps.max(1e-6), found: true, corners, score: 1.0, agree: 1.0, visible: 1.0 });
+            frames.push(held(i));
             tracker = Some(PlaneTracker::new(&frame, quad, opts)?);
+            still_test = test;
         } else if let Some(tracker) = tracker.as_mut() {
-            frames.push(sample(i, tracker.step(&Gray::from_luma8(wu, hu, &buf))));
+            let g = Gray::from_luma8(wu, hu, &buf);
+            let share = still_test.as_ref().map_or(0.0, |t| t.share(&g));
+            if std::env::var_os("LAHZA_TRACK_DEBUG").is_some() {
+                eprintln!("still: frame {i} share {share:.3}");
+            }
+            let stood = share >= STILL;
+            still += stood as usize;
+            frames.push(match one(tracker, &g, stood, texture) {
+                Some(s) => sample(i, s),
+                None => held(i),
+            });
         }
         i += 1;
     }
@@ -136,7 +192,7 @@ pub fn track(video: &Path, corners: Quad, at: f64, from: f64, to: Option<f64>, w
         return Err(if i == 0 { format!("{}: no frames could be read from {from} s", video.display()) } else { format!("the video ends before the marked frame ({at} s)") });
     };
     retakes += tracker.rekeys;
-    Ok(Track { info, size: (w, h), frames, marked, retakes, seconds: started.elapsed().as_secs_f64() })
+    Ok(Track { info, size: (w, h), frames, marked, retakes, still, texture, seconds: started.elapsed().as_secs_f64() })
 }
 
 /// The scene camera a track implies.

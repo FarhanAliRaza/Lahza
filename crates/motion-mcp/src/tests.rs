@@ -1207,3 +1207,151 @@ fn a_plane_tracked_in_footage_gives_the_scene_its_camera() {
     assert!(worst_above < 1.5, "a point above the table is up to {worst_above:.2} px off");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// track_plane on a harder shot, as near to a hand-held camera's footage
+/// as the engine and ffmpeg make: the camera shakes on its way, with
+/// motion blur; an arm sweeps over the table; then the video is given
+/// sensor noise, a drifting exposure and a small bitrate. Every frame
+/// is still found, and the corners stay within two and a half pixels of
+/// 1280 (measured: 1.4 at worst, 0.7 on average; the shake, the blur and
+/// the arm alone leave 0.9 and 0.5, and twice the noise at a third of
+/// the bitrate 2.5 and 1.2).
+#[test]
+fn a_shaky_noisy_shot_with_an_arm_over_the_table_is_followed() {
+    use lahza_motion_core::camfit::{project, CameraParams};
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("trackhard");
+    let (w, h, seconds) = (1280.0, 720.0, 2.0);
+    tb.call("project_create", json!({"path": "shot", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    std::fs::create_dir_all(dir.join("shot.lahza/assets")).unwrap();
+    table_png(&dir.join("shot.lahza/assets/table.png"), 700, 440);
+    table_png(&dir.join("shot.lahza/assets/floor.png"), 2000, 1400);
+    // A key every fifth of a second: the move, and a shake on it.
+    let shake = |i: usize, s: u64| -> f64 {
+        let mut v = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ s.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        v ^= v >> 29;
+        v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        v ^= v >> 32;
+        (v >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+    };
+    let steps = 10usize;
+    let cams: Vec<CameraParams> = (0..=steps).map(|i| {
+        let k = i as f64 / steps as f64;
+        CameraParams {
+            fov: 45.0,
+            orbit: [-14.0 + 26.0 * k + 1.2 * shake(i, 1), -56.0 + 8.0 * k + 1.0 * shake(i, 2)],
+            dolly: 110.0 * k + 15.0 * shake(i, 3),
+            position: Some([600.0 + 80.0 * k + 10.0 * shake(i, 4), 380.0 - 30.0 * k + 8.0 * shake(i, 5)]),
+            shift: [0.0, 0.0],
+            rotation: -3.0 + 7.0 * k + 0.8 * shake(i, 6),
+        }
+    }).collect();
+    let truth = |t: f64| -> CameraParams {
+        let x = (t / seconds * steps as f64).clamp(0.0, steps as f64);
+        let i = (x.floor() as usize).min(steps - 1);
+        let (a, b, f) = (cams[i], cams[i + 1], x - i as f64);
+        let mix = |a: f64, b: f64| a + (b - a) * f;
+        let (pa, pb) = (a.position.unwrap(), b.position.unwrap());
+        CameraParams { fov: 45.0, orbit: [mix(a.orbit[0], b.orbit[0]), mix(a.orbit[1], b.orbit[1])], dolly: mix(a.dolly, b.dolly), position: Some([mix(pa[0], pb[0]), mix(pa[1], pb[1])]), shift: [0.0, 0.0], rotation: mix(a.rotation, b.rotation) }
+    };
+    let key = |f: &dyn Fn(&CameraParams) -> serde_json::Value| json!({"keys": cams.iter().enumerate().map(|(i, c)| json!({"at": seconds * i as f64 / steps as f64, "v": f(c)})).collect::<Vec<_>>()});
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "background": "#2a2f3a", "motion_blur": {"shutter": 180, "samples": 6}},
+        {"op": "set", "target": "s1.camera", "value": {
+            "fov": 45, "orbit": key(&|c| json!(c.orbit)), "dolly": key(&|c| json!(c.dolly)),
+            "position": key(&|c| json!(c.position)), "rotation": key(&|c| json!(c.rotation))}},
+        {"op": "add", "id": "floor", "kind": "image", "src": "assets/floor.png", "three_d": true,
+         "transform": {"position": [640, 360], "z": 260, "opacity": 0.55}},
+        {"op": "add", "id": "table", "kind": "image", "src": "assets/table.png", "three_d": true, "transform": {"position": [640, 360]}},
+        // An arm across the picture, over the table from 0.6 s to 1.5 s.
+        {"op": "add", "id": "arm", "kind": "shape", "shape": "capsule", "size": [560, 120], "fill": "#3b2a22", "space": "screen",
+         "transform": {"rotation": -28, "position": {"keys": [{"at": 0.45, "v": [-200, 760]}, {"at": 1.7, "v": [1350, 80]}]}}}
+    ]})).unwrap();
+    tb.call("render", json!({"output": "clean.mp4", "wait": true, "audio": false})).unwrap();
+    // What a small sensor and a small bitrate add.
+    let video = dir.join("shot.mp4");
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"]).arg(dir.join("clean.mp4"))
+        .args(["-vf", "noise=alls=8:allf=t,eq=brightness='0.07*sin(2.4*t)':contrast='1+0.12*sin(1.7*t)'", "-c:v", "libx264", "-crf", "26", "-pix_fmt", "yuv420p"]).arg(&video)
+        .status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("skipping: this ffmpeg has no libx264, noise or eq");
+        return;
+    }
+    let table = [[290.0, 140.0], [990.0, 140.0], [990.0, 580.0], [290.0, 580.0]];
+    let seen = |t: f64| table.map(|p| project(&truth(t), w, h, [p[0], p[1], 0.0]).unwrap());
+    let marked_at = 0.2;
+    tb.call("project_create", json!({"path": "comp", "duration": seconds, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    tb.call("edit_apply", json!({"ops": [{"op": "add_scene", "id": "s1"}]})).unwrap();
+    let out = tb.call("track_plane", json!({"video": video.display().to_string(), "corners": seen(marked_at), "at": marked_at, "detail": true, "camera": {"scene": "s1"}})).unwrap().json;
+    let frames = out["track"].as_array().unwrap();
+    let (mut worst, mut sum, mut n, mut least) = (0.0f64, 0.0f64, 0usize, 1.0f64);
+    for f in frames.iter().filter(|f| f["found"] == true) {
+        let want = seen(f["t"].as_f64().unwrap());
+        let mut e = 0.0f64;
+        for k in 0..4 {
+            let got = [f["corners"][k][0].as_f64().unwrap(), f["corners"][k][1].as_f64().unwrap()];
+            e = e.max(((got[0] - want[k][0]).powi(2) + (got[1] - want[k][1]).powi(2)).sqrt());
+        }
+        worst = worst.max(e);
+        sum += e;
+        n += 1;
+        least = least.min(f["match"].as_f64().unwrap());
+    }
+    eprintln!("found {} of {}; lost {}; corners worst {worst:.2} px, mean {:.2} px of 1280; least match {least:.2}; lens {} at {}°; {} frames a second", out["found"], out["frames"], out["lost"], sum / n.max(1) as f64, out["camera"]["lens"], out["camera"]["fov"], out["frames_per_second"]);
+    assert_eq!(out["found"], out["frames"], "lost {}", out["lost"]);
+    assert!(worst < 2.5 && sum / (n as f64) < 1.2, "corners up to {worst:.2} px off, {:.2} px on average", sum / n as f64);
+    assert!(least < 0.9, "the arm should show as pixels that do not match: least {least:.2}");
+    let fov = out["camera"]["fov"].as_f64().unwrap();
+    assert!((fov - 45.0).abs() < 2.0, "lens {fov}°, the shot's is 45°");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tripod shot of a blank table with things moved about on it: the
+/// surface has nothing of its own to follow, and followed by its look it
+/// would go where the things go. The camera is seen to be still, so the
+/// corners stay where they were marked; told that the surface itself
+/// moves, the tool follows the look instead.
+#[test]
+fn a_blank_table_under_a_still_camera_stays_where_it_was_marked() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: ffmpeg is not installed");
+        return;
+    }
+    let (mut tb, dir) = toolbox("trackstill");
+    tb.call("project_create", json!({"path": "shot", "duration": 2, "width": 1280, "height": 720, "fps": 30})).unwrap();
+    std::fs::create_dir_all(dir.join("shot.lahza/assets")).unwrap();
+    table_png(&dir.join("shot.lahza/assets/room.png"), 1280, 720);
+    table_png(&dir.join("shot.lahza/assets/shirt.png"), 300, 260);
+    let cup = |id: &str, from: [f64; 2], to: [f64; 2]| json!({"op": "add", "id": id, "kind": "shape", "shape": "rect", "size": [90, 120], "radius": 10, "fill": "#c8202a",
+        "transform": {"position": {"keys": [{"at": 0.2, "v": from}, {"at": 1.8, "v": to}]}}});
+    tb.call("edit_apply", json!({"ops": [
+        {"op": "add_scene", "id": "s1", "background": "#30343c"},
+        {"op": "add", "id": "room", "kind": "image", "src": "assets/room.png", "transform": {"position": [640, 360], "opacity": 0.6}},
+        // Someone at the table, moving.
+        {"op": "add", "id": "shirt", "kind": "image", "src": "assets/shirt.png",
+         "transform": {"position": {"keys": [{"at": 0, "v": [640, 250]}, {"at": 1, "v": [600, 262]}, {"at": 2, "v": [690, 245]}]}}},
+        {"op": "add", "id": "table", "kind": "shape", "shape": "rect", "size": [1280, 330], "fill": "#f2f1ee", "transform": {"position": [640, 555]}},
+        cup("a", [300.0, 520.0], [880.0, 560.0]), cup("b", [640.0, 540.0], [330.0, 600.0]), cup("c", [960.0, 560.0], [620.0, 500.0])
+    ]})).unwrap();
+    tb.call("render", json!({"output": "shot.mp4", "wait": true, "audio": false})).unwrap();
+    let video = dir.join("shot.mp4").display().to_string();
+    let corners = json!([[120, 420], [1160, 420], [1250, 700], [30, 700]]);
+    let out = tb.call("track_plane", json!({"video": video, "corners": corners, "at": 1.0, "detail": true})).unwrap().json;
+    let frames = out["track"].as_array().unwrap();
+    assert_eq!(out["found"], out["frames"], "{}", out["lost"]);
+    assert!(out["texture"].as_f64().unwrap() < 0.3, "the table is blank: texture {}", out["texture"]);
+    assert_eq!(out["camera_still_frames"].as_u64().unwrap() as usize, frames.len() - 1, "every frame but the marked one is seen to be still");
+    assert!(out.get("warning").is_none(), "{}", out["warning"]);
+    for f in frames {
+        assert_eq!(f["corners"], json!([[120.0, 420.0], [1160.0, 420.0], [1250.0, 700.0], [30.0, 700.0]]), "frame {}", f["frame"]);
+    }
+    // Told the surface itself moves, the still camera is not used: the
+    // look is followed, and here that is the cups.
+    let out = tb.call("track_plane", json!({"video": video, "corners": corners, "at": 1.0, "moving": true, "detail": true})).unwrap().json;
+    assert_eq!(out["camera_still_frames"], 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

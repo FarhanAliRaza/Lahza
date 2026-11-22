@@ -102,7 +102,9 @@ fn inside(q: &Quad, sign: f64, x: f64, y: f64, margin: f64) -> bool {
 }
 
 impl Template {
-    fn new(pyr: &Pyramid, quad: &Quad, max_points: usize) -> Result<Template, String> {
+    /// `allow` says which pixels (level-0 coordinates) may be used: what
+    /// covers the plane is kept out.
+    fn new(pyr: &Pyramid, quad: &Quad, max_points: usize, allow: &dyn Fn(f64, f64) -> bool) -> Result<Template, String> {
         if !convex(quad) {
             return Err("the four corners must go round the region in order (no crossing, no three in a line)".into());
         }
@@ -114,7 +116,7 @@ impl Template {
         }
         let mut levels = Vec::new();
         for (l, img) in pyr.levels.iter().enumerate() {
-            match Level::new(img, l, quad, sign, centre, scale, max_points) {
+            match Level::new(img, l, quad, sign, centre, scale, max_points, allow) {
                 Some(level) => levels.push(level),
                 None => break,
             }
@@ -128,7 +130,7 @@ impl Template {
 
 impl Level {
     #[allow(clippy::too_many_arguments)]
-    fn new(img: &Gray, l: usize, quad: &Quad, sign: f64, centre: [f64; 2], scale: f64, max_points: usize) -> Option<Level> {
+    fn new(img: &Gray, l: usize, quad: &Quad, sign: f64, centre: [f64; 2], scale: f64, max_points: usize, allow: &dyn Fn(f64, f64) -> bool) -> Option<Level> {
         let k = (1u32 << l) as f64;
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for p in quad {
@@ -152,7 +154,7 @@ impl Level {
                 let (bx, by) = (to_base(i as f64, l), to_base(j as f64, l));
                 // Clear of the edge by what the blur and the gradient reach,
                 // so nothing outside the plane is in the template.
-                if !inside(quad, sign, bx, by, 2.0 * k) {
+                if !inside(quad, sign, bx, by, 2.0 * k) || !allow(bx, by) {
                     continue;
                 }
                 let gx = (img.at(i + 1, j) - img.at(i - 1, j)) * 0.5 / k as f32;
@@ -361,8 +363,11 @@ fn weigh(level: &Level, work: &mut Work, mi: f32, gain: f32, mt: f32) {
     if work.abs.is_empty() {
         return;
     }
-    let mid = work.abs.len() / 2;
-    let median = *work.abs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1;
+    // The residuals' scale from their lower quartile, which what covers
+    // up to two thirds of the region does not reach (a median gives way
+    // at a half). Written as the median a clean region would have.
+    let quarter = work.abs.len() / 4;
+    let median = *work.abs.select_nth_unstable_by(quarter, |a, b| a.total_cmp(b)).1 * (0.6745 / 0.3186);
     work.median = median;
     // Never tighter than a quarter of the template's deviation, so noise
     // alone drops nothing; never wider than about one deviation, so what
@@ -385,6 +390,12 @@ fn weigh(level: &Level, work: &mut Work, mi: f32, gain: f32, mt: f32) {
 /// frame), coarse to fine. None when the region leaves the frame or the
 /// frame is flat under it.
 fn align(tpl: &Template, pyr: &Pyramid, init: H3, opts: &Options, close: f32) -> Option<Fit> {
+    align_noting(tpl, pyr, init, opts, close, None)
+}
+
+/// `align`, also noting for each pixel of the finest level used where it
+/// is (template coordinates) and whether it disagreed with the template.
+fn align_noting(tpl: &Template, pyr: &Pyramid, init: H3, opts: &Options, close: f32, noted: Option<&mut Vec<(f32, f32, bool)>>) -> Option<Fit> {
     let (c, s) = (tpl.centre, tpl.scale);
     // Normalised coordinates → level-0 pixels, and back.
     let n_inv = H3([s, 0.0, c[0], 0.0, s, c[1], 0.0, 0.0, 1.0]);
@@ -493,6 +504,10 @@ fn align(tpl: &Template, pyr: &Pyramid, init: H3, opts: &Options, close: f32) ->
     work.wt.clear();
     work.wt.resize(count, 1.0);
     let (score, agree) = residuals(level, &mut work, true, close)?;
+    if let Some(noted) = noted {
+        noted.clear();
+        noted.extend((0..count).filter(|&i| !work.vals[i].is_nan()).map(|i| (level.x[i], level.y[i], work.wt[i] <= 0.0)));
+    }
     Some(Fit { h, score, visible: valid as f64 / count as f64, agree, spread: work.median as f64 })
 }
 
@@ -545,6 +560,11 @@ fn search_shift(tpl: &Template, pyr: &Pyramid, h: H3) -> Option<[f64; 2]> {
     best.filter(|b| b.0 > 0.5).map(|b| [b.1 as f64 * k, b.2 as f64 * k])
 }
 
+/// Cells across the region on which what covers it is kept.
+const GRID: usize = 24;
+/// Frames a covered cell stays so without word of it.
+const COVER_FRAMES: u8 = 12;
+
 /// Follows one marked region through frames given in order.
 pub struct PlaneTracker {
     opts: Options,
@@ -565,6 +585,16 @@ pub struct PlaneTracker {
     lost: usize,
     /// The usual size of a residual on the frames found so far.
     spread: Option<f64>,
+    /// Frames running on which the template did not hold.
+    weak: usize,
+    /// The usual residual between one frame and the next.
+    step_spread: Option<f64>,
+    /// Marked frame → the unit square of the region.
+    to_unit: H3,
+    texture: f64,
+    /// What covers the region, on a grid over it (marked frame's
+    /// coordinates): frames a cell is still held to be covered.
+    cover: Vec<u8>,
     /// Times the template was taken again.
     pub rekeys: usize,
 }
@@ -581,7 +611,38 @@ impl PlaneTracker {
             (((side as f64) / 40.0).log2().floor() as usize + 1).clamp(1, 6)
         };
         let pyr = Pyramid::new(frame, levels);
-        let key = Template::new(&pyr, &quad, opts.max_points)?;
+        let key = Template::new(&pyr, &quad, opts.max_points, &|_, _| true)?;
+        let to_unit = H3::from_quads(&quad, &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]).ok_or("the four corners must go round the region in order")?;
+        // The mean gradient of each cell of the region.
+        let texture = {
+            let img = &pyr.levels[0];
+            let mut cells = vec![(0.0f64, 0u32); GRID * GRID];
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for p in &quad {
+                x0 = x0.min(p[0]);
+                y0 = y0.min(p[1]);
+                x1 = x1.max(p[0]);
+                y1 = y1.max(p[1]);
+            }
+            let (xa, ya) = (x0.ceil().max(1.0) as usize, y0.ceil().max(1.0) as usize);
+            let (xb, yb) = ((x1.floor() as isize).min(img.w as isize - 2), (y1.floor() as isize).min(img.h as isize - 2));
+            for y in ya as isize..=yb {
+                for x in xa as isize..=xb {
+                    let (x, y) = (x as usize, y as usize);
+                    let u = to_unit.apply([x as f64, y as f64]);
+                    let (cx, cy) = ((u[0] * GRID as f64).floor(), (u[1] * GRID as f64).floor());
+                    if cx >= 0.0 && cy >= 0.0 && (cx as usize) < GRID && (cy as usize) < GRID {
+                        let gx = (img.at(x + 1, y) - img.at(x - 1, y)) * 0.5;
+                        let gy = (img.at(x, y + 1) - img.at(x, y - 1)) * 0.5;
+                        let c = &mut cells[cy as usize * GRID + cx as usize];
+                        c.0 += ((gx * gx + gy * gy) as f64).sqrt();
+                        c.1 += 1;
+                    }
+                }
+            }
+            let seen = cells.iter().filter(|c| c.1 > 0).count().max(1);
+            cells.iter().filter(|c| c.1 > 0 && c.0 / c.1 as f64 >= 1.5).count() as f64 / seen as f64
+        };
         let area = signed_area2(&quad);
         Ok(PlaneTracker {
             opts,
@@ -597,8 +658,34 @@ impl PlaneTracker {
             last: Some(pyr),
             lost: 0,
             spread: None,
+            weak: 0,
+            step_spread: None,
+            to_unit,
+            texture,
+            cover: vec![0; GRID * GRID],
             rekeys: 0,
         })
+    }
+
+    /// This frame is known to show the region where it was marked (the
+    /// camera has not moved since): the track goes on from there.
+    pub fn hold(&mut self, frame: &Gray) -> Sample {
+        if let Some(back) = self.key_h.inverse() {
+            self.rel = back.normalised();
+        }
+        self.rel_before = None;
+        self.lost = 0;
+        self.weak = 0;
+        self.last = Some(Pyramid::new(frame, self.levels));
+        Sample { found: true, h: H3::IDENTITY, corners: self.reference, score: 1.0, visible: 1.0, agree: 1.0 }
+    }
+
+    /// How much of the region has something on it: the share of its
+    /// cells (a 24 × 24 grid) with texture or edges in the marked frame.
+    /// A blank table top with a few things standing on it is near 0.1; a
+    /// stone worktop is 1.
+    pub fn texture(&self) -> f64 {
+        self.texture
     }
 
     fn sane(&self, h: H3) -> bool {
@@ -636,10 +723,56 @@ impl PlaneTracker {
     }
 
     /// The next frame (the one after, or before, the last one given).
+    ///
+    /// Two things say where the plane is. The frame before, which looks
+    /// almost the same as this one whatever has changed since the frame
+    /// was marked (the view, the focus, a sheen on the surface): it gives
+    /// the step, and steps add up to a slow drift. And the template,
+    /// which does not drift but stops comparing as the look changes, and
+    /// then wanders. So the step is taken from the frame before, the
+    /// template corrects it while it still matches closely, and when it
+    /// no longer does the template is taken again from this frame, early,
+    /// while what the steps have added is still small.
     pub fn step(&mut self, frame: &Gray) -> Sample {
         let pyr = Pyramid::new(frame, self.levels);
         let close = self.close();
-        let mut fit: Option<Fit> = None;
+        let debug = std::env::var_os("LAHZA_TRACK_DEBUG").is_some();
+        // Marked frame → the frame before.
+        let total_before = self.rel.then(self.key_h).normalised();
+        let mut step_noted: Vec<(f32, f32, bool)> = Vec::new();
+        let mut key_noted: Vec<(f32, f32, bool)> = Vec::new();
+        // 1. From the frame before (not after frames were lost: that
+        // picture is then no neighbour of this one).
+        let mut chain: Option<Fit> = None;
+        if self.lost == 0 {
+            if let Some(last) = &self.last {
+                let quad = self.rel.quad(&self.key.quad);
+                // Left out of the step: what covered the region on the
+                // frame before (it moves by itself, not with the plane).
+                let to_cell = total_before.inverse().map(|inv| self.to_unit.then(inv));
+                let allow = |x: f64, y: f64| to_cell.is_none_or(|m| !self.covered(m.apply([x, y])));
+                if let Ok(tpl) = Template::new(last, &quad, self.opts.max_points, &allow) {
+                    // Neighbours match closely or not at all.
+                    let fine = |s: &Fit| s.score >= 0.9 && s.agree >= self.opts.min_agree;
+                    let mut step = align_noting(&tpl, &pyr, H3::IDENTITY, &self.opts, close, Some(&mut step_noted));
+                    if !step.is_some_and(|s| fine(&s)) {
+                        if let Some(d) = search_shift(&tpl, &pyr, H3::IDENTITY) {
+                            let mut noted = Vec::new();
+                            let moved = align_noting(&tpl, &pyr, H3([1.0, 0.0, d[0], 0.0, 1.0, d[1], 0.0, 0.0, 1.0]), &self.opts, close, Some(&mut noted));
+                            if moved.is_some_and(|m| step.is_none_or(|s| m.score > s.score)) {
+                                step = moved;
+                                step_noted = noted;
+                            }
+                        }
+                    }
+                    chain = step.filter(fine).map(|s| Fit { h: s.h.then(self.rel).normalised(), ..s }).filter(|c| c.visible >= self.opts.min_visible && self.sane(c.h) && self.steady(c.h));
+                }
+            }
+        }
+        // 2. Against the template, from where the step puts it; without
+        // a step, from where the motion so far would put it, from where
+        // it was, and by a search of shifts.
+        let mut key: Option<Fit> = None;
         let better = |cand: Option<Fit>, fit: &mut Option<Fit>| {
             if let Some(c) = cand {
                 if fit.is_none_or(|f| c.score > f.score) {
@@ -647,85 +780,148 @@ impl PlaneTracker {
                 }
             }
         };
-        // 1. From where the motion so far would put it, then from where
-        // it was.
-        if let Some(before) = self.rel_before.and_then(|b| b.inverse()) {
-            let predicted = self.rel.then(before).then(self.rel).normalised();
-            if predicted.0.iter().all(|v| v.is_finite()) {
-                better(align(&self.key, &pyr, predicted, &self.opts, close), &mut fit);
+        if let Some(c) = chain {
+            key = align_noting(&self.key, &pyr, c.h, &self.opts, close, Some(&mut key_noted));
+        } else {
+            if let Some(before) = self.rel_before.and_then(|b| b.inverse()) {
+                let predicted = self.rel.then(before).then(self.rel).normalised();
+                if predicted.0.iter().all(|v| v.is_finite()) {
+                    better(align(&self.key, &pyr, predicted, &self.opts, close), &mut key);
+                }
             }
-        }
-        if !fit.is_some_and(|f| self.good(&f)) {
-            better(align(&self.key, &pyr, self.rel, &self.opts, close), &mut fit);
-        }
-        // 2. Through the previous frame's picture, which looks most like
-        // this one.
-        let mut via_last: Option<Fit> = None;
-        if !fit.is_some_and(|f| self.good(&f)) {
-            if let Some(last) = &self.last {
-                let quad = self.rel.quad(&self.key.quad);
-                if let Ok(tpl) = Template::new(last, &quad, self.opts.max_points) {
-                    let mut step = align(&tpl, &pyr, H3::IDENTITY, &self.opts, close);
-                    let fine = |s: &Fit| s.score >= self.opts.min_score && s.agree >= self.opts.min_agree;
-                    if !step.is_some_and(|s| fine(&s)) {
-                        if let Some(d) = search_shift(&tpl, &pyr, H3::IDENTITY) {
-                            step = align(&tpl, &pyr, H3([1.0, 0.0, d[0], 0.0, 1.0, d[1], 0.0, 0.0, 1.0]), &self.opts, close);
-                        }
-                    }
-                    if let Some(s) = step.filter(fine) {
-                        let init = s.h.then(self.rel).normalised();
-                        via_last = Some(Fit { h: init, ..s });
-                        better(align(&self.key, &pyr, init, &self.opts, close), &mut fit);
-                    }
+            if !key.is_some_and(|f| self.good(&f)) {
+                better(align(&self.key, &pyr, self.rel, &self.opts, close), &mut key);
+            }
+            if !key.is_some_and(|f| self.good(&f)) {
+                if let Some(d) = search_shift(&self.key, &pyr, self.rel) {
+                    let init = H3([1.0, 0.0, d[0], 0.0, 1.0, d[1], 0.0, 0.0, 1.0]).then(self.rel);
+                    better(align(&self.key, &pyr, init, &self.opts, close), &mut key);
                 }
             }
         }
-        // 3. A search of shifts of the template itself.
-        if !fit.is_some_and(|f| self.good(&f)) && via_last.is_none() {
-            if let Some(d) = search_shift(&self.key, &pyr, self.rel) {
-                let init = H3([1.0, 0.0, d[0], 0.0, 1.0, d[1], 0.0, 0.0, 1.0]).then(self.rel);
-                better(align(&self.key, &pyr, init, &self.opts, close), &mut fit);
-            }
+        // 3. Which to take. The template holds while its residuals are
+        // about what they were when it was taken (a covered part of the
+        // region does not raise them: they are measured at the middle).
+        let holds = |k: &Fit| self.good(k) && k.spread <= self.anchor_spread();
+        let key_good = key.filter(|k| self.good(k));
+        let (taken, by_template) = match (key_good, chain) {
+            (Some(k), _) if holds(&k) => (Some(k), true),
+            (_, Some(c)) => (Some(c), false),
+            (Some(k), None) => (Some(k), true),
+            (None, None) => (None, false),
+        };
+        if debug {
+            let show = |f: Option<Fit>| f.map_or("none".to_string(), |f| format!("score {:.3} agree {:.2} spread {:.3}", f.score, f.agree, f.spread));
+            eprintln!("track: template [{}] step [{}] holds under {:.3}: {}", show(key), show(chain), self.anchor_spread(), if taken.is_none() { "lost" } else if by_template { "template" } else { "step" });
         }
-        let mut found = fit.filter(|f| self.good(f));
-        let mut rekey = false;
-        // The template no longer compares, but the frame before does and
-        // matches well: go on from it and take the template again.
-        if found.is_none() && self.opts.rekey {
-            if let Some(v) = via_last.filter(|v| v.score >= 0.9 && v.agree >= 0.8 && v.visible >= self.opts.min_visible && self.sane(v.h) && self.steady(v.h)) {
-                found = Some(v);
-                rekey = true;
-            }
-        }
-        let Some(f) = found else {
+        let Some(f) = taken else {
             self.lost += 1;
+            self.weak = 0;
             let h = self.rel.then(self.key_h).normalised();
-            let (score, visible, agree) = fit.map(|f| (f.score, f.visible, f.agree)).unwrap_or((0.0, 0.0, 0.0));
+            let (score, visible, agree) = key.map(|f| (f.score, f.visible, f.agree)).unwrap_or((0.0, 0.0, 0.0));
             return Sample { found: false, h, corners: h.quad(&self.reference), score: score.max(0.0), visible, agree };
         };
-        self.spread = Some(self.spread.map_or(f.spread, |s| 0.8 * s + 0.2 * f.spread));
+        // What covers the region now: where the template's own pixels
+        // disagree (when it holds, it knows the plane's look), else where
+        // the frame before disagrees with this one.
+        if by_template && !key_noted.is_empty() {
+            let m = self.key_h.inverse().map(|inv| self.to_unit.then(inv));
+            self.note_cover(&key_noted, m);
+        } else if !step_noted.is_empty() {
+            let m = total_before.inverse().map(|inv| self.to_unit.then(inv));
+            self.note_cover(&step_noted, m);
+        }
+        if by_template {
+            self.weak = 0;
+            self.spread = Some(self.spread.map_or(f.spread, |s| 0.8 * s + 0.2 * f.spread));
+        } else {
+            self.weak += 1;
+        }
+        if let Some(c) = chain {
+            self.step_spread = Some(self.step_spread.map_or(c.spread, |s| 0.8 * s + 0.2 * c.spread));
+        }
         self.rel_before = (self.lost == 0).then_some(self.rel);
         self.lost = 0;
         self.rel = f.h;
         let h = f.h.then(self.key_h).normalised();
         let corners = h.quad(&self.reference);
-        if self.opts.rekey && !rekey {
+        if self.opts.rekey {
+            // Past about three times the size, or a third of it; or the
+            // template has not held for two frames running.
             let ratio = signed_area2(&corners).abs() / self.key_area;
-            // Past about three times the size, or a third of it.
-            let resized = !(0.1..=10.0).contains(&ratio);
-            rekey = resized && f.agree >= 0.7;
-        }
-        if rekey {
-            if let Ok(tpl) = Template::new(&pyr, &corners, self.opts.max_points) {
-                self.key = tpl;
-                self.key_h = h;
-                self.key_area = signed_area2(&corners).abs();
-                self.rel = H3::IDENTITY;
-                self.rel_before = None;
-                self.rekeys += 1;
+            let resized = by_template && !(0.1..=10.0).contains(&ratio) && f.agree >= 0.7;
+            let stale = !by_template && self.weak >= 2 && f.agree >= 0.8;
+            if resized || stale {
+                // What covers the region stays out of the new template.
+                let to_cell = h.inverse().map(|inv| self.to_unit.then(inv));
+                let allow = |x: f64, y: f64| to_cell.is_none_or(|m| !self.covered(m.apply([x, y])));
+                if let Ok(tpl) = Template::new(&pyr, &corners, self.opts.max_points, &allow) {
+                    self.key = tpl;
+                    self.key_h = h;
+                    self.key_area = signed_area2(&corners).abs();
+                    self.rel = H3::IDENTITY;
+                    self.rel_before = None;
+                    self.weak = 0;
+                    self.rekeys += 1;
+                }
             }
         }
         self.last = Some(pyr);
         Sample { found: true, h, corners, score: f.score.clamp(0.0, 1.0), visible: f.visible, agree: f.agree }
+    }
+
+    /// Whether a point of the region (unit square) is covered: its cell
+    /// or one next to it.
+    fn covered(&self, p: [f64; 2]) -> bool {
+        if !(p[0].is_finite() && p[1].is_finite()) {
+            return false;
+        }
+        let (cx, cy) = ((p[0] * GRID as f64).floor() as isize, (p[1] * GRID as f64).floor() as isize);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let (x, y) = (cx + dx, cy + dy);
+                if x >= 0 && y >= 0 && (x as usize) < GRID && (y as usize) < GRID && self.cover[y as usize * GRID + x as usize] > 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Takes an alignment's word on which pixels disagreed (`to_cell`:
+    /// their coordinates → the region's unit square). A cell most of
+    /// whose pixels disagree is covered; one most of whose pixels agree
+    /// is clear; one with no word keeps its state a while, then clears
+    /// (if it is still covered, the next word says so).
+    fn note_cover(&mut self, noted: &[(f32, f32, bool)], to_cell: Option<H3>) {
+        let Some(m) = to_cell else { return };
+        let mut counts = vec![(0u32, 0u32); GRID * GRID];
+        for &(x, y, out) in noted {
+            let p = m.apply([x as f64, y as f64]);
+            let (cx, cy) = ((p[0] * GRID as f64).floor(), (p[1] * GRID as f64).floor());
+            if cx >= 0.0 && cy >= 0.0 && (cx as usize) < GRID && (cy as usize) < GRID {
+                let c = &mut counts[cy as usize * GRID + cx as usize];
+                if out { c.1 += 1 } else { c.0 += 1 }
+            }
+        }
+        for (cell, &(agree, out)) in self.cover.iter_mut().zip(&counts) {
+            if out >= 3 && out * 2 > (agree + out) {
+                *cell = COVER_FRAMES;
+            } else if agree + out >= 3 {
+                *cell = 0;
+            } else {
+                *cell = cell.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Residuals (at their middle) up to which the template is believed:
+    /// twice what neighbouring frames leave between them (the footage's
+    /// own noise), and between 0.12 and 0.3 of the template's deviation.
+    /// On a hand-held shot of a worktop the template's own answer was
+    /// within 0.2 px while its residuals were under 0.15, and 0.8 px out
+    /// at 0.3.
+    fn anchor_spread(&self) -> f64 {
+        (2.0 * self.step_spread.unwrap_or(0.1)).clamp(0.12, 0.3)
     }
 }

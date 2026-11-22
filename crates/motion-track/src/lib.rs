@@ -12,6 +12,7 @@
 pub mod image;
 pub mod plane;
 pub mod rect;
+pub mod still;
 
 #[cfg(test)]
 mod tests;

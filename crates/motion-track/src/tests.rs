@@ -300,6 +300,80 @@ fn a_flat_region_is_refused() {
     assert!(PlaneTracker::new(&first, crossed, Options::default()).is_err());
 }
 
+// --------------------------------------------------------------- still
+
+/// A camera that has not moved, with a thing sliding across a third of
+/// the picture, is still; the same picture a pixel and a half over is
+/// not, nor is another picture.
+#[test]
+fn a_still_camera_is_told_from_one_that_moved() {
+    use crate::still::{StillTest, STILL};
+    // The "plane" here is a thing that moves in front of a still scene.
+    let s = Shot { w: 320, h: 180, region: [[90.0, 40.0], [200.0, 40.0], [200.0, 150.0], [90.0, 150.0]], noise: 2.0 };
+    let slide = |x: f64, y: f64| H3([1.0, 0.0, x, 0.0, 1.0, y, 0.0, 0.0, 1.0]);
+    let test = StillTest::new(&s.frame(H3::IDENTITY, H3::IDENTITY, 0, 1.0, 0.0));
+    for i in 1..6u64 {
+        let moved_thing = s.frame(slide(14.0 * i as f64, 3.0 * i as f64), H3::IDENTITY, i, 1.0 + 0.05 * i as f64, 4.0);
+        let share = test.share(&moved_thing);
+        assert!(share >= 3.0 * STILL, "frame {i}: a still camera read as moved ({share:.2})");
+    }
+    for (x, y) in [(1.5, 0.0), (0.0, -1.5), (4.0, 3.0), (30.0, 10.0)] {
+        let share = test.share(&s.frame(slide(x, y), slide(x, y), 9, 1.0, 0.0));
+        assert!(share < STILL, "a camera that moved ({x}, {y}) read as still ({share:.2})");
+    }
+    let other = Shot { w: 320, h: 180, region: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], noise: 2.0 };
+    assert!(test.share(&other.frame(H3::IDENTITY, slide(500.0, 900.0), 3, 1.0, 0.0)) < STILL / 2.0);
+}
+
+/// What the region has of its own: most of it on a textured plane (its
+/// smoother stretches do not count), next to none on a blank one with
+/// two things standing on it.
+#[test]
+fn a_blank_region_is_told_from_a_textured_one() {
+    let s = shot();
+    let first = s.frame(H3::IDENTITY, H3::IDENTITY, 0, 1.0, 0.0);
+    let textured = PlaneTracker::new(&first, REGION, Options::default()).unwrap().texture();
+    assert!(textured > 0.5, "{textured}");
+    let mut blank = Gray { w: 320, h: 180, px: vec![200.0; 320 * 180] };
+    for (bx, by) in [(120usize, 80usize), (180, 100)] {
+        for y in by..by + 14 {
+            for x in bx..bx + 12 {
+                blank.px[y * 320 + x] = if (x + y) % 5 < 2 { 60.0 } else { 120.0 };
+            }
+        }
+    }
+    let texture = PlaneTracker::new(&blank, REGION, Options::default()).unwrap().texture();
+    assert!(texture < 0.15, "{texture}");
+}
+
+/// A thing with a pattern of its own crosses a third of the region,
+/// moving against the plane: the step from the frame before leaves it
+/// out (it is noted as cover), and the plane is still held to a
+/// fraction of a pixel.
+#[test]
+fn a_patterned_thing_crossing_the_region_does_not_carry_it_off() {
+    let s = Shot { w: 320, h: 180, region: [[70.0, 40.0], [250.0, 44.0], [246.0, 150.0], [66.0, 146.0]], noise: 2.0 };
+    let centre = [160.0, 95.0];
+    let first = s.frame(H3::IDENTITY, H3::IDENTITY, 0, 1.0, 0.0);
+    let mut tracker = PlaneTracker::new(&first, s.region, Options::default()).unwrap();
+    for i in 1..=40u64 {
+        let t = i as f64 / 40.0;
+        let plane = motion(t, centre, [10.0, -6.0], 6.0, 1.08, [0.0002, 0.0001]);
+        let mut frame = s.frame(plane, H3::IDENTITY, i, 1.0, 0.0);
+        // A textured block, 60 × 70, sliding the other way.
+        let (bx, by) = ((230.0 - 170.0 * t) as usize, 60usize);
+        for y in by..by + 70 {
+            for x in bx..(bx + 60).min(s.w) {
+                frame.px[y * s.w + x] = (texture((x - bx) as f64 * 1.7, (y - by) as f64 * 1.7, 300) * 200.0 + 20.0) as f32;
+            }
+        }
+        let out = tracker.step(&frame);
+        assert!(out.found, "frame {i}: lost");
+        let e = worst(&out.corners, &plane.quad(&s.region));
+        assert!(e < 0.6, "frame {i}: {e:.3} px (match {:.2})", out.agree);
+    }
+}
+
 // ---------------------------------------------------------------- rect
 
 fn rot_x(deg: f64) -> [[f64; 3]; 3] {

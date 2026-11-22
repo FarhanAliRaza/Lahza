@@ -27,7 +27,7 @@ Usage:
                      --drawn also scores one element's box)
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
-  lahza motion track-plane <video> --corners x,y,x,y,x,y,x,y [--at S] [--from S] [--to S] [--width PX] [--detail]
+  lahza motion track-plane <video> --corners x,y,x,y,x,y,x,y [--at S] [--from S] [--to S] [--width PX] [--detail] [--moving]
                     [--project DIR --scene ID [--timeline S] [--scale S] [--offset x,y] [--fov DEG] [--aspect R] [--size PX] [--apply]]
                     follows a flat region (four corners marked on the frame at --at) as one plane; with --scene, the scene
                     camera per frame, so 3D layers stand on that plane (the footage layer in \"space\": \"screen\")
@@ -546,6 +546,9 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             }
             if has(args, "--detail") {
                 a["detail"] = json!(true);
+            }
+            if has(args, "--moving") {
+                a["moving"] = json!(true);
             }
             if let Some(scene) = flag(args, "--scene") {
                 let mut cam = json!({"scene": scene});

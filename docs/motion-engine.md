@@ -171,7 +171,14 @@ Select, type, Enter. The prompt bar is the same on a motion project and on a rec
 
 ## Things placed in footage
 
-`track_plane` follows a flat surface in a video (a table top, a wall, a floor, a screen) so that 3D layers can stand on it. Mark it once: the four corners of a real rectangle on the surface (the table's own corners, a book, a tile), in source pixels, on any one frame. The region is followed both ways from that frame by aligning the picture itself, coarse to fine, always against the marked frame, so the track does not drift. It needs no model and no GPU. Changes of brightness are taken out, and what passes over the surface is left out of the fit, so a hand over the table does not move the plane. A frame where the surface cannot be matched (a cut away, the region out of frame) is reported as lost, and the track picks up again when it comes back.
+`track_plane` follows a flat surface in a video (a table top, a wall, a floor, a screen) so that 3D layers can stand on it. Mark it once: the four corners of a real rectangle on the surface (the table's own corners, a book, a tile), in source pixels, on any one frame. It needs no model and no GPU.
+
+How it follows:
+
+- **By the picture itself.** Every pixel of the region with some gradient pulls the fit (a homography), coarse to fine. Each frame is first placed from the frame before, which always looks nearly the same; the frame the corners were marked on then corrects it for as long as it still matches closely, so the steps do not add up to a drift. When the view or the focus has changed too much for that, the template is taken again from the current frame.
+- **What covers the surface is left out.** Changes of brightness are matched away, and the parts of the region where the picture disagrees (a hand, an arm, a thing standing on the surface seen from a new side) are remembered on a grid and kept out of the next step.
+- **A camera on a tripod settles a blank surface.** A white table with cups and hands on it has nothing of its own to follow. When the scene behind has not moved since the marked frame, the corners stay where they were marked (`camera_still_frames`). Say `moving: true` when the surface itself moves in the scene (a thing carried, a held screen).
+- **It says when it does not know.** A frame where the surface cannot be matched (a cut away, the region out of frame) is `lost`, and the track picks up when it comes back. With a moving camera and a surface that has little of its own on it (`texture`), the result carries a `warning`.
 
 With `camera: {scene}` it also solves the scene's camera for every frame. The lens is measured from the rectangle's perspective (or given as `fov`; when the rectangle is seen too squarely to tell, 39.6° is assumed and the result says so). The marked rectangle becomes `camera.rect` on the scene's z = 0:
 
@@ -184,9 +191,29 @@ lahza motion track-plane shot.mp4 --corners 412,300,905,318,960,560,380,540 --at
     --project comp.lahza --scene s1 --apply
 ```
 
-[`examples/track/table.py`](../examples/track/table.py) makes its own footage (a table under a moving camera), tracks it and stands a box, a ball and a cylinder on it. On a cloud container's CPU that track runs at about 110 frames a second for 1280 × 720 footage, decoding included, with the corners within a quarter of a pixel and the lens within 0.1°. These are numbers on footage the engine drew; none has been taken on a camera's footage yet.
+[`examples/track/table.py`](../examples/track/table.py) makes its own footage (a table under a moving camera), tracks it and stands a box, a ball and a cylinder on it. [`examples/track/verify.py`](../examples/track/verify.py) checks any track against its footage: it warps each frame's region back onto the marked one and measures what is left, with a search of its own.
 
-Limits: one plane per scene (the camera is what moves); the surface must be flat and have something on it (a blank table top gives nothing to hold); the track follows from where the last frame was, so it does not find a surface again in a different shot of it; nothing yet hides a placed object behind what passes in front of it (that needs a matte), and footage is not relit. Both are planned in `TODO.md` ("Tracking footage").
+Measured, on a cloud container's CPU, decoding included:
+
+| Footage | Result |
+|---|---|
+| The engine's own shot, 1280 × 720, H.264 | corners within 0.24 px, lens 44.99° for 45°, a point standing above the table within 0.17 px; about 50 frames a second |
+| The same with a shaking camera, motion blur, noise, a small bitrate and an arm crossing the table | every frame found; corners 0.7 px off on average, 1.4 px at worst |
+| A hand-held phone shot of a stone worktop with an apple on it (1296 × 720, 10 fps, 5 s) | every frame found; 0.4 px of slip over any second, about 1 px from the marked frame after 4.8 s; 50 frames a second |
+| A wall behind children jumping, the camera pushing in (960 × 540, 200 frames) | every frame found; 0.4 px of slip over any ten frames, 1.2 px at worst |
+| Three tripod shots of a table with hands, cups, blocks and a kettle moving on it, two of the tables blank white | corners held where marked, to 0.1 px |
+
+The real clips are demo footage of two public research repositories; they are not in this repository.
+
+Limits:
+
+- One plane per scene (the camera is what moves).
+- The camera needs a real rectangle on the surface. Four points that only look square give no usable camera (on the worktop above, 10 to 40 px of error): the surface's tilt would have to come from the camera's own motion, which is not done yet.
+- A surface with nothing of its own on it, under a moving camera, cannot be followed by its look.
+- The track follows from where the last frame was, so it does not find a surface again in a different shot of it.
+- Nothing yet hides a placed object behind what passes in front of it (that needs a matte), and footage is not relit.
+
+`TODO.md` ("Tracking footage") has what is planned.
 
 ## 3D with Blender
 

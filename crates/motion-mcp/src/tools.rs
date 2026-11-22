@@ -357,13 +357,14 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "track_plane",
-            description: "Follow a flat surface in footage (a table top, a wall, a floor, a screen) as one plane, so things can be put on it. Mark it once: `corners`, four [x, y] in source pixels going round a real rectangle on the surface (its top-left, top-right, bottom-right, bottom-left as it lies there: the table's own corners, a book, a tile, a screen), on the frame at `at` seconds. The region is followed both ways from that frame over `from`..`to` by aligning the picture itself (no model; brightness changes and things passing over it are allowed for). Returns frames and how many were found, the stretches `lost`, and with `detail` the corners per frame. With `camera`: {scene} it also solves the scene camera per frame (orbit, rotation, dolly, position; the lens `fov` measured from the rectangle's perspective, or given, or assumed when the rectangle is seen too squarely) so the rectangle is `camera.rect` on the scene's z = 0: put 3D layers there (a mesh at z = −half its height stands on the surface; toward the viewer is −z; a `plane` mesh with material preset \"shadow\" at z = 0 takes their shadows), and keep the footage's video layer in \"space\": \"screen\", drawn as `footage` says. `apply` writes the camera keys; otherwise they come back as edit_apply `ops`. Mark corners from a snapshot or frame of the footage; a larger rectangle with more in it holds better.",
+            description: "Follow a flat surface in footage (a table top, a wall, a floor, a screen) as one plane, so things can be put on it. Mark it once: `corners`, four [x, y] in source pixels going round a real rectangle on the surface (its top-left, top-right, bottom-right, bottom-left as it lies there: the table's own corners, a book, a tile, a screen), on the frame at `at` seconds. The region is followed both ways from that frame over `from`..`to` by aligning the picture itself (no model; brightness changes and things passing over it are allowed for). A blank surface has nothing of its own to follow: with a still camera (a tripod) that does not matter, since the corners are then held where they were marked (`camera_still_frames`); with a moving camera the result carries a `warning` when `texture` is low. Returns frames and how many were found, the stretches `lost`, and with `detail` the corners per frame. With `camera`: {scene} it also solves the scene camera per frame (orbit, rotation, dolly, position; the lens `fov` measured from the rectangle's perspective, or given, or assumed when the rectangle is seen too squarely) so the rectangle is `camera.rect` on the scene's z = 0: put 3D layers there (a mesh at z = −half its height stands on the surface; toward the viewer is −z; a `plane` mesh with material preset \"shadow\" at z = 0 takes their shadows), and keep the footage's video layer in \"space\": \"screen\", drawn as `footage` says. `apply` writes the camera keys; otherwise they come back as edit_apply `ops`. Mark corners from a snapshot or frame of the footage; a larger rectangle with more in it holds better.",
             schema: obj(json!({
                 "video": {"type": "string", "description": "video file (absolute, or relative to the working folder or project)"},
                 "corners": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "four [x, y] in source pixels, going round the rectangle"},
                 "at": {"type": "number", "description": "source seconds of the frame the corners were marked on (default `from`)"},
                 "from": {"type": "number", "default": 0}, "to": {"type": "number"},
                 "width": {"type": "integer", "description": "width to follow at (default 640, more when the region is small)"},
+                "moving": {"type": "boolean", "default": false, "description": "the surface itself moves in the scene (a thing carried, a held screen). Default false: a surface of the scene, so on frames where the camera has not moved since the marked frame the corners stay where they were marked, whatever moves over the surface"},
                 "detail": {"type": "boolean", "default": false, "description": "also return every frame's corners and score"},
                 "camera": {"type": "object", "description": "{scene: id, at: timeline seconds at which source second `from` plays (default `from`), scale: canvas px per source px and offset: [x, y] of the footage's corner (default: fitted in the canvas, centred), fov: degrees if known, aspect: the rectangle's real width ÷ height if known, size: its height in scene px}"},
                 "apply": {"type": "boolean", "default": false, "description": "write the camera keys to the scene"},
@@ -3285,7 +3286,8 @@ impl Toolbox {
         let from = get_f64(args, "from").unwrap_or(0.0).max(0.0);
         let at = get_f64(args, "at").unwrap_or(from);
         let width = args.get("width").and_then(Value::as_u64).map(|w| w as u32);
-        let track = planetrack::track(&video, corners, at, from, get_f64(args, "to"), width, Default::default())?;
+        let moving = args.get("moving").and_then(Value::as_bool).unwrap_or(false);
+        let track = planetrack::track(&video, corners, at, from, get_f64(args, "to"), width, moving, Default::default())?;
         let found: Vec<&planetrack::Frame> = track.frames.iter().filter(|f| f.found).collect();
         // Stretches not found, in source seconds.
         let mut lost: Vec<Value> = Vec::new();
@@ -3309,9 +3311,12 @@ impl Toolbox {
             "video": video.display().to_string(), "size": [track.info.width, track.info.height], "fps": round(track.info.fps),
             "followed_at": [track.size.0, track.size.1], "frames": track.frames.len(), "found": found.len(), "lost": lost,
             "match": {"mean": round(mean(&|f| f.agree)), "least": round(found.iter().map(|f| f.agree).fold(1.0, f64::min))},
-            "template_retaken": track.retakes,
+            "template_retaken": track.retakes, "camera_still_frames": track.still, "texture": round(track.texture),
             "seconds": round(track.seconds), "frames_per_second": round(track.frames.len() as f64 / track.seconds.max(1e-9)),
         });
+        if track.texture < 0.3 && track.still + 1 < track.frames.len() {
+            out["warning"] = json!("the surface has little of its own on it (see `texture`) and the camera moves: what was followed may be the things standing on it and not the surface. Look at the result (a snapshot with something placed), or mark a rectangle that has texture or edges of the surface itself.");
+        }
         if args.get("detail").and_then(Value::as_bool).unwrap_or(false) {
             out["track"] = json!(track.frames.iter().map(|f| if f.found {
                 json!({"t": round(f.t), "frame": f.frame, "found": true, "corners": f.corners.map(|p| [round(p[0]), round(p[1])]), "match": round(f.agree), "visible": round(f.visible)})
