@@ -772,6 +772,11 @@ fn apply_color(op: &[[f32; 4]], c: V3, l: V2, size: V2) -> V3 {
     }
 }
 
+/// Taps of a directional blur `d` texels long (as `blur_taps` in the shader).
+pub fn blur_taps(d: V2) -> usize {
+    ((len(d) / 3.0).ceil() as usize).clamp(9, 64)
+}
+
 /// Samples a group texture through its post program (displacement,
 /// directional blur, RGB split, then colour ops, vignette and grain).
 fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] {
@@ -804,13 +809,15 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
     let tap = |p: V2| -> [f32; 4] {
         match blur {
             Some(d) => {
+                // A tap every ~3 texels (9 at least, 64 at most), so a long
+                // smear is smooth instead of a ladder of copies.
                 let mut acc = [0.0f32; 4];
-                const N: usize = 9;
-                for k in 0..N {
-                    let t = k as f32 / (N - 1) as f32 - 0.5;
+                let n = blur_taps(d);
+                for k in 0..n {
+                    let t = k as f32 / (n - 1) as f32 - 0.5;
                     let c = base([p[0] + d[0] * t, p[1] + d[1] * t]);
                     for j in 0..4 {
-                        acc[j] += c[j] / N as f32;
+                        acc[j] += c[j] / n as f32;
                     }
                 }
                 acc

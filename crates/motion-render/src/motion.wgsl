@@ -657,10 +657,12 @@ fn apply_color(i: u32, c: vec3<f32>, l: vec2<f32>, size: vec2<f32>) -> vec3<f32>
 
 fn tap(prim: Prim, p: vec2<f32>, blur: vec2<f32>, has_blur: bool) -> vec4<f32> {
     if !has_blur { return sample_image(prim, p); }
+    // A tap every ~3 texels (9..64), as raster.rs blur_taps.
+    let n = clamp(i32(ceil(length(blur) / 3.0)), 9, 64);
     var acc = vec4<f32>(0.0);
-    for (var k = 0; k < 9; k++) {
-        let t = f32(k) / 8.0 - 0.5;
-        acc += sample_image(prim, p + blur * t) / 9.0;
+    for (var k = 0; k < n; k++) {
+        let t = f32(k) / f32(n - 1) - 0.5;
+        acc += sample_image(prim, p + blur * t) / f32(n);
     }
     return acc;
 }

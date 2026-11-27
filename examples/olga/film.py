@@ -818,26 +818,24 @@ def stage(s, spec, k):
     if spec.get("screen_extra"):
         layers.append(screen(f"{sid}-scr", spec["screen_extra"], t0, t1))
     root = {"id": sid, "kind": "comp", "layers": layers, "transform": {}}
-    # Blur-whips: the outgoing shot and the incoming one move together,
-    # smeared, for two frames each side of the cut.
-    pos_keys, blur_keys = [], []
+    # Blur-whips: the outgoing and incoming shots move together edge to
+    # edge (same ease, a full frame apart), smeared, two frames each side of
+    # the cut.
+    pos_keys, blur_keys, angle_keys = [], [], []
     dir_in = DIRS[(k - 1) % 4] if k else None
     dir_out = DIRS[k % 4] if k + 1 < len(SHOTS) else None
-    push = 1.0
+    span = lambda d: [d[0] * W, d[1] * H]
     if dir_in:
-        pos_keys += [{"at": round(t0 - WHIP, 3), "v": [-dir_in[0] * W * push, -dir_in[1] * H * push * 0.6]},
-                     {"at": round(t0 + WHIP, 3), "v": [0, 0], "ease": "out"}]
-        blur_keys += [{"at": round(t0 - WHIP, 3), "v": 260}, {"at": round(t0 + WHIP, 3), "v": 0, "ease": "out"}]
+        pos_keys += [{"at": round(t0 - WHIP, 3), "v": [-v for v in span(dir_in)]}, {"at": round(t0 + WHIP, 3), "v": [0, 0], "ease": "gesture"}]
+        blur_keys += [{"at": round(t0 - WHIP, 3), "v": 160}, {"at": round(t0, 3), "v": 260, "ease": "gesture"}, {"at": round(t0 + WHIP, 3), "v": 0, "ease": "gesture"}]
+        angle_keys.append({"at": round(t0 - WHIP, 3), "v": 0 if dir_in[0] else 90})
     if dir_out:
-        pos_keys += [{"at": round(t1 - WHIP, 3), "v": [0, 0]}, {"at": round(t1 + WHIP, 3), "v": [dir_out[0] * W * push, dir_out[1] * H * push * 0.6], "ease": "in"}]
-        blur_keys += [{"at": round(t1 - WHIP, 3), "v": 0}, {"at": round(t1 + WHIP, 3), "v": 260, "ease": "in"}]
+        pos_keys += [{"at": round(t1 - WHIP, 3), "v": [0, 0]}, {"at": round(t1 + WHIP, 3), "v": span(dir_out), "ease": "gesture"}]
+        blur_keys += [{"at": round(t1 - WHIP, 3), "v": 0}, {"at": round(t1, 3), "v": 260, "ease": "gesture"}, {"at": round(t1 + WHIP, 3), "v": 160, "ease": "gesture"}]
+        angle_keys.append({"at": round(t1 - WHIP, 3), "v": 0 if dir_out[0] else 90, "ease": "hold"})
     if pos_keys:
-        if dir_in:
-            pos_keys[0]["at"] = round(t0 - WHIP, 3)
         root["transform"]["position"] = {"keys": pos_keys}
-        d = dir_in or dir_out
-        angle = 0 if (dir_out or dir_in)[0] != 0 else 90
-        root["effects"] = [{"type": "directional_blur", "angle": angle, "length": {"keys": blur_keys}}]
+        root["effects"] = [{"type": "directional_blur", "angle": {"keys": angle_keys} if len(angle_keys) > 1 else angle_keys[0]["v"], "length": {"keys": blur_keys}}]
     root["time"] = {"start": round(max(0, t0 - WHIP), 3), "end": round(min(END, t1 + WHIP), 3)}
     return root
 
