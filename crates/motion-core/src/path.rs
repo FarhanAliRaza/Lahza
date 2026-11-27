@@ -348,7 +348,7 @@ fn is_loop(line: &[Pt]) -> bool {
 /// and a reversed inner ring (non-zero fill leaves the inside empty).
 pub fn ink_outline(lines: &[Vec<Pt>], width: f64, ink: &crate::document::Ink, tolerance: f64) -> Vec<Vec<Pt>> {
     let mut out = Vec::new();
-    let step = (width * 0.6).min(ink.wobble_scale.max(1.0) / 6.0).min(ink.pressure_scale.max(1.0) / 6.0).max(tolerance * 2.0).max(1e-3);
+    let step = (width * 1.5).min(ink.wobble_scale.max(1.0) / 5.0).min(ink.pressure_scale.max(1.0) / 5.0).max(tolerance * 4.0).max(1e-3);
     for (index, line) in lines.iter().enumerate() {
         if line.len() < 2 {
             continue;
