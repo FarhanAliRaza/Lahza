@@ -167,7 +167,12 @@ def yard(id="yard"):
         mid.append(shape(f"{id}-blade{k}", [(sx_ - 22, sy_ - 4), (sx_ + 20, sy_ - 6), (sx_ + 16, sy_ + 40), (sx_ - 4, sy_ + 52), (sx_ - 20, sy_ + 38)], CREAM, w=2.6, smooth=0.4))
     fore = [shape(f"{id}-fore", [(-200, 2000), (300, 1940), (700, 1980), (1200, 1930), (1700, 1990), (1700, 2600), (-200, 2600)], CREAM_DK, w=3.6, rough=2.5),
             strokes(f"{id}-grass", [[(x, 1980 + (x % 37)), (x + 6, 1950 + (x % 29))] for x in range(-180, 1700, 23)], w=2.2, color=INK, taper=(1, 4))]
-    return {"sky": sky_, "back": back, "mid": mid, "fore": fore}
+    # The pit's near lip: drawn in front of whoever is in the pit.
+    lip = [(-200, 1520), (150, 1530), (240, 1560), (500, 1610), (860, 1600), (1150, 1560), (1240, 1520), (1700, 1500), (1700, 2600), (-200, 2600)]
+    front = [shape(f"{id}-lip", lip, CREAM_DK, w=4.0, rough=1.5),
+             strokes(f"{id}-lipticks", [[(x, 1660 + (x * 7) % 200), (x + 10, 1661 + (x * 7) % 200)] for x in range(-150, 1650, 41)], w=1.8, color=FINE, taper=(2, 2)),
+             strokes(f"{id}-lipcrack", cracks(520, 1612, 50, seed=21, depth=1, angle=100) + cracks(950, 1596, 40, seed=22, depth=1, angle=80), w=1.8, color=FINE)]
+    return {"sky": sky_, "back": back, "mid": mid, "fore": fore, "front": front}
 
 
 def boat(id, x, y, s=1.0):
