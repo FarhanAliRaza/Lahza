@@ -26,6 +26,8 @@ pub const SOUNDS: &[(&str, f32, &str)] = &[
     ("ding", 1.4, "a bell: success, a notification, a reveal"),
     ("sparkle", 0.9, "glitter: magic, a highlight appearing"),
     ("glitch", 0.35, "digital breakup: glitch transitions, errors"),
+    ("sting", 1.3, "a brassy dissonant stab: a shock, a gasp, a dreadful reveal"),
+    ("chime", 1.9, "two soft bell strikes: a reveal, a thing appearing with wonder"),
 ];
 
 /// Samples of a built-in sound, or None for an unknown name.
@@ -122,6 +124,42 @@ pub fn generate(name: &str) -> Option<Vec<f32>> {
                     if s >= 0.0 {
                         let vib = 1.0 + 0.004 * (TAU * 7.0 * s).sin();
                         *o += 0.5 * (TAU * f * vib * s).sin() * (-s / 0.12).exp() * (s / 0.002).min(1.0);
+                    }
+                }
+            }
+        }
+        "sting" => {
+            // A dissonant cluster of brassy saws (many harmonics), its
+            // brightness closing as it decays, over a low hit.
+            let chord = [77.8f32, 155.6, 164.8, 233.1, 311.1];
+            let mut lp = OnePole::default();
+            let mut phases = [0.0f32; 5];
+            let mut body = 0.0f32;
+            for (i, o) in out.iter_mut().enumerate() {
+                let s = t(i);
+                let swell = (s / 0.012).min(1.0) * ((-s / 0.55).exp() * 0.8 + 0.2 * (-s / 0.12).exp());
+                let mut v = 0.0f32;
+                for (k, f) in chord.iter().enumerate() {
+                    let detune = 1.0 + 0.003 * (k as f32 - 2.0) + 0.002 * (TAU * 5.5 * s).sin();
+                    phases[k] = (phases[k] + f * detune / RATE as f32).fract();
+                    v += (2.0 * phases[k] - 1.0) * if k == 0 { 0.9 } else { 0.55 };
+                }
+                let cut = 600.0 + 4200.0 * (-s / 0.25).exp();
+                let brass = lp.low(v, cut);
+                body += TAU * (60.0 + 50.0 * (-s / 0.04).exp()) / RATE as f32;
+                let low = body.sin() * (-s / 0.18).exp() * 0.8;
+                *o = ((brass * swell + low) * 1.6).tanh() * (1.0 - (s / seconds).powi(6));
+            }
+        }
+        "chime" => {
+            let strikes = [(0.0f32, 1046.5f32, 1.0f32), (0.09, 1568.0, 0.8)];
+            let partials = [(1.0f32, 1.0f32, 1.1f32), (2.0, 0.35, 0.6), (3.01, 0.22, 0.35), (4.17, 0.12, 0.25)];
+            for &(start, f, amp) in &strikes {
+                for (i, o) in out.iter_mut().enumerate() {
+                    let s = t(i) - start;
+                    if s >= 0.0 {
+                        let attack = (s / 0.004).min(1.0);
+                        *o += amp * attack * partials.iter().map(|&(r, a, d)| a * (TAU * f * r * s).sin() * (-s / d).exp()).sum::<f32>();
                     }
                 }
             }

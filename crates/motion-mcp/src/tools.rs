@@ -104,7 +104,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "sfx_add",
-            description: "Add a sound effect at one or more times. `sound` is a built-in effect (whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom, riser, ding, sparkle, glitch; see \"sounds\" in lahza://catalog) or an audio file. Anchor it to the animation it belongs to so it moves with it: \"#card.start - 3f\" (a whoosh leads its move), \"#title.end\", \"beat:9\", \"hit:2\". A riser should end where the reveal lands: at = \"#reveal.start - 1.6\". Each placement is a sound with an id (whoosh1, whoosh2…).",
+            description: "Add a sound effect at one or more times. `sound` is a built-in effect (whoosh, whoosh-out, swipe, pop, click, tick, type, thud, hit, boom, riser, ding, sparkle, glitch, sting, chime; see \"sounds\" in lahza://catalog) or an audio file. Anchor it to the animation it belongs to so it moves with it: \"#card.start - 3f\" (a whoosh leads its move), \"#title.end\", \"beat:9\", \"hit:2\". A riser should end where the reveal lands: at = \"#reveal.start - 1.6\". Each placement is a sound with an id (whoosh1, whoosh2…).",
             schema: obj(json!({
                 "sound": {"type": "string"},
                 "at": {"description": "a time, or a list of times", "type": ["number", "string", "array"]},
