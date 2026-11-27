@@ -119,6 +119,27 @@ fading tail):
  "stroke": {"color": "#3b35b0", "width": 3, "cap": "butt", "dash": [14, 12]}}
 ```
 
+A path stroke with `ink` is a dip-pen line: a filled outline whose width
+swells and thins with seeded `pressure` (0..1, a change every
+`pressure_scale` px), whose open ends taper to points over `taper`
+([start, end] px) and whose centre strays `wobble` px (every
+`wobble_scale` px). The same path and `seed` always draw the same line, so
+a part redrawn every frame does not shimmer. With `"fixed": true` the width and
+taper are output px at any scale or camera zoom, so a close-up is drawn
+with the same pen as a wide shot. `rough` on a path (`amount`
+px, a bump every `scale` px, `seed`) cuts its edges by hand, fill and
+stroke alike. A path can also be a smooth curve through points:
+`{"points": [[x, y], …], "closed": true}` (Catmull-Rom; `smooth` 0 is
+straight segments):
+
+```json
+{"id": "jaw", "kind": "shape", "shape": "path",
+ "d": {"points": [[-60, 0], [-40, 38], [0, 52], [44, 36], [62, -4]]},
+ "rough": {"amount": 1, "scale": 18, "seed": 4},
+ "stroke": {"color": "#170b08", "width": 4,
+            "ink": {"taper": [12, 16], "pressure": 0.45, "wobble": 0.7, "seed": 4}}}
+```
+
 A path stroke's colour can run along its length: `gradient` replaces
 `color`; offset 0 is the path's start and 1 its end, measured over the
 full path, so `trim` reveals the colours without sliding them while it

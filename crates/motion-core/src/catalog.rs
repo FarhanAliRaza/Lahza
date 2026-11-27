@@ -194,10 +194,13 @@ pub fn catalog_json() -> Value {
                 {"type": "displace", "amount": "px", "scale": "feature size px", "speed": "evolution per second", "seed": 0},
                 {"type": "directional_blur", "angle": "degrees", "length": "px"},
                 {"type": "rgb_split", "amount": "px", "angle": "degrees"},
+                {"type": "sharpen", "radius": "blur sigma px (default 5)", "amount": "default 0.6: unsharp mask, edges get a faint rim"},
+                {"type": "chroma_blur", "radius": "colour blur px (default 3)", "offset": "px the colour is printed off-register (default 2)", "angle": "degrees", "note": "brightness stays sharp; colour blurred and shifted (old cel / print)"},
                 {"type": "vignette", "amount": 0.5, "softness": 0.5},
-                {"type": "grain", "amount": 0.08, "size": "px", "seed": 0}
+                {"type": "grain", "amount": 0.08, "size": "px", "seed": 0},
+                {"type": "mottle", "amount": "brightness drift (default 0.04)", "scale": "blotch size px (default 140)", "speed": "evolution per second (default 0.25)", "seed": 0}
             ],
-            "effects_order": "shadow (below), then the layer through displace → directional_blur → rgb_split → colour effects in list order → vignette → grain, then glow (above); blur applies to the layer's picture first",
+            "effects_order": "shadow (below), then the layer through displace → directional_blur → rgb_split → sharpen → chroma_blur → colour effects, vignette, grain and mottle in list order, then glow (above); blur applies to the layer's picture first",
             "effects_note": "effects apply to the layer as one picture; on a comp they apply to the flattened comp (like an AE precomp)",
             "matte": {"layer": "sibling layer id used as a track matte (not drawn itself)", "mode": "alpha | alpha_inverted | luma | luma_inverted"},
             "space": "world (default) | screen: screen ignores the scene camera's zoom/orbit/dolly and stays put on screen, drawn in layer order (titles, captions and finishing layers over a moving 3D camera)",
@@ -213,7 +216,7 @@ pub fn catalog_json() -> Value {
         "layer_kinds": {
             "shape": {
                 "shape": "circle | rect | capsule | ring | arc | polygon | star | line | path | field",
-                "d": "path only: SVG path data in layer space (M L H V C S Q T A Z, absolute or relative), or a primitive {\"shape\": \"circle|rect|capsule|polygon|star\", \"size\", \"radius\", \"sides\", \"inner\"}, or keys that MORPH: {\"keys\": [{\"at\", \"v\": path or primitive, \"ease\", \"anchor\", \"lead\", \"dur\"}]} (outlines are resampled and aligned, so any two shapes morph); fill uses non-zero winding; trim draws the stroke on",
+                "d": "path only: SVG path data in layer space (M L H V C S Q T A Z, absolute or relative), or a primitive {\"shape\": \"circle|rect|capsule|polygon|star\", \"size\", \"radius\", \"sides\", \"inner\"}, or a smooth curve through points {\"points\": [[x, y], …], \"closed\": bool, \"smooth\": 0..1 (default 1, Catmull-Rom; 0 straight)}, or keys that MORPH: {\"keys\": [{\"at\", \"v\": path or primitive, \"ease\", \"anchor\", \"lead\", \"dur\"}]} (outlines are resampled and aligned, so any two shapes morph); fill uses non-zero winding; trim draws the stroke on",
                 "size": "[w, h] (default [100, 100]); circle/ring/arc/polygon/star use size[0] as diameter",
                 "radius": "corner rounding (rect, polygon, star)", "thickness": "ring, arc and line width (default 10)",
                 "sides": "polygon sides / star points (default 5)", "inner": "star inner radius ratio (default 0.5)",
@@ -223,7 +226,8 @@ pub fn catalog_json() -> Value {
                 "points": "field only: [{\"position\": [x, y] layer space (animatable), \"color\": colour (animatable), \"radius\": px the colour holds (animatable, default 200)}, …] blended smoothly across the size box (mesh/blob gradient background)",
                 "softness": "field: how far colours blend (default 1; 0.25 crisp, 2 very soft; animatable)",
                 "warp": "field: noise displacement px of the blend (default 0; animatable)", "warp_scale": "field: warp noise feature size px (default 300)",
-                "stroke": {"color": "colour (default white)", "width": "px", "gradient": "path strokes: {\"stops\": [[0, colour], [1, colour]], \"along\": \"length\"} colour along the full path's length (0 = start, 1 = end; trim reveals it without sliding), replaces color; works with caps, joins, dashes, feathers", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px, animatable (marching ants)", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "note": "cap, join, dash and feathers apply to path strokes"}
+                "stroke": {"color": "colour (default white)", "width": "px", "gradient": "path strokes: {\"stops\": [[0, colour], [1, colour]], \"along\": \"length\"} colour along the full path's length (0 = start, 1 = end; trim reveals it without sliding), replaces color; works with caps, joins, dashes, feathers", "cap": "round | butt | square (default round)", "join": "round | miter | bevel (default round)", "miter_limit": "default 4", "dash": "[dash, gap, …] px", "dash_offset": "px, animatable (marching ants)", "feather": "px faded at the far end (the head while trim draws it on)", "feather_start": "px faded at the start (a fading tail)", "ink": "path strokes: a dip-pen line instead of an even one, drawn as a filled outline: {\"taper\": [start px, end px] the ends thin to points (default [14, 14]; 0 blunt), \"pressure\": 0..1 how much width swells and thins (default 0.4), \"pressure_scale\": px between swells (default 48), \"wobble\": px the line strays sideways (default 0.6), \"wobble_scale\": px (default 36), \"seed\": 0, \"fixed\": true keeps width and taper in output px at any scale or zoom (one pen for close-ups and wides)}; seeded, so the same path redraws identically every frame (caps, joins and dashes do not apply)", "note": "cap, join, dash and feathers apply to path strokes"},
+                "rough": "path only: hand-cut edges {\"amount\": px in and out (default 1.5), \"scale\": px between bumps (default 24), \"seed\": 0}: the outline (fill and stroke) jittered by seeded noise, identical every frame"
             },
             "text": {
                 "text": "string; \\n breaks lines", "font": "Inter | Inter Medium | Inter SemiBold | project-relative .ttf/.otf",

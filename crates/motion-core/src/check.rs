@@ -521,6 +521,7 @@ fn tracing(project: &Project, compiled: &Compiled, issues: &mut Vec<Issue>) {
             numbers >= 6
         }
         PathValue::Shape(_) => false,
+        PathValue::Spline(s) => s.points.len() >= 3,
     };
     fn paths<'a>(layers: &'a [crate::document::Layer], out: &mut Vec<&'a crate::document::Layer>) {
         for l in layers {

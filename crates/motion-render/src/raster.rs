@@ -596,8 +596,45 @@ pub const OP_THRESHOLD: f32 = 10.0;
 pub const OP_DISPLACE: f32 = 20.0;
 pub const OP_DIRECTIONAL_BLUR: f32 = 21.0;
 pub const OP_RGB_SPLIT: f32 = 22.0;
+pub const OP_SHARPEN: f32 = 23.0;
+pub const OP_CHROMA_BLUR: f32 = 24.0;
 pub const OP_VIGNETTE: f32 = 30.0;
 pub const OP_GRAIN: f32 = 31.0;
+pub const OP_MOTTLE: f32 = 32.0;
+
+/// A soft blur's taps (unit offsets, weight): the centre, a ring at half
+/// the reach and a ring at the reach turned 22.5°. Reach = 1.8 sigma.
+const SOFT_TAPS: [[f32; 3]; 17] = [
+    [0.0, 0.0, 0.25],
+    [0.5, 0.0, 0.0625],
+    [0.353_553, 0.353_553, 0.0625],
+    [0.0, 0.5, 0.0625],
+    [-0.353_553, 0.353_553, 0.0625],
+    [-0.5, 0.0, 0.0625],
+    [-0.353_553, -0.353_553, 0.0625],
+    [0.0, -0.5, 0.0625],
+    [0.353_553, -0.353_553, 0.0625],
+    [0.923_880, 0.382_683, 0.03125],
+    [0.382_683, 0.923_880, 0.03125],
+    [-0.382_683, 0.923_880, 0.03125],
+    [-0.923_880, 0.382_683, 0.03125],
+    [-0.923_880, -0.382_683, 0.03125],
+    [-0.382_683, -0.923_880, 0.03125],
+    [0.382_683, -0.923_880, 0.03125],
+    [0.923_880, -0.382_683, 0.03125],
+];
+
+fn soft_blur(src: &Sources, prim: &Prim, p: V2, sigma: f32) -> [f32; 4] {
+    let reach = 1.8 * sigma;
+    let mut acc = [0.0f32; 4];
+    for t in &SOFT_TAPS {
+        let c = sample_image(src, prim, [p[0] + t[0] * reach, p[1] + t[1] * reach]);
+        for j in 0..4 {
+            acc[j] += c[j] * t[2];
+        }
+    }
+    acc
+}
 
 /// Integer hash → [0, 1). Same bits on CPU and GPU.
 pub fn hash(x: i32, y: i32, seed: u32) -> f32 {
@@ -720,6 +757,12 @@ fn apply_color(op: &[[f32; 4]], c: V3, l: V2, size: V2) -> V3 {
             let v = t * t * (3.0 - 2.0 * t) * h[2];
             c.map(|x| x * (1.0 - v))
         }
+        OP_MOTTLE => {
+            let (time, seed) = (op[1][0], op[1][1] as u32);
+            let q = [l[0] / h[3].max(1e-3) + time, l[1] / h[3].max(1e-3) + time * 0.7];
+            let n = 0.65 * value_noise(q[0], q[1], seed) + 0.35 * value_noise(q[0] * 2.03 + 5.2, q[1] * 2.03 + 1.3, seed ^ 0x51ed_270b);
+            c.map(|v| v * (1.0 + n * h[2]))
+        }
         OP_GRAIN => {
             let size = h[3].max(1e-3);
             let n = hash((l[0] / size).floor() as i32, (l[1] / size).floor() as i32, op[1][0] as u32) - 0.5;
@@ -738,6 +781,8 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
     let mut uv = l;
     let mut blur: Option<V2> = None;
     let mut split: Option<V2> = None;
+    let mut sharpen: Option<V2> = None;
+    let mut chroma: Option<(f32, V2)> = None;
     let mut i = start;
     while i < end {
         let h = ops[i];
@@ -749,6 +794,8 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
             }
             OP_DIRECTIONAL_BLUR => blur = Some([h[2], h[3]]),
             OP_RGB_SPLIT => split = Some([h[2], h[3]]),
+            OP_SHARPEN => sharpen = Some([h[2], h[3]]),
+            OP_CHROMA_BLUR => chroma = Some((h[2], [ops[i + 1][0], ops[i + 1][1]])),
             _ => {}
         }
         i += h[1] as usize;
@@ -777,6 +824,22 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
         let b = tap([uv[0] - d[0], uv[1] - d[1]]);
         let a = c[3].max(r[3]).max(b[3]);
         c = [r[0], c[1], b[2], a];
+    }
+    if let Some([sigma, amount]) = sharpen {
+        if sigma > 0.0 {
+            let b = soft_blur(src, prim, uv, sigma);
+            c = std::array::from_fn(|j| (c[j] + amount * (c[j] - b[j])).max(0.0));
+            c[3] = c[3].min(1.0);
+        }
+    }
+    if let Some((sigma, off)) = chroma {
+        let b = soft_blur(src, prim, [uv[0] + off[0], uv[1] + off[1]], sigma.max(1e-3));
+        if c[3] > 0.0 && b[3] > 0.0 {
+            let cs: V3 = [c[0] / c[3], c[1] / c[3], c[2] / c[3]];
+            let bs: V3 = [b[0] / b[3], b[1] / b[3], b[2] / b[3]];
+            let (y, yb) = (luma3(cs), luma3(bs));
+            c = [(y + bs[0] - yb) * c[3], (y + bs[1] - yb) * c[3], (y + bs[2] - yb) * c[3], c[3]];
+        }
     }
     let a = c[3];
     if a <= 0.0 {

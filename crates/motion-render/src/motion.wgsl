@@ -639,6 +639,14 @@ fn apply_color(i: u32, c: vec3<f32>, l: vec2<f32>, size: vec2<f32>) -> vec3<f32>
         let v = t * t * (3.0 - 2.0 * t) * h.z;
         return c * (1.0 - v);
     }
+    if op == 32.0 {
+        let e = b_ops[i + 1u];
+        let sz = max(h.w, 1e-3);
+        let q = l / sz + vec2<f32>(e.x, e.x * 0.7);
+        let seed = u32(e.y);
+        let n = 0.65 * value_noise(q.x, q.y, seed) + 0.35 * value_noise(q.x * 2.03 + 5.2, q.y * 2.03 + 1.3, seed ^ 0x51ed270bu);
+        return c * (1.0 + n * h.z);
+    }
     if op == 31.0 {
         let sz = max(h.w, 1e-3);
         let n = hash(i32(floor(l.x / sz)), i32(floor(l.y / sz)), u32(b_ops[i + 1u].x)) - 0.5;
@@ -657,6 +665,20 @@ fn tap(prim: Prim, p: vec2<f32>, blur: vec2<f32>, has_blur: bool) -> vec4<f32> {
     return acc;
 }
 
+// Mirrors raster.rs SOFT_TAPS: centre, half-reach ring, reach ring at 22.5°.
+const SOFT_X = array<f32, 17>(0.0, 0.5, 0.353553, 0.0, -0.353553, -0.5, -0.353553, 0.0, 0.353553, 0.92388, 0.382683, -0.382683, -0.92388, -0.92388, -0.382683, 0.382683, 0.92388);
+const SOFT_Y = array<f32, 17>(0.0, 0.0, 0.353553, 0.5, 0.353553, 0.0, -0.353553, -0.5, -0.353553, 0.382683, 0.92388, 0.92388, 0.382683, -0.382683, -0.92388, -0.92388, -0.382683);
+const SOFT_W = array<f32, 17>(0.25, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.03125, 0.03125, 0.03125, 0.03125, 0.03125, 0.03125, 0.03125, 0.03125);
+
+fn soft_blur(prim: Prim, p: vec2<f32>, sigma: f32) -> vec4<f32> {
+    let reach = 1.8 * sigma;
+    var acc = vec4<f32>(0.0);
+    for (var k = 0; k < 17; k++) {
+        acc += sample_image(prim, p + vec2<f32>(SOFT_X[k], SOFT_Y[k]) * reach) * SOFT_W[k];
+    }
+    return acc;
+}
+
 fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
     let start = bitcast<u32>(prim.paint.z);
     let end = start + bitcast<u32>(prim.paint.w);
@@ -666,6 +688,9 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
     var has_blur = false;
     var split = vec2<f32>(0.0);
     var has_split = false;
+    var sharpen = vec2<f32>(0.0);
+    var chroma = vec3<f32>(0.0);
+    var has_chroma = false;
     var i = start;
     while i < end {
         let h = b_ops[i];
@@ -682,6 +707,11 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
         } else if h.x == 22.0 {
             split = h.zw;
             has_split = true;
+        } else if h.x == 23.0 {
+            sharpen = h.zw;
+        } else if h.x == 24.0 {
+            chroma = vec3<f32>(h.z, b_ops[i + 1u].xy);
+            has_chroma = true;
         }
         i += u32(h.y);
     }
@@ -690,6 +720,20 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
         let r = tap(prim, uv + split, blur, has_blur);
         let b = tap(prim, uv - split, blur, has_blur);
         c = vec4<f32>(r.x, c.y, b.z, max(max(c.w, r.w), b.w));
+    }
+    if sharpen.x > 0.0 {
+        let b = soft_blur(prim, uv, sharpen.x);
+        c = max(c + sharpen.y * (c - b), vec4<f32>(0.0));
+        c.w = min(c.w, 1.0);
+    }
+    if has_chroma {
+        let b = soft_blur(prim, uv + chroma.yz, max(chroma.x, 1e-3));
+        if c.w > 0.0 && b.w > 0.0 {
+            let cs = c.xyz / c.w;
+            let bs = b.xyz / b.w;
+            let y = luma3(cs);
+            c = vec4<f32>((vec3<f32>(y) + bs - vec3<f32>(luma3(bs))) * c.w, c.w);
+        }
     }
     let a = c.w;
     if a <= 0.0 { return c; }

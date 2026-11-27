@@ -682,6 +682,40 @@ pub enum Effect {
         #[serde(default)]
         seed: u32,
     },
+    /// Unsharp mask: the picture plus `amount` × (picture − its blur), so
+    /// every edge gets a faint rim (pale on the light side of an ink line).
+    Sharpen {
+        /// Blur sigma, px (default 5).
+        #[serde(default = "five_prop")]
+        radius: Property<f64>,
+        /// default 0.6.
+        #[serde(default = "sharpen_amount")]
+        amount: Property<f64>,
+    },
+    /// Colour blurred more than brightness and printed off-register: the
+    /// brightness stays sharp, the colour comes from a blur `radius` px
+    /// wide, shifted `offset` px along `angle` (old cel and print looks).
+    #[serde(rename = "chroma_blur")]
+    ChromaBlur {
+        #[serde(default = "three_prop")]
+        radius: Property<f64>,
+        #[serde(default = "two_prop")]
+        offset: Property<f64>,
+        #[serde(default = "zero_prop")]
+        angle: Property<f64>,
+    },
+    /// Slow, slight mottling of flat colour: brightness drifts by up to
+    /// `amount` in blotches `scale` px across that evolve at `speed`.
+    Mottle {
+        #[serde(default = "mottle_amount")]
+        amount: Property<f64>,
+        #[serde(default = "mottle_scale")]
+        scale: Property<f64>,
+        #[serde(default = "mottle_speed")]
+        speed: Property<f64>,
+        #[serde(default)]
+        seed: u32,
+    },
     /// Glow: a blurred, tinted copy added on top.
     Glow {
         #[serde(default = "white")]
@@ -716,6 +750,27 @@ fn grain_amount() -> Property<f64> {
 }
 fn twelve() -> Property<f64> {
     Property::Constant(12.0)
+}
+fn five_prop() -> Property<f64> {
+    Property::Constant(5.0)
+}
+fn three_prop() -> Property<f64> {
+    Property::Constant(3.0)
+}
+fn two_prop() -> Property<f64> {
+    Property::Constant(2.0)
+}
+fn sharpen_amount() -> Property<f64> {
+    Property::Constant(0.6)
+}
+fn mottle_amount() -> Property<f64> {
+    Property::Constant(0.04)
+}
+fn mottle_scale() -> Property<f64> {
+    Property::Constant(140.0)
+}
+fn mottle_speed() -> Property<f64> {
+    Property::Constant(0.25)
 }
 
 /// Track matte: the layer shows only where the `layer` (a sibling, which
@@ -1177,6 +1232,9 @@ pub struct ShapeLayer {
     /// Field: the warp noise's feature size in px.
     #[serde(default = "warp_scale", skip_serializing_if = "is_warp_scale")]
     pub warp_scale: Property<f64>,
+    /// Path: hand-cut edges (the outline jittered by seeded noise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rough: Option<Rough>,
 }
 
 /// One coloured point of a field shape (layer space, like `d`).
@@ -1248,6 +1306,53 @@ pub enum PathData {
 pub enum PathValue {
     Svg(String),
     Shape(PathShape),
+    Spline(SplinePath),
+}
+
+/// A smooth curve through points (Catmull-Rom), for lines drawn as point
+/// lists: `{"points": [[x, y], …], "closed": true}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplinePath {
+    pub points: Vec<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+    /// 0 straight segments, 1 (default) the full Catmull-Rom curve.
+    #[serde(default = "one_f64", skip_serializing_if = "is_one_f64")]
+    pub smooth: f64,
+}
+
+/// SVG cubic Béziers through `points` (uniform Catmull-Rom, tangents
+/// scaled by `smooth`).
+pub fn spline_svg(s: &SplinePath) -> String {
+    let p = &s.points;
+    let n = p.len();
+    if n == 0 {
+        return String::new();
+    }
+    let mut d = format!("M {:.3} {:.3}", p[0][0], p[0][1]);
+    if n == 1 {
+        return d;
+    }
+    let at = |i: isize| -> [f64; 2] {
+        if s.closed {
+            p[i.rem_euclid(n as isize) as usize]
+        } else {
+            p[i.clamp(0, n as isize - 1) as usize]
+        }
+    };
+    let k = s.smooth / 6.0;
+    let segs = if s.closed { n } else { n - 1 };
+    for i in 0..segs as isize {
+        let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let c1 = [p1[0] + (p2[0] - p0[0]) * k, p1[1] + (p2[1] - p0[1]) * k];
+        let c2 = [p2[0] - (p3[0] - p1[0]) * k, p2[1] - (p3[1] - p1[1]) * k];
+        d.push_str(&format!(" C {:.3} {:.3} {:.3} {:.3} {:.3} {:.3}", c1[0], c1[1], c2[0], c2[1], p2[0], p2[1]));
+    }
+    if s.closed {
+        d.push_str(" Z");
+    }
+    d
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1320,6 +1425,7 @@ impl PathValue {
         match self {
             PathValue::Svg(d) => d.clone(),
             PathValue::Shape(p) => primitive_path(p),
+            PathValue::Spline(s) => spline_svg(s),
         }
     }
 }
@@ -1471,6 +1577,81 @@ pub struct Stroke {
     /// Path strokes: colour along the stroke instead of `color`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient: Option<StrokeGradient>,
+    /// Path strokes: a dip-pen line instead of an even one: `width` swells
+    /// and thins with pressure, the ends taper to points, and the line
+    /// wobbles a little. Drawn as a filled outline (caps, joins and dashes
+    /// do not apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ink: Option<Ink>,
+}
+
+/// A hand-inked stroke. Pressure and wobble come from seeded noise along
+/// the line's length, so the same path and seed always draw the same line
+/// (a part redrawn every frame does not shimmer).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ink {
+    /// px over which the [start, end] of each line taper to a point (0: a
+    /// blunt end).
+    #[serde(default = "ink_taper")]
+    pub taper: [f64; 2],
+    /// How much the width swells and thins (0 even, 1 from nothing to
+    /// twice `width`).
+    #[serde(default = "ink_pressure")]
+    pub pressure: f64,
+    /// px between pressure changes.
+    #[serde(default = "ink_pressure_scale")]
+    pub pressure_scale: f64,
+    /// px the line strays sideways from the path.
+    #[serde(default = "ink_wobble")]
+    pub wobble: f64,
+    /// px between wobbles.
+    #[serde(default = "ink_wobble_scale")]
+    pub wobble_scale: f64,
+    #[serde(default)]
+    pub seed: u32,
+    /// `width` (and `taper`) in output px whatever the layer's scale or the
+    /// camera's zoom: one pen for wide shots and close-ups.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fixed: bool,
+}
+
+fn ink_taper() -> [f64; 2] {
+    [14.0, 14.0]
+}
+fn ink_pressure() -> f64 {
+    0.4
+}
+fn ink_pressure_scale() -> f64 {
+    48.0
+}
+fn ink_wobble() -> f64 {
+    0.6
+}
+fn ink_wobble_scale() -> f64 {
+    36.0
+}
+
+/// Hand-cut edges: a path's outline pushed in and out by seeded noise
+/// along its length (fill and stroke alike).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rough {
+    /// px in and out.
+    #[serde(default = "rough_amount")]
+    pub amount: f64,
+    /// px between bumps.
+    #[serde(default = "rough_scale")]
+    pub scale: f64,
+    #[serde(default)]
+    pub seed: u32,
+}
+
+fn rough_amount() -> f64 {
+    1.5
+}
+fn rough_scale() -> f64 {
+    24.0
 }
 
 /// A stroke colour that changes along the path: offset 0 is the path's
@@ -1508,13 +1689,14 @@ pub struct StrokeStyle {
     pub dash_offset: f64,
     pub feather: f64,
     pub feather_start: f64,
+    pub ink: Option<Ink>,
 }
 
 impl Stroke {
     pub fn style(&self) -> Option<StrokeStyle> {
         let dash: Vec<f64> = self.dash.iter().map(|d| d.max(0.0)).collect();
         let dashed = dash.iter().sum::<f64>() > 0.0;
-        let plain = self.cap == LineCap::Round && self.join == LineJoin::Round && !dashed && self.feather <= 0.0 && self.feather_start <= 0.0;
+        let plain = self.cap == LineCap::Round && self.join == LineJoin::Round && !dashed && self.feather <= 0.0 && self.feather_start <= 0.0 && self.ink.is_none();
         (!plain).then(|| StrokeStyle {
             cap: self.cap,
             join: self.join,
@@ -1524,6 +1706,7 @@ impl Stroke {
             dash_offset: 0.0,
             feather: self.feather.max(0.0),
             feather_start: self.feather_start.max(0.0),
+            ink: self.ink,
         })
     }
 }

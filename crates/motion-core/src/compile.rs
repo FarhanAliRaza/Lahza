@@ -169,8 +169,14 @@ pub enum PostKind {
     Displace,
     DirectionalBlur,
     RgbSplit,
+    /// Unsharp mask [sigma px, amount].
+    Sharpen,
+    /// [radius px, offset x px, offset y px].
+    ChromaBlur,
     Vignette,
     Grain,
+    /// [amount, scale px, speed × t].
+    Mottle,
 }
 
 /// Evaluated post effect: numbers in `v` by kind (lengths in canvas px):
@@ -271,6 +277,8 @@ pub struct ShapeState {
     pub path: Option<PathMorph>,
     /// `ShapeKind::Field`: its points this frame.
     pub field: Option<FieldState>,
+    /// Path: hand-cut edges.
+    pub rough: Option<crate::document::Rough>,
 }
 
 /// A field shape's evaluated points (layer space) and blend.
@@ -672,6 +680,7 @@ struct CShape {
     stroke_gradient: Option<Arc<Vec<(f64, Color)>>>,
     path: Option<(Vec<Arc<str>>, Prop<f64>)>,
     field: Option<CField>,
+    rough: Option<crate::document::Rough>,
 }
 
 struct CField {
@@ -1082,6 +1091,15 @@ impl<'a> Compiler<'a> {
                 }
                 Effect::DirectionalBlur { angle, length } => self.post(PostKind::DirectionalBlur, &[angle, length], &[], id, &what, start, step, shift),
                 Effect::RgbSplit { amount, angle } => self.post(PostKind::RgbSplit, &[amount, angle], &[], id, &what, start, step, shift),
+                Effect::Sharpen { radius, amount } => self.post(PostKind::Sharpen, &[radius, amount], &[], id, &what, start, step, shift),
+                Effect::ChromaBlur { radius, offset, angle } => self.post(PostKind::ChromaBlur, &[radius, offset, angle], &[], id, &what, start, step, shift),
+                Effect::Mottle { amount, scale, speed, seed } => {
+                    let mut e = self.post(PostKind::Mottle, &[amount, scale, speed], &[], id, &what, start, step, shift);
+                    if let CEffect::Post(p) = &mut e {
+                        p.seed = *seed;
+                    }
+                    e
+                }
                 Effect::Vignette { amount, softness } => self.post(PostKind::Vignette, &[amount, softness], &[], id, &what, start, step, shift),
                 Effect::Grain { amount, size, seed } => {
                     let mut e = self.post(PostKind::Grain, &[amount, size], &[], id, &what, start, step, shift);
@@ -1194,6 +1212,7 @@ impl<'a> Compiler<'a> {
                             warp_scale: self.prop(&s.warp_scale, id, "warp_scale", start, step, shift),
                         }
                     }),
+                    rough: s.rough,
                     path: match (s.shape, &s.d) {
                         (ShapeKind::Path, Some(PathData::Static(v))) => Some((vec![v.svg().into()], Prop::constant(0.0))),
                         (ShapeKind::Path, Some(PathData::Keys(keys))) => {
@@ -2034,6 +2053,7 @@ fn canvas_rect(id: &str, w: f64, h: f64, color: Color) -> LayerState {
             stroke_gradient: None,
             path: None,
             field: None,
+            rough: None,
         }),
         view: None,
     }
@@ -2313,6 +2333,16 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                         v = [c * len, s * len, 0.0, 0.0, 0.0];
                     }
                     PostKind::Grain => v[1] *= scale,
+                    PostKind::Sharpen => v[0] *= scale,
+                    PostKind::ChromaBlur => {
+                        let (s, c) = crate::dm::sin_cos(v[2].to_radians());
+                        let len = v[1] * scale;
+                        v = [v[0] * scale, c * len, s * len, 0.0, 0.0];
+                    }
+                    PostKind::Mottle => {
+                        v[1] *= scale;
+                        v[2] *= t;
+                    }
                     _ => {}
                 }
                 // Grain changes every frame (and holds on stepped frames).
@@ -2403,6 +2433,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                 warp: f.warp.at(t),
                 warp_scale: f.warp_scale.at(t).max(1e-3),
             }),
+            rough: s.rough,
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Mesh(m) => match &l.rope {

@@ -281,9 +281,216 @@ pub fn morph(m: &PathMorph, tolerance: f64) -> Result<Vec<Poly>, String> {
     Ok(out)
 }
 
+/// Smooth seeded value noise in −1..1 along a line; with `period` cells
+/// (> 0) it wraps, so a closed outline has no seam.
+pub fn noise1(x: f64, seed: u32, period: i64) -> f64 {
+    let i = x.floor();
+    let f = x - i;
+    let h = |k: i64| {
+        let k = if period > 0 { k.rem_euclid(period) } else { k };
+        crate::noise::hash3(k as i32, (k >> 31) as i32, 0, seed) as f64 * 2.0 - 1.0
+    };
+    let (a, b) = (h(i as i64), h(i as i64 + 1));
+    a + (b - a) * (f * f * (3.0 - 2.0 * f))
+}
+
+/// `line` with extra points so no segment is longer than `step`, and each
+/// point's arc length.
+fn densify(line: &[Pt], step: f64) -> (Vec<Pt>, Vec<f64>) {
+    let mut pts = Vec::with_capacity(line.len());
+    let mut s = Vec::with_capacity(line.len());
+    let mut acc = 0.0;
+    pts.push(line[0]);
+    s.push(0.0);
+    for w in line.windows(2) {
+        let l = seg_len(w[0], w[1]);
+        let n = ((l / step).ceil() as usize).clamp(1, 4096);
+        for k in 1..=n {
+            let t = k as f64 / n as f64;
+            pts.push((w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t));
+            s.push(acc + l * t);
+        }
+        acc += l;
+    }
+    (pts, s)
+}
+
+/// Unit normals (left of the direction of travel) of a polyline; a closed
+/// one (`pts` without its repeated end) wraps around.
+fn normals(pts: &[Pt], closed: bool) -> Vec<Pt> {
+    let n = pts.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = if closed {
+                (pts[(i + n - 1) % n], pts[(i + 1) % n])
+            } else {
+                (pts[i.saturating_sub(1)], pts[(i + 1).min(n - 1)])
+            };
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let l = crate::dm::hypot(dx, dy);
+            if l < 1e-12 {
+                (0.0, 0.0)
+            } else {
+                (-dy / l, dx / l)
+            }
+        })
+        .collect()
+}
+
+/// A polyline that ends where it starts.
+fn is_loop(line: &[Pt]) -> bool {
+    line.len() > 3 && seg_len(line[0], line[line.len() - 1]) < 1e-6
+}
+
+/// Filled outlines of dip-pen lines along `lines` (layer units): the width
+/// swells with seeded pressure, open ends taper to points, the centre
+/// wobbles. Open lines give one polygon each; a closed loop gives an outer
+/// and a reversed inner ring (non-zero fill leaves the inside empty).
+pub fn ink_outline(lines: &[Vec<Pt>], width: f64, ink: &crate::document::Ink, tolerance: f64) -> Vec<Vec<Pt>> {
+    let mut out = Vec::new();
+    let step = (width * 0.6).min(ink.wobble_scale.max(1.0) / 6.0).min(ink.pressure_scale.max(1.0) / 6.0).max(tolerance * 2.0).max(1e-3);
+    for (index, line) in lines.iter().enumerate() {
+        if line.len() < 2 {
+            continue;
+        }
+        let seed = ink.seed.wrapping_add((index as u32).wrapping_mul(7919));
+        let closed = is_loop(line);
+        let (mut pts, mut s) = densify(line, step);
+        let total = *s.last().unwrap_or(&0.0);
+        if total <= 1e-9 {
+            continue;
+        }
+        if closed {
+            pts.pop();
+            s.pop();
+        }
+        let nrm = normals(&pts, closed);
+        // Noise coordinates: periodic around a loop (whole cells), plain
+        // along an open line.
+        let coord = |s: f64, scale: f64| -> (f64, i64) {
+            let scale = scale.max(1e-3);
+            if closed {
+                let cells = (total / scale).round().max(3.0);
+                (s / total * cells, cells as i64)
+            } else {
+                (s / scale, 0)
+            }
+        };
+        let (t0, t1) = (ink.taper[0].max(0.0).min(total * 0.45), ink.taper[1].max(0.0).min(total * 0.45));
+        let ease = |u: f64| {
+            let u = u.clamp(0.0, 1.0);
+            1.0 - (1.0 - u) * (1.0 - u)
+        };
+        let mut left = Vec::with_capacity(pts.len());
+        let mut right = Vec::with_capacity(pts.len());
+        for i in 0..pts.len() {
+            let (x, period) = coord(s[i], ink.pressure_scale);
+            let mut w = width * (1.0 + ink.pressure * noise1(x, seed, period)).max(0.0);
+            if !closed {
+                if t0 > 0.0 {
+                    w *= ease(s[i] / t0);
+                }
+                if t1 > 0.0 {
+                    w *= ease((total - s[i]) / t1);
+                }
+            }
+            let (x, period) = coord(s[i], ink.wobble_scale);
+            let off = ink.wobble * noise1(x, seed ^ 0x5bd1_e995, period);
+            let (p, n) = (pts[i], nrm[i]);
+            let c = (p.0 + n.0 * off, p.1 + n.1 * off);
+            left.push((c.0 + n.0 * w * 0.5, c.1 + n.1 * w * 0.5));
+            right.push((c.0 - n.0 * w * 0.5, c.1 - n.1 * w * 0.5));
+        }
+        right.reverse();
+        if closed {
+            out.push(left);
+            out.push(right);
+        } else {
+            left.extend(right);
+            out.push(left);
+        }
+    }
+    out.retain(|p| p.len() >= 3);
+    out
+}
+
+/// Hand-cut outlines: each subpath pushed in and out along its normals by
+/// seeded noise (`amount` px, a bump every `scale` px).
+pub fn roughen(subpaths: &[Poly], rough: &crate::document::Rough, tolerance: f64) -> Vec<Poly> {
+    if rough.amount == 0.0 {
+        return subpaths.to_vec();
+    }
+    let scale = rough.scale.max(1e-3);
+    let step = (scale / 5.0).max(tolerance * 2.0).max(1e-3);
+    subpaths
+        .iter()
+        .enumerate()
+        .map(|(index, (pts, closed))| {
+            let seed = rough.seed.wrapping_add((index as u32).wrapping_mul(104_729));
+            let mut line = pts.clone();
+            if *closed && line.first() != line.last() {
+                line.push(line[0]);
+            }
+            let (mut dense, mut s) = densify(&line, step);
+            let total = *s.last().unwrap_or(&0.0);
+            if *closed {
+                dense.pop();
+                s.pop();
+            }
+            let nrm = normals(&dense, *closed);
+            let cells = (total / scale).round().max(3.0);
+            let moved = dense
+                .iter()
+                .zip(&nrm)
+                .zip(&s)
+                .map(|((p, n), s)| {
+                    let k = if *closed { rough.amount * noise1(s / total.max(1e-9) * cells, seed, cells as i64) } else { rough.amount * noise1(s / scale, seed, 0) };
+                    (p.0 + n.0 * k, p.1 + n.1 * k)
+                })
+                .collect();
+            (moved, *closed)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ink_tapers_to_points_and_is_stable() {
+        let ink = crate::document::Ink { taper: [10.0, 10.0], pressure: 0.4, pressure_scale: 40.0, wobble: 0.6, wobble_scale: 30.0, seed: 3, fixed: false };
+        let line = vec![(0.0, 0.0), (100.0, 0.0), (200.0, 40.0)];
+        let a = ink_outline(&[line.clone()], 4.0, &ink, 0.25);
+        let b = ink_outline(&[line], 4.0, &ink, 0.25);
+        assert_eq!(a, b, "same seed, same line");
+        assert_eq!(a.len(), 1);
+        let poly = &a[0];
+        let n = poly.len();
+        // The first and last left points meet the matching right points.
+        assert!(seg_len(poly[0], poly[n - 1]) < 1e-6, "start is a point");
+        assert!(seg_len(poly[n / 2 - 1], poly[n / 2]) < 1e-6, "end is a point");
+        // Mid-line the width is near 4 (pressure keeps it within 0.6..1.4×).
+        let mid = n / 4;
+        let w = seg_len(poly[mid], poly[n - 1 - mid]);
+        assert!(w > 4.0 * 0.5 && w < 4.0 * 1.5, "width {w}");
+        // A closed loop gives two rings and no taper.
+        let ring: Vec<Pt> = (0..=64).map(|i| {
+            let a = std::f64::consts::TAU * (i % 64) as f64 / 64.0;
+            (50.0 * crate::dm::cos(a), 50.0 * crate::dm::sin(a))
+        }).collect();
+        assert_eq!(ink_outline(&[ring], 4.0, &ink, 0.25).len(), 2);
+    }
+
+    #[test]
+    fn rough_closed_outline_has_no_seam() {
+        let sq = flatten("M -50 -50 L 50 -50 L 50 50 L -50 50 Z", 0.25).unwrap();
+        let r = roughen(&sq, &crate::document::Rough { amount: 3.0, scale: 20.0, seed: 1 }, 0.25);
+        let pts = &r[0].0;
+        let (first, last) = (pts[0], pts[pts.len() - 1]);
+        assert!(seg_len(first, last) < 6.0, "seam {first:?} {last:?}");
+        assert!(pts.iter().any(|p| (p.1 + 50.0).abs() > 0.5 && p.0.abs() < 40.0), "edges move");
+    }
 
     #[test]
     fn point_at_is_the_end_of_trim() {

@@ -236,6 +236,16 @@ fn splice(base: &str, hooked: &str, hooks: &[(&str, &str)], glue: &str, program:
 mod tests {
     use super::*;
 
+    /// The main shader parses and validates (catches WGSL errors on
+    /// machines without a GPU, where nothing else compiles it).
+    #[test]
+    fn motion_shader_validates() {
+        let source = crate::gpu::SHADER;
+        let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
+        let flags = naga::valid::ValidationFlags::all() ^ naga::valid::ValidationFlags::BINDINGS;
+        naga::valid::Validator::new(flags, naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
+    }
+
     /// The lines the Slang variants change are still in the shaders, once
     /// each (a shader edit that moves one would only show with a project
     /// that uses Slang materials, and with slangc installed).

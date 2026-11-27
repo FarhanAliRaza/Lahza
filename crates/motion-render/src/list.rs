@@ -487,6 +487,15 @@ impl Builder<'_> {
                 }
                 PostKind::DirectionalBlur => [OP_DIRECTIONAL_BLUR, 0.0, v[0] * k, v[1] * k],
                 PostKind::RgbSplit => [OP_RGB_SPLIT, 0.0, v[0] * k, v[1] * k],
+                PostKind::Sharpen => [OP_SHARPEN, 0.0, (v[0] * k).max(0.0), v[1]],
+                PostKind::ChromaBlur => {
+                    body.push([v[1] * k, v[2] * k, 0.0, 0.0]);
+                    [OP_CHROMA_BLUR, 0.0, (v[0] * k).max(0.0), 0.0]
+                }
+                PostKind::Mottle => {
+                    body.push([v[2], p.seed as f32, 0.0, 0.0]);
+                    [OP_MOTTLE, 0.0, v[0], (v[1] * k).max(1e-3)]
+                }
                 PostKind::Vignette => [OP_VIGNETTE, 0.0, v[0], v[1].clamp(0.0, 1.0)],
                 PostKind::Grain => {
                     body.push([(p.seed % 16_777_216) as f32, 0.0, 0.0, 0.0]);
@@ -1163,6 +1172,9 @@ impl Builder<'_> {
                 EffectState::Post(p) => match p.kind {
                     PostKind::Displace => post_pad += p.v[0].abs(),
                     PostKind::DirectionalBlur | PostKind::RgbSplit => post_pad += p.v[0].hypot(p.v[1]),
+                    // Their kernels reach 1.8 sigma (and the offset) past a pixel.
+                    PostKind::Sharpen => post_pad += 1.8 * p.v[0].abs(),
+                    PostKind::ChromaBlur => post_pad += 1.8 * p.v[0].abs() + p.v[1].hypot(p.v[2]),
                     _ => {}
                 },
             }
@@ -2029,6 +2041,10 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
     let Some(m) = &s.path else { return items };
     let tolerance = path::tolerance(matrix.max_scale());
     let Ok(subpaths) = morph(m, tolerance) else { return items };
+    let subpaths = match &s.rough {
+        Some(r) => path::roughen(&subpaths, r, tolerance),
+        None => subpaths,
+    };
     let mut add = |prim: Prim, bounds: [f64; 4], pad: f64| {
         if let Some((prim, _)) = with_inverse(prim, matrix, opacity) {
             let pad = pad + prim.inv_x[3] as f64 * 1.5;
@@ -2062,7 +2078,16 @@ fn path_items(s: &ShapeState, matrix: Proj, opacity: f64, blend: u32, stops: &mu
                     push_params(&measured, segments);
                     (first, count)
                 });
-                let outline = stroke_outline(&lines, width, style, tolerance);
+                let outline = match &style.ink {
+                    Some(ink) if ink.fixed => {
+                        // Output px: undo the layer's scale on width and taper.
+                        let k = 1.0 / matrix.max_scale().max(1e-6);
+                        let ink = lahza_motion_core::document::Ink { taper: [ink.taper[0] * k, ink.taper[1] * k], ..*ink };
+                        path::ink_outline(&lines, width * k, &ink, tolerance)
+                    }
+                    Some(ink) => path::ink_outline(&lines, width, ink, tolerance),
+                    None => stroke_outline(&lines, width, style, tolerance),
+                };
                 let (first, count, b) = push_segments(&outline, true, segments);
                 if count > 0 {
                     let mut prim = Prim { kind: [PRIM_SHAPE, SHAPE_PATH, blend, FLAG_FILL], geom2: [f32::from_bits(first), f32::from_bits(count), 0.0, 0.0], ..Default::default() };
