@@ -90,7 +90,8 @@ def cam_comp(id, layers, p, cam, blur=0.0):
             ks["ease"] = "zoom" if ease in ("glide", "gesture", "zoom") else ease
         anchor.append(ka)
         scale.append(ks)
-    t_ = {"position": [C[0], C[1]], "anchor": {"keys": anchor} if len(anchor) > 1 else anchor[0]["v"],
+    shake = [{"type": "wiggle", "hz": 0.9, "amp": round(6 * p, 2), "seed": 77}]
+    t_ = {"position": [C[0], C[1]], "anchor": {"keys": anchor, "add": shake} if len(anchor) > 1 else {"base": anchor[0]["v"], "add": shake},
           "scale": {"keys": scale} if len(scale) > 1 else scale[0]["v"]}
     layer = {"id": id, "kind": "comp", "transform": t_, "layers": layers}
     if blur > 0:
@@ -245,50 +246,84 @@ def screen(id, layers, t0, t1, drift=(0, -30), zoom=(1.0, 1.08)):
 # Each shot: who/what, an expression, a body action, a camera move. Cycle
 # close-up → wide → insert → reaction.
 
-def S01(s):  # Twenty men sit in a boat at the bottom of a pit, — WIDE (high), push down
+def tremble(layer, hz=7, deg=1.6, seed=0):
+    """Fear: a fast shiver of the whole body."""
+    layer["transform"]["rotation"] = {"base": 0, "add": [{"type": "wiggle", "hz": hz, "amp": deg, "seed": seed}]}
+    return layer
+
+
+def S01(s):  # Twenty men sit in a boat at the bottom of a pit, — the boat in the pit: men cower, peek up, flinch; dirt trickles from the rim
     t0, t1 = s["t0"], s["t1"]
     world = sets.yard(f"{s['sid']}y")
-    men = [envoy_rig(f"{s['sid']}e", (560, 1560), 0.55, t0, t1, [(t0, "fear"), (t0 + 0.9, "shock"), (t0 + 1.5, "fear")], head=[(t0, -6), (t0 + 1.2, 6)], seed=1),
-           extra("drev", f"{s['sid']}d1", (760, 1560), 0.62, mood="fear", seed=2),
-           extra("drev", f"{s['sid']}d2", (900, 1560), 0.6, flip=True, mood="fear", tunic=RED, seed=3),
-           extra("drev", f"{s['sid']}d3", (400, 1560), 0.58, mood="shock", seed=4)]
-    boat = sets.boat(f"{s['sid']}b", 700, 1560, 0.95)
-    return dict(pit=True, world=world, mid=men + [comp(f"{s['sid']}bt", boat)],
-                cam=cam((t0, 700, 1250, 1.05), (t1, 680, 1380, 1.35, "linear")),
+    cower, peek = 150, 95
+    env = envoy_rig(f"{s['sid']}e", (590, 1600), 0.62, t0, t1,
+                    [(t0, "fear"), (t0 + 0.45, "shock"), (t0 + 0.9, "fear"), (t0 + 1.4, "shock"), (t0 + 1.9, "fear"), (t0 + 2.3, "shock")],
+                    head=[(t0, -16), (t0 + 0.45, -4), (t0 + 0.9, -18), (t0 + 1.4, 8), (t0 + 1.9, -14), (t0 + 2.3, -22)],
+                    arm_l=[(t0, arm_deg(-1, 40)), (t0 + 0.45, arm_deg(-1, cower)), (t0 + 0.9, arm_deg(-1, peek)), (t0 + 1.4, arm_deg(-1, cower)), (t0 + 1.9, arm_deg(-1, peek)), (t0 + 2.3, arm_deg(-1, cower))],
+                    arm_r=[(t0, arm_deg(1, 30)), (t0 + 0.5, arm_deg(1, cower - 10)), (t0 + 0.95, arm_deg(1, peek)), (t0 + 1.45, arm_deg(1, cower)), (t0 + 1.95, arm_deg(1, peek - 10)), (t0 + 2.35, arm_deg(1, cower))],
+                    hand_l="open", hand_r="open",
+                    body=[(t0, (0, 0)), (t0 + 0.45, (0, 26)), (t0 + 0.9, (0, 6)), (t0 + 1.4, (0, 30)), (t0 + 1.9, (0, 8)), (t0 + 2.3, (0, 32))], seed=1)
+    men = [env]
+    for k, (x, sc, fl, mood, tun) in enumerate([(790, 0.66, False, "fear", CREAM), (930, 0.62, True, "shock", RED), (420, 0.6, False, "shock", CREAM)]):
+        men.append(tremble(extra("drev", f"{s['sid']}d{k}", (x, 1600), sc, flip=fl, mood=mood, tunic=tun, seed=2 + k), seed=k))
+    boat = sets.boat(f"{s['sid']}b", 700, 1600, 0.95)
+    trickle = props.dirt_clods(f"{s['sid']}tr", 300, 1100, 1380, 1620, t0, t1, n=22, seed=9)
+    # The guards' shadows fall across the far wall of the pit.
+    shadows = []
+    for k, x in enumerate([380, 760, 1040]):
+        sh = shape(f"{s['sid']}gs{k}", [(x - 40, 1400), (x - 20, 1300), (x, 1280), (x + 20, 1300), (x + 40, 1400)], COBALT_DK, w=0, line=False, rough=1.0, opacity=0.8)
+        sh["transform"]["position"] = ks([(t0, [0, 0]), (t1, [30 * (k - 1), 10], "linear")])
+        shadows.append(sh)
+    return dict(pit=True, world=world, mid=men + [comp(f"{s['sid']}bt", boat)], fore_extra=trickle, back_extra=[], set_extra=shadows,
+                cam=cam((t0, 700, 1180, 1.12), (t1, 690, 1360, 1.5, "gesture")),
                 sfx=[("whoosh", t0 + 0.2, -16)])
 
 
-def S02(s):  # and the first shovel of dirt comes down. — INSERT: shovel + dirt onto the envoy, punch-in
+def S02(s):  # and the first shovel of dirt comes down. — CU: a shovel tips its load; the envoy screams, arms up, buried in clods; the camera jolts
     t0, t1 = s["t0"], s["t1"]
     world = sets.yard(f"{s['sid']}y")
-    env = envoy_rig(f"{s['sid']}e", (560, 1700), 0.75, t0, t1, [(t0, "fear"), (cue("l01", "dirt") - 0.05, "shock")],
-                    head=[(t0, 0), (cue("l01", "dirt"), -14), (cue("l01", "dirt") + 0.5, -10)],
-                    arm_l=[(t0, 0), (cue("l01", "dirt"), arm_deg(-1, 120))], arm_r=[(t0, 0), (cue("l01", "dirt") + 0.04, arm_deg(1, 115))], hand_l="open", hand_r="open", seed=5)
+    td = cue("l01", "dirt")
+    env = envoy_rig(f"{s['sid']}e", (560, 1760), 0.8, t0, t1,
+                    [(t0, "fear"), (t0 + 0.35, "fear"), (td - 0.05, "shock"), (td + 0.5, "shock"), (td + 0.9, "fear")],
+                    head=[(t0, -12), (t0 + 0.35, -20), (td - 0.05, -26), (td + 0.12, 8), (td + 0.3, -6), (td + 0.6, 10)],
+                    arm_l=[(t0, arm_deg(-1, 30)), (td - 0.1, arm_deg(-1, 120)), (td + 0.1, arm_deg(-1, 165)), (td + 0.4, arm_deg(-1, 140))],
+                    arm_r=[(t0, arm_deg(1, 20)), (td - 0.05, arm_deg(1, 125)), (td + 0.12, arm_deg(1, 160)), (td + 0.45, arm_deg(1, 135))],
+                    hand_l="open", hand_r="open",
+                    body=[(t0, (0, 0)), (td - 0.05, (0, -10)), (td + 0.1, (0, 40)), (td + 0.3, (0, 30)), (td + 0.6, (0, 46))], seed=5)
+    env["transform"]["scale"] = ks([(t0, [0.8, 0.8]), (td + 0.08, [0.86, 0.72], "snap"), (td + 0.3, [0.8, 0.8], "squash")])
     haft = [(-10, -40), (10, -40), (16, -460), (-4, -462)]
     blade = [(-70, -40), (70, -40), (64, 60), (30, 120), (0, 132), (-30, 120), (-64, 60)]
     shovel = comp(f"{s['sid']}sh", [shape(f"{s['sid']}sh-h", haft, GOLD_DK, w=3.6),
                                     strokes(f"{s['sid']}sh-g", [[(0, -100 - 60 * k), (1, -86 - 60 * k)] for k in range(6)], w=1.6, color=FINE),
                                     shape(f"{s['sid']}sh-b", blade, COBALT_LT, w=4),
-                                    polys(f"{s['sid']}sh-bs", [[(10, -40), (70, -40), (64, 60), (30, 120), (12, 126)]], COBALT),
-                                    sparkle(f"{s['sid']}sh-gl", -36, -10, r=12),
-                                    shape(f"{s['sid']}sh-dirt", blob(0, -50, 78, 44, n=10, lump=0.25, seed=2), CREAM_DK, w=3)],
-                  transform={"position": [760, 760], "anchor": [0, -300], "rotation": ks([(t0, 150), (cue("l01", "dirt") - 0.1, 200, "snap")])})
-    td = cue("l01", "dirt")
-    dirt = props.dirt_clods(f"{s['sid']}c", 420, 760, 940, 1500, td - 0.1, t1, n=26, seed=3)
-    return dict(pit=True, world=world, mid=[env], fore_extra=[shovel] + dirt, defocus=5,
-                cam=cam((t0, 580, 1160, 1.9), (td, 580, 1140, 2.25, "snap"), (t1, 580, 1150, 2.35, "linear")),
-                sfx=[("whoosh-out", td - 0.25, -14), ("thud", td + 0.18, -9), ("sting", td, -12)])
+                                    sparkle(f"{s['sid']}sh-gl", -36, -10, r=12)],
+                  transform={"position": ks([(t0, [820, 560]), (td - 0.2, [760, 760], "glide")]), "anchor": [0, -300],
+                             "rotation": ks([(t0, 160), (td - 0.25, 165), (td - 0.08, 215, "snap")])})
+    load = shape(f"{s['sid']}load", blob(0, 0, 90, 50, n=12, lump=0.25, seed=2), CREAM_DK, w=3.2)
+    load["transform"] = {"position": ks([(t0, [760, 760]), (td - 0.2, [740, 820]), (td + 0.12, [600, 1220], "in")]),
+                         "scale": ks([(td - 0.05, [1, 1]), (td + 0.12, [1.5, 0.7], "in")]),
+                         "opacity": ks([(td + 0.1, 1), (td + 0.16, 0, "linear")])}
+    dirt = props.dirt_clods(f"{s['sid']}c", 380, 820, 820, 1560, td - 0.05, t1, n=60, seed=3)
+    puff = props.puffs(f"{s['sid']}pf", 580, 1260, td + 0.1, td + 1.0, n=3, s=1.4, color=CREAM_DK, rise=140, seed=4)
+    jolt = [(td + 0.1, 580, 1120, 2.35, "snap"), (td + 0.16, 596, 1104, 2.38, "linear"), (td + 0.22, 570, 1130, 2.36, "linear"), (td + 0.3, 584, 1116, 2.37, "linear")]
+    return dict(pit=True, world=world, mid=[env], fore_extra=[shovel, load] + dirt + puff, defocus=7,
+                cam=cam((t0, 580, 1180, 1.85), (td, 580, 1140, 2.0, "glide"), *jolt, (t1, 580, 1130, 2.5, "linear"), clamp=False),
+                sfx=[("whoosh-out", td - 0.25, -14), ("thud", td + 0.12, -8), ("sting", td, -12)])
 
 
-def S03(s):  # The woman watching is Olga, princess of Kyiv. — CU Olga, low angle push
+def S03(s):  # The woman watching is Olga, princess of Kyiv. — CU Olga: looks down into the pit, lifts her chin to camera, a slow smug smile; strong push in
     t0, t1 = s["t0"], s["t1"]
     world = sets.yard(f"{s['sid']}y")
-    ol = olga_rig(f"{s['sid']}o", (330, 1400), 1.0, t0, t1, [(t0, "neutral"), (cue("l02", "olga"), "smug")],
-                  head=[(t0, 0), (cue("l02", "olga"), -8, "pop")], seed=6)
-    g = extra("guard", f"{s['sid']}g", (620, 1400), 0.95, flip=True, mood="smug", seed=7)
-    return dict(world=world, mid=[g, ol], defocus=7,
-                cam=cam((t0, 400, 760, 2.25), (t1, 380, 700, 2.6, "linear"), clamp=False),
-                sfx=[("chime", cue("l02", "olga") - 0.05, -14)])
+    to = cue("l02", "olga")
+    tk = cue("l02", "kyiv")
+    ol = olga_rig(f"{s['sid']}o", (330, 1400), 1.0, t0, t1, [(t0, "neutral"), (t0 + 0.4, "blink"), (t0 + 0.52, "neutral"), (to - 0.05, "smug"), (tk, "smug")],
+                  head=[(t0, 14), (t0 + 0.5, 10), (to - 0.1, -10, "pop"), (to + 0.3, -6, "pop"), (to + 0.5, -10, "pop"), (tk, -4, "glide")],
+                  body=[(t0, (0, 8)), (to - 0.1, (0, -6)), (to + 0.15, (0, -14)), (to + 0.35, (0, -6)), (to + 0.55, (0, -12))], seed=6)
+    g = extra("guard", f"{s['sid']}g", (640, 1420), 0.95, flip=True, mood="smug", seed=7)
+    g["transform"]["rotation"] = ks([(t0, 0), (to + 0.2, -6), (to + 0.6, -2)])
+    return dict(world=world, mid=[g, ol], defocus=10,
+                cam=cam((t0, 420, 860, 2.0), (to, 400, 780, 2.4, "glide"), (t1, 380, 720, 2.9, "linear"), clamp=False),
+                sfx=[("chime", to - 0.05, -14)])
 
 
 def S04(s):  # The year is 945. — WIDE courtyard, drift
@@ -798,6 +833,14 @@ for sid, line_, idx, fn in TABLE:
 build_times()
 
 WHIP = 2 * F  # each side of the cut
+DAY = {"S01", "S02", "S03", "S04", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S16"}
+
+
+def rimmed(layer, s):
+    """Rim light on the cast: warm cream from the sun by day, salmon at night."""
+    color = "#fff1cf" if s["sid"] in DAY else "#ff9878"
+    layer["effects"] = layer.get("effects", []) + [{"type": "rim", "color": color, "width": 9, "angle": -55, "intensity": 0.95}]
+    return layer
 DIRS = [(-1, 0), (0, -1), (1, 0), (0, 1)]
 
 
@@ -810,8 +853,8 @@ def stage(s, spec, k):
     layers = [
         cam_comp(f"{sid}-sky", world["sky"] + spec.get("sky_extra", []), DEPTH["sky"], c, blur * 1.3),
         cam_comp(f"{sid}-back", world["back"] + spec.get("back_extra", []), DEPTH["back"], c, blur),
-        cam_comp(f"{sid}-set", world["mid"], DEPTH["mid"], c, blur * 0.8),
-        cam_comp(f"{sid}-act", spec.get("mid", []), DEPTH["mid"], c),
+        cam_comp(f"{sid}-set", world["mid"] + spec.get("set_extra", []), DEPTH["mid"], c, blur * 0.8),
+        rimmed(cam_comp(f"{sid}-act", [{"id": f"{sid}-twos", "kind": "comp", "time": {"step_fps": 12}, "layers": spec.get("mid", [])}], DEPTH["mid"], c), s),
         cam_comp(f"{sid}-front", world.get("front", []) if spec.get("pit") else [], DEPTH["mid"], c, blur * 0.8),
         cam_comp(f"{sid}-fore", world["fore"] + spec.get("fore_extra", []), DEPTH["fore"], c),
     ]
@@ -865,10 +908,10 @@ def captions():
     for k, c in enumerate(ch):
         a = c[0][0] - 2 * F
         b = ch[k + 1][0][0] - 2 * F if k + 1 < len(ch) else c[-1][1] + 1.2
-        text = " ".join(tx.strip(",.:;!?") for _, _, tx in c).upper()
-        size = round(min(84, 0.84 * W / (0.72 * len(text))), 1)
+        text = " ".join(tx for _, _, tx in c).rstrip(",;:")
+        size = round(min(66, 0.84 * W / (0.6 * len(text))), 1)
         L.append({"id": f"cap{k:03d}", "kind": "text", "text": text, "font": CAPTION_FONT, "size": size, "color": "#ffe21a",
-                  "weight": 2.5, "stroke": {"color": INK, "width": 12}, "tracking": 10, "role": "caption", "space": "screen",
+                  "weight": 2.0, "stroke": {"color": INK, "width": 9}, "tracking": 0, "role": "caption", "space": "screen",
                   "transform": {"position": [C[0], 1540], "opacity": {"keys": [{"at": round(a, 3), "v": 0.5}, {"at": round(a + 3 * F, 3), "v": 1, "ease": "hold"}]}},
                   "time": {"start": round(a, 3), "end": round(b, 3)}})
     return L
@@ -979,6 +1022,8 @@ if __name__ == "__main__":
     shot_list()
     if MODE == "sheet":
         contact_sheet(mcp)
+    elif MODE == "test":
+        print(run("motion", "render", PROJECT, "-o", os.path.join(OUT, "olga-test.mp4"), "--from", 0, "--to", round(SHOTS[3]["t0"] + 0.05, 2)))
     elif MODE in ("render", "draft"):
         args = ["motion", "render", PROJECT, "-o", os.path.join(OUT, "olga.mp4" if MODE == "render" else "olga-draft.mp4")]
         if MODE == "draft":

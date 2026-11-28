@@ -48,8 +48,11 @@ def seed_of(name):
     return int(hashlib.md5(name.encode()).hexdigest()[:6], 16)
 
 
+BOIL = 12  # every line is redrawn 12 times a second (on twos), like inked cels
+
+
 def _ink(w, seed, taper=None, pressure=0.4, wobble=0.6, fixed=True):
-    ink = {"pressure": pressure, "wobble": wobble, "seed": seed, "fixed": fixed}
+    ink = {"pressure": pressure, "wobble": wobble, "seed": seed, "fixed": fixed, "boil": BOIL}
     if taper is not None:
         ink["taper"] = list(taper)
     return ink
@@ -74,7 +77,7 @@ def shape(id, pts, fill=None, w=3.6, color=INK, closed=True, smooth=None, rough=
         layer["stroke"] = {"color": color, "width": w,
                            "ink": _ink(w, s, taper if taper is not None else ([0, 0] if closed else None), pressure, wobble)}
     if rough:
-        layer["rough"] = {"amount": rough, "scale": 22, "seed": s}
+        layer["rough"] = {"amount": rough, "scale": 22, "seed": s, "boil": BOIL}
     if opacity is not None:
         layer.setdefault("transform", {})["opacity"] = opacity
     layer.update(extra)

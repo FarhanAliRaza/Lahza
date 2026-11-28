@@ -154,7 +154,7 @@ def mouth(id, cx, cy, w=34, mood="neutral", jaw=0.0, lip=RED_DK, gold=None, side
 def pores(id, poly, n=24, seed=0):
     rnd = random.Random(seed)
     pts = points_in(poly, n, seed)
-    return [dots(id, pts, r=1.05, color=FINE)]
+    return [dots(id, pts, r=0.8, color=FINE)]
 
 
 def skin_ticks(id, poly, n=14, length=6, seed=0, angle=None):

@@ -18,6 +18,7 @@ import random
 
 from kit import *  # noqa: F401,F403
 from face import eye, bags, brow, mouth, pores, skin_ticks, stubble, sparkle, teeth_row
+import detail as dt
 
 LIGHT_SPLIT = 0.12  # slope of the hard diagonal light edge across a face
 
@@ -32,6 +33,39 @@ def light_split(id, cx, top, bottom, side=1, width=400, color=SKIN_DK):
     """A hard diagonal shadow over one side (light from the upper left)."""
     x0 = cx + side * 8
     return polys(id, [[(x0, top), (cx + side * width, top), (cx + side * width, bottom), (x0 - side * (bottom - top) * LIGHT_SPLIT, bottom)]], color)
+
+
+def form_shade(id, eye_dx, eye_y, eye_w, nose, mouth_y, jaw_y, face_hw, j=0.0, dark=SKIN_DK, lit=SKIN_LT):
+    """Shade where something throws it (eye sockets under the brow, the far
+    side and cast shadow of the nose, under the cheekbones, under the lower
+    lip and the jaw) and light where bone catches it (brow ridge, cheekbone,
+    the bridge of the nose). Flat tones, hard edges."""
+    nx0, ny0, nx1, ny1 = nose  # nose box
+    sockets = []
+    for s in (-1, 1):
+        cx = s * eye_dx
+        sockets.append([(cx - eye_w * 0.75, eye_y - 6), (cx - eye_w * 0.3, eye_y - 22), (cx + eye_w * 0.35, eye_y - 22), (cx + eye_w * 0.8, eye_y - 4),
+                        (cx + eye_w * 0.5, eye_y + 12), (cx - eye_w * 0.4, eye_y + 12)])
+    shade = sockets + [
+        # far (right) side of the nose and its cast shadow
+        [(nx1 - 8, ny0 + 10), (nx1 + 2, ny0 + 40), (nx1 + 6, ny1 - 6), (nx1 - 10, ny1 + 2), (nx1 - 14, ny0 + 40)],
+        [(nx0 + 6, ny1 + 2), (nx1 + 4, ny1), (nx1 - 6, ny1 + 12 + j * 0.2), (nx0 + 12, ny1 + 12 + j * 0.2)],
+        # under the cheekbones
+        [(-face_hw * 0.95, eye_y + 46), (-face_hw * 0.55, eye_y + 62), (-face_hw * 0.62, eye_y + 80), (-face_hw * 0.97, eye_y + 70)],
+        [(face_hw * 0.95, eye_y + 40), (face_hw * 0.5, eye_y + 60), (face_hw * 0.58, eye_y + 84), (face_hw * 1.0, eye_y + 76)],
+        # under the lower lip and under the jaw
+        [(-14, mouth_y + 10 + j), (14, mouth_y + 10 + j), (8, mouth_y + 20 + j), (-8, mouth_y + 20 + j)],
+        [(-face_hw, jaw_y - 10 + j), (face_hw, jaw_y - 10 + j), (face_hw, jaw_y + 60 + j), (-face_hw, jaw_y + 60 + j)],
+    ]
+    light = []
+    for s in (-1, 1):
+        cx = s * eye_dx
+        light.append([(cx - eye_w * 0.6, eye_y - 30), (cx + eye_w * 0.5, eye_y - 34), (cx + eye_w * 0.4, eye_y - 26), (cx - eye_w * 0.5, eye_y - 24)])
+        light.append([(s * face_hw * 0.8, eye_y + 30), (s * face_hw * 0.45, eye_y + 22), (s * face_hw * 0.42, eye_y + 30), (s * face_hw * 0.78, eye_y + 40)])
+    light.append([((nx0 + nx1) / 2 - 3, ny0 + 4), ((nx0 + nx1) / 2 + 3, ny0 + 4), ((nx0 + nx1) / 2 + 2, ny1 - 30), ((nx0 + nx1) / 2 - 4, ny1 - 30)])
+    # Faces are shaped by line, not tone (see the contour lines in each
+    # head); keep only the cast shadow under the nose.
+    return [polys(f"{id}-shade", shade[2:4], dark)]
 
 
 # ----------------------------------------------------------------- Olga ----
@@ -59,6 +93,7 @@ def olga_head(id, mood="neutral"):
             (-128, -150), (-124, -214), (-108, -270), (-64, -306)]
     L.append(shape(f"{id}-veil", veil, CREAM, w=4.0))
     L += matted(f"{id}-veilsh", [light_split(f"{id}-veilsh-s", 30, -330, 120, color=CREAM_DK)], veil)
+    L.append(dt.ink_layer(f"{id}-veilfold2", dt.strands(lambda x: -260 + abs(x) * 0.4, lambda x: 90, -200, 200, n=26, seed=seed_of(id), wave=5), w=1.6, color=FINE))
     L.append(strokes(f"{id}-veilfold", [[(112, -150), (124, -70), (152, 20), (176, 90)], [(-110, -140), (-122, -60), (-150, 30), (-172, 96)],
                                         [(132, -10), (138, 50), (126, 104)], [(-132, 0), (-140, 56), (-124, 106)],
                                         [(170, 40), (190, 96)], [(-176, 46), (-196, 98)]], w=2.4, color=FINE, taper=(10, 10)))
@@ -67,14 +102,31 @@ def olga_head(id, mood="neutral"):
     L.append(strokes(f"{id}-neckl", [[(-14, 8), (-4, 30)], [(14, 10), (8, 28)]], w=1.8, color=FINE))
     # Face mass, its shade and light.
     L.append(shape(f"{id}-face", face, SKIN, w=4.2))
-    light = [light_split(f"{id}-sh", 18, -300, 60),
-             polys(f"{id}-cheek", [[(-96, -146), (-74, -150), (-52, -140), (-62, -132), (-84, -132)]], SKIN_LT),
-             polys(f"{id}-brow-lt", [[(-80, -218), (-30, -214), (-34, -206), (-78, -206)]], SKIN_LT),
-             polys(f"{id}-jowl", [[(-66, -78 + j), (-40, -64 + j), (-30, -40 + j), (-52, -48 + j)]], SKIN_DK)]
+    light = form_shade(f"{id}-fs", 30, -164, 34, (-22, -182, 30, -84), -58, -14, 96, j=j)
     light += pores(f"{id}-pores", [(-88, -130), (-50, -126), (-46, -90), (-78, -92)], 18, seed=3)
     light += pores(f"{id}-pores2", [(40, -125), (84, -132), (72, -88), (40, -86)], 14, seed=4)
     light += skin_ticks(f"{id}-ticks", [(-70, -240), (60, -240), (60, -222), (-70, -222)], 6, 7, seed=5, angle=0)
     L += matted(f"{id}-light", light, face)
+    # Dense line detail clipped to the face: lids, bags, crow's feet,
+    # nose-to-jowl folds, cheek hollows, lip lines, a chin crease.
+    seed = seed_of(id)
+    det = []
+    for s_ in (-1, 1):
+        if mood not in ("shock", "blink"):
+            det += dt.eye_bags(s_ * 30, -150, 34, n=3, seed=seed + s_, step=5)
+            det += dt.crows_feet(s_ * 54, -166, s_, n=4, length=18, spread=60, seed=seed + 3 * s_)
+        det += dt.fold((s_ * 20, -112), (s_ * 40, -52 + j), s_ * -6, seed=seed + 5 * s_)
+        det += dt.fold((s_ * 46, -96), (s_ * 60, -60 + j * 0.6), s_ * -4, seed=seed + 7 * s_)
+        det += dt.cheek_creases(s_ * 58, -128, 30, 18, 200 if s_ < 0 else -20, 260 if s_ < 0 else 40, n=3, seed=seed + 9 * s_)
+        det += dt.furrows(s_ * 6, -206, -188, n=1, seed=seed + 11 * s_)
+    det += [[(x, -60 + abs(x) * 0.05), (x + 1, -52)] for x in (-10, -4, 4, 10)] if mood in ("neutral", "smug", "grief", "anger", "blink") else []
+    det += dt.fold((-12, -24 + j), (12, -24 + j), 4, seed=seed + 13)
+    det += dt.neck_rings(0, 8, 26, n=2, seed=seed)
+    for s_ in (-1, 1):
+        det += dt.fold((s_ * 62, -150), (s_ * 92, -112), s_ * 8, n=8, seed=seed + 20 * s_)
+        det += dt.fold((s_ * 74, -96), (s_ * 40, -30 + j), s_ * 10, n=9, seed=seed + 21 * s_)
+    L += matted(f"{id}-det", [dt.ink_layer(f"{id}-detl", det, w=2.3, color=INK),
+                              dots(f"{id}-stip", points_in(face, 26, seed=seed + 1), r=0.85, color=INK)], face)
     # Cheekbone and jowl structure: lines that follow the skull.
     L.append(strokes(f"{id}-bones", [[(-92, -122), (-80, -110), (-62, -108)], [(88, -118), (74, -106), (58, -104)],
                                      [(-40, -110), (-52, -86 + j * 0.3), (-50, -58 + j * 0.6)], [(40, -110), (52, -86 + j * 0.3), (50, -58 + j * 0.6)]],
@@ -89,11 +141,9 @@ def olga_head(id, mood="neutral"):
     nose = [(-6, -182), (6, -180), (10, -150), (20, -122), (30, -100), (24, -84 + j * 0.15), (6, -80 + j * 0.15),
             (-12, -84), (-22, -94), (-18, -104), (-8, -112), (-6, -146)]
     L.append(shape(f"{id}-nose", nose, SKIN, w=3.8, smooth=0.9))
-    L.append(polys(f"{id}-noseshade", [[(8, -150), (18, -122), (28, -100), (22, -86), (10, -104)]], SKIN_DK))
-    L.append(polys(f"{id}-nosehl", [[(0, -160), (4, -132), (0, -128), (-3, -150)]], SKIN_LT))
+    L.append(dt.ink_layer(f"{id}-noseln", [[(12, -150), (20, -124), (26, -104)], [(-8, -100), (0, -96)]], w=1.8))
     L.append(shape(f"{id}-nostril", [(-14, -92), (-6, -96), (2, -90), (-6, -86)], INK, w=0, line=False, rough=0))
     L.append(line(f"{id}-wing", [(-20, -104), (-26, -94), (-18, -86)], w=2.2, taper=(3, 3)))
-    L.append(polys(f"{id}-noseshadow", [[(-14, -80), (14, -78), (4, -72), (-10, -73)]], SKIN_DK))
     # Mouth: thin, red-lipped, under the overhanging nose.
     m = mood if mood != "blink" else "neutral"
     if m in ("neutral", "smug", "anger", "grief"):
@@ -308,18 +358,35 @@ def envoy_head(id, mood="neutral"):
         L.append(shape(f"{id}-ear{s}", ear, SKIN if s < 0 else SKIN_DK, w=3.6))
         L.append(line(f"{id}-earl{s}", [(s * 130, -222), (s * 142, -206), (s * 132, -186)], w=2.0, color=FINE, taper=(4, 4)))
     L.append(shape(f"{id}-face", face, SKIN, w=4.4))
-    light = [light_split(f"{id}-sh", 26, -320, 80),
-             polys(f"{id}-cheek", [[(-120, -150), (-96, -164), (-74, -150), (-96, -136)]], SKIN_LT),
-             polys(f"{id}-fore", [[(-80, -280), (-20, -286), (-24, -270), (-78, -264)]], SKIN_LT)]
+    light = form_shade(f"{id}-fs", 44, -212, 34, (-44, -204, 44, -136), -92, -60, 150, j=jaw * 46)
     light += pores(f"{id}-pores", [(-130, -150), (-70, -150), (-70, -110), (-130, -110)], 22, seed=11)
     light += skin_ticks(f"{id}-wr", [(-60, -262), (60, -262), (60, -244), (-60, -244)], 8, 10, seed=12, angle=0)
     L += matted(f"{id}-light", light, face)
+    seed = seed_of(id)
+    det = dt.forehead(0, -262, -236, 80, n=3, seed=seed, sag=6)
+    for s_ in (-1, 1):
+        if mood not in ("shock", "blink"):
+            det += dt.eye_bags(s_ * 44, -200, 32, n=4, seed=seed + s_, step=6)
+            det += dt.lids(s_ * 44, -212, 26, 11, n=2, seed=seed + 2 * s_, side=s_)
+        det += dt.crows_feet(s_ * 66, -214, s_, n=5, length=22, spread=70, seed=seed + 3 * s_)
+        det += dt.cheek_creases(s_ * 100, -150, 30, 26, 200 if s_ < 0 else -20, 280 if s_ < 0 else 60, n=4, seed=seed + 4 * s_)
+        det += dt.fold((s_ * 46, -176), (s_ * 72, -120), s_ * -8, seed=seed + 5 * s_)
+    det += dt.furrows(0, -240, -222, n=3, seed=seed, spacing=7)
+    for s_ in (-1, 1):
+        # Cheek masses: an outer contour from the eye down to the beard and an
+        # inner one from the nose wing; fat folds under the eyes.
+        det += dt.fold((s_ * 78, -196), (s_ * 132, -118), s_ * 14, n=10, seed=seed + 20 * s_, pieces=(1, 2))
+        det += dt.fold((s_ * 46, -150), (s_ * 74, -108), s_ * 8, n=8, seed=seed + 21 * s_, pieces=(1, 1))
+        det += dt.fold((s_ * 60, -176), (s_ * 104, -160), s_ * -6, n=7, seed=seed + 22 * s_)
+        det += dt.cheek_creases(s_ * 124, -200, 18, 22, 140 if s_ < 0 else -60, 220 if s_ < 0 else 20, n=3, seed=seed + 23 * s_)
+    L += matted(f"{id}-det", [dt.ink_layer(f"{id}-detl", det, w=2.3, color=INK),
+                              dots(f"{id}-stip", points_in(face, 45, seed=seed + 1), r=0.9, color=INK)], face)
     # Beard: solid black, barbed; it drops with the jaw.
     beard = [(-132, -150), (-104, -120), (-70, -106), (-40, -96), (0, -92), (40, -96), (70, -106), (104, -120), (132, -150),
              (150, -96), (146, -40), (124, 10), (84, 48), (40, 66), (0, 74), (-40, 66), (-84, 48), (-124, 10), (-146, -40), (-150, -96)]
     beard = jawed(beard, jaw, top=-110, amount=46)
     L.append(shape(f"{id}-beard", barbed(beard, depth=9, every=1, seed=seed_of(id)), INK, w=2.0, rough=0.6, smooth=0.5))
-    L.append(strokes(f"{id}-beardhair", ticks_in(beard, 26, 12, angle=95, seed=13, jitter=20), w=1.6, color=COBALT_DK, taper=(3, 3)))
+    L += matted(f"{id}-bh", [dt.ink_layer(f"{id}-beardhair", dt.locks(beard, 90, 34, seed=seed, curl=3), w=1.7, color=COBALT_LT, taper=(8, 8), pressure=0.3)], barbed(beard, depth=9, every=1, seed=seed_of(id)))
     # Moustache over the mouth.
     m = mood if mood != "blink" else "neutral"
     open_mouth = m in ("joy", "shock", "fear")
@@ -328,16 +395,17 @@ def envoy_head(id, mood="neutral"):
     # Mouth: a gap in the beard, wide enough to clear it when it grins.
     mood_mouth = {"neutral": "neutral", "smug": "smug", "joy": "grin", "shock": "shock", "fear": "fear", "anger": "anger"}.get(m, "neutral")
     if mood_mouth in ("neutral", "smug", "anger"):
-        L.append(shape(f"{id}-lipgap", [(-30, -98), (30, -98), (26, -80), (-26, -80)], SKIN_DK, w=0, line=False, rough=0.5))
+        L.append(shape(f"{id}-lipgap", [(-30, -98), (-10, -101), (10, -101), (30, -98), (22, -84), (0, -80), (-22, -84)], SKIN, w=2.0, rough=0.5))
     L += mouth(f"{id}-mouth", 0, -92 if not open_mouth else -86, w=96 if open_mouth else 50, mood=mood_mouth, jaw=jaw,
                gold=[1, 2, 6] if open_mouth else None)
     L.append(shape(f"{id}-mous", barbed(mous, depth=6, every=1, seed=seed_of(id) + 1), INK, w=1.6, rough=0.4, smooth=0.6))
     # Nose: a flat bulb with wide nostrils.
     nose = [(-30, -190), (-14, -204), (14, -204), (32, -186), (44, -158), (32, -136), (10, -132), (-10, -134), (-34, -138), (-44, -158)]
     L.append(shape(f"{id}-nose", nose, SKIN, w=4.0))
-    L.append(polys(f"{id}-nosesh", [[(10, -200), (34, -184), (44, -158), (30, -138), (14, -140)]], SKIN_DK))
-    L.append(polys(f"{id}-nosehl", [[(-24, -176), (-10, -182), (-8, -168), (-22, -164)]], SKIN_LT))
+    L.append(dt.ink_layer(f"{id}-noseln", [[(-20, -186), (-8, -192), (6, -190)], [(26, -160), (34, -150)], [(-30, -150), (-24, -144)]], w=1.8))
     L.append(dots(f"{id}-nostrils", [(-18, -142), (16, -142)], r=4.2))
+    L.append(dots(f"{id}-nosepores", points_in(nose, 14, seed=seed_of(id)), r=1.2, color=FINE))
+    L.append(dt.ink_layer(f"{id}-nosewing", [[(-34, -170), (-42, -156), (-36, -140)], [(34, -170), (42, -156), (36, -140)]], w=2.0, color=INK))
     # Little eyes high up, under bushy barbed brows.
     look = {"joy": (0.0, 0.0), "smug": (-0.5, 0.0), "fear": (0.0, -0.6)}.get(m, (0.2, 0.0))
     for s in (-1, 1):
@@ -416,18 +484,30 @@ def igor_head(id, mood="neutral"):
     chin2 = jawed([(-70, -12), (-36, 10), (0, 16), (36, 10), (70, -12), (60, 22), (0, 38), (-60, 22)], jaw, top=-80, amount=36)
     L.append(shape(f"{id}-chin2", chin2, SKIN_DK, w=3.6))
     L.append(shape(f"{id}-face", face, SKIN, w=4.4))
-    light = [light_split(f"{id}-sh", 20, -280, 60),
-             polys(f"{id}-cheek", [[(-110, -110), (-84, -122), (-62, -108), (-86, -96)]], SKIN_LT)]
+    light = form_shade(f"{id}-fs", 42, -170, 30, (-34, -150, 34, -86), -54, -20, 124, j=jaw * 36)
     light += stubble(f"{id}-stub", jawed([(-110, -70), (110, -70), (90, -10), (0, 6), (-90, -10)], jaw, top=-80, amount=36), 70, seed=21)
     light += pores(f"{id}-pores", [(-120, -120), (-70, -120), (-70, -80), (-120, -80)], 16, seed=22)
     L += matted(f"{id}-light", light, face)
+    seed = seed_of(id)
+    det = []
+    for s_ in (-1, 1):
+        if mood not in ("shock", "blink"):
+            det += dt.eye_bags(s_ * 42, -158, 34, n=4, seed=seed + s_, step=6)
+        det += dt.crows_feet(s_ * 66, -172, s_, n=5, length=20, seed=seed + 3 * s_)
+        det += dt.cheek_creases(s_ * 90, -110, 30, 30, 200 if s_ < 0 else -20, 280 if s_ < 0 else 60, n=4, seed=seed + 4 * s_)
+    det += dt.furrows(0, -196, -178, n=3, seed=seed)
+    for s_ in (-1, 1):
+        det += dt.fold((s_ * 76, -150), (s_ * 120, -70), s_ * 14, n=10, seed=seed + 20 * s_)
+        det += dt.fold((s_ * 36, -110), (s_ * 64, -60), s_ * 8, n=8, seed=seed + 21 * s_)
+    L += matted(f"{id}-det", [dt.ink_layer(f"{id}-detl", det, w=2.3, color=INK),
+                              dots(f"{id}-stip", points_in(face, 40, seed=seed + 1), r=0.9, color=INK)], face)
     L.append(strokes(f"{id}-jowls", [[(-98, -84), (-104, -54 + jaw * 20), (-90, -28 + jaw * 30)], [(98, -84), (104, -54 + jaw * 20), (90, -28 + jaw * 30)]], w=2.4, color=FINE, taper=(6, 6)))
     m = mood if mood != "blink" else "neutral"
     L += mouth(f"{id}-mouth", 0, -54, w=40 if m in ("neutral", "smug") else 52, mood={"joy": "grin"}.get(m, m), jaw=jaw)
     # Nose: a red-tipped potato.
     nose = [(-16, -150), (16, -150), (30, -124), (34, -100), (18, -86), (0, -90), (-18, -86), (-34, -100), (-30, -124)]
     L.append(shape(f"{id}-nose", nose, SKIN, w=3.8))
-    L.append(polys(f"{id}-nosesh", [[(10, -148), (30, -124), (34, -100), (18, -88), (12, -110)]], SKIN_DK))
+    L.append(dt.ink_layer(f"{id}-noseln", [[(18, -140), (28, -118)], [(-6, -146), (6, -146)]], w=1.8))
     L.append(dots(f"{id}-nostrils", [(-12, -94), (12, -94)], r=3.2))
     # The moustache: a black handlebar wider than the face, barbed.
     mous = [(0, -84), (40, -92), (90, -88), (150, -100), (180, -122), (170, -94), (140, -70), (90, -60), (40, -66), (0, -72),
