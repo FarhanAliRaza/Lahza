@@ -598,6 +598,7 @@ pub const OP_DIRECTIONAL_BLUR: f32 = 21.0;
 pub const OP_RGB_SPLIT: f32 = 22.0;
 pub const OP_SHARPEN: f32 = 23.0;
 pub const OP_CHROMA_BLUR: f32 = 24.0;
+pub const OP_RIM: f32 = 25.0;
 pub const OP_VIGNETTE: f32 = 30.0;
 pub const OP_GRAIN: f32 = 31.0;
 pub const OP_MOTTLE: f32 = 32.0;
@@ -788,6 +789,7 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
     let mut split: Option<V2> = None;
     let mut sharpen: Option<V2> = None;
     let mut chroma: Option<(f32, V2)> = None;
+    let mut rim: Option<(V2, [f32; 4])> = None;
     let mut i = start;
     while i < end {
         let h = ops[i];
@@ -801,6 +803,7 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
             OP_RGB_SPLIT => split = Some([h[2], h[3]]),
             OP_SHARPEN => sharpen = Some([h[2], h[3]]),
             OP_CHROMA_BLUR => chroma = Some((h[2], [ops[i + 1][0], ops[i + 1][1]])),
+            OP_RIM => rim = Some(([h[2], h[3]], ops[i + 1])),
             _ => {}
         }
         i += h[1] as usize;
@@ -846,6 +849,15 @@ fn sample_post(src: &Sources, prim: &Prim, l: V2, ops: &[[f32; 4]]) -> [f32; 4] 
             let bs: V3 = [b[0] / b[3], b[1] / b[3], b[2] / b[3]];
             let (y, yb) = (luma3(cs), luma3(bs));
             c = [(y + bs[0] - yb) * c[3], (y + bs[1] - yb) * c[3], (y + bs[2] - yb) * c[3], c[3]];
+        }
+    }
+    if let Some((d, rc)) = rim {
+        // Inside the shape where the way toward the light leaves it.
+        let half = sample_image(src, prim, [uv[0] + d[0] * 0.5, uv[1] + d[1] * 0.5])[3];
+        let full = sample_image(src, prim, [uv[0] + d[0], uv[1] + d[1]])[3];
+        let m = c[3] * (1.0 - 0.5 * (half + full)) * rc[3];
+        for j in 0..3 {
+            c[j] += (rc[j] * c[3] - c[j]) * m;
         }
     }
     let a = c[3];

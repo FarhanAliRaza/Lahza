@@ -496,6 +496,11 @@ impl Builder<'_> {
                     body.push([v[2], p.seed as f32, 0.0, 0.0]);
                     [OP_MOTTLE, 0.0, v[0], (v[1] * k).max(1e-3)]
                 }
+                PostKind::Rim => {
+                    let c = col(p.colors[0]);
+                    body.push([c[0], c[1], c[2], v[2].clamp(0.0, 1.0)]);
+                    [OP_RIM, 0.0, v[0] * k, v[1] * k]
+                }
                 PostKind::Vignette => [OP_VIGNETTE, 0.0, v[0], v[1].clamp(0.0, 1.0)],
                 PostKind::Grain => {
                     body.push([(p.seed % 16_777_216) as f32, 0.0, 0.0, 0.0]);

@@ -693,6 +693,9 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
     var sharpen = vec2<f32>(0.0);
     var chroma = vec3<f32>(0.0);
     var has_chroma = false;
+    var rim_dir = vec2<f32>(0.0);
+    var rim_col = vec4<f32>(0.0);
+    var has_rim = false;
     var i = start;
     while i < end {
         let h = b_ops[i];
@@ -714,6 +717,10 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
         } else if h.x == 24.0 {
             chroma = vec3<f32>(h.z, b_ops[i + 1u].xy);
             has_chroma = true;
+        } else if h.x == 25.0 {
+            rim_dir = h.zw;
+            rim_col = b_ops[i + 1u];
+            has_rim = true;
         }
         i += u32(h.y);
     }
@@ -736,6 +743,13 @@ fn sample_post(prim: Prim, l: vec2<f32>) -> vec4<f32> {
             let y = luma3(cs);
             c = vec4<f32>((vec3<f32>(y) + bs - vec3<f32>(luma3(bs))) * c.w, c.w);
         }
+    }
+    if has_rim {
+        // Inside the shape where the way toward the light leaves it.
+        let half = sample_image(prim, uv + rim_dir * 0.5).w;
+        let full = sample_image(prim, uv + rim_dir).w;
+        let m = c.w * (1.0 - 0.5 * (half + full)) * rim_col.w;
+        c = vec4<f32>(c.xyz + (rim_col.xyz * c.w - c.xyz) * m, c.w);
     }
     let a = c.w;
     if a <= 0.0 { return c; }

@@ -716,6 +716,19 @@ pub enum Effect {
         #[serde(default)]
         seed: u32,
     },
+    /// Rim light: the edges of the layer that face a light (`angle`,
+    /// degrees, 0 = from above, clockwise) take `color`, fading inward over
+    /// `width` px; strength `intensity` (0..1).
+    Rim {
+        #[serde(default = "white")]
+        color: Property<Color>,
+        #[serde(default = "six_prop")]
+        width: Property<f64>,
+        #[serde(default = "rim_angle")]
+        angle: Property<f64>,
+        #[serde(default = "one_prop")]
+        intensity: Property<f64>,
+    },
     /// Glow: a blurred, tinted copy added on top.
     Glow {
         #[serde(default = "white")]
@@ -750,6 +763,12 @@ fn grain_amount() -> Property<f64> {
 }
 fn twelve() -> Property<f64> {
     Property::Constant(12.0)
+}
+fn six_prop() -> Property<f64> {
+    Property::Constant(6.0)
+}
+fn rim_angle() -> Property<f64> {
+    Property::Constant(-45.0)
 }
 fn five_prop() -> Property<f64> {
     Property::Constant(5.0)
@@ -1614,6 +1633,10 @@ pub struct Ink {
     /// camera's zoom: one pen for wide shots and close-ups.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fixed: bool,
+    /// Line boil: the line is redrawn (a new seed) this many times a second
+    /// (12 = on twos at 24 fps), like hand-inked cels; 0 holds it.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub boil: f64,
 }
 
 fn ink_taper() -> [f64; 2] {
@@ -1645,6 +1668,9 @@ pub struct Rough {
     pub scale: f64,
     #[serde(default)]
     pub seed: u32,
+    /// Edge boil: recut this many times a second (0 holds it).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub boil: f64,
 }
 
 fn rough_amount() -> f64 {

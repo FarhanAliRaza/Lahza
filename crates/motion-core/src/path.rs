@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn ink_tapers_to_points_and_is_stable() {
-        let ink = crate::document::Ink { taper: [10.0, 10.0], pressure: 0.4, pressure_scale: 40.0, wobble: 0.6, wobble_scale: 30.0, seed: 3, fixed: false };
+        let ink = crate::document::Ink { taper: [10.0, 10.0], pressure: 0.4, pressure_scale: 40.0, wobble: 0.6, wobble_scale: 30.0, seed: 3, fixed: false, boil: 0.0 };
         let line = vec![(0.0, 0.0), (100.0, 0.0), (200.0, 40.0)];
         let a = ink_outline(&[line.clone()], 4.0, &ink, 0.25);
         let b = ink_outline(&[line], 4.0, &ink, 0.25);
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn rough_closed_outline_has_no_seam() {
         let sq = flatten("M -50 -50 L 50 -50 L 50 50 L -50 50 Z", 0.25).unwrap();
-        let r = roughen(&sq, &crate::document::Rough { amount: 3.0, scale: 20.0, seed: 1 }, 0.25);
+        let r = roughen(&sq, &crate::document::Rough { amount: 3.0, scale: 20.0, seed: 1, boil: 0.0 }, 0.25);
         let pts = &r[0].0;
         let (first, last) = (pts[0], pts[pts.len() - 1]);
         assert!(seg_len(first, last) < 6.0, "seam {first:?} {last:?}");

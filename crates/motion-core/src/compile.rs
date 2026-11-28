@@ -177,6 +177,8 @@ pub enum PostKind {
     Grain,
     /// [amount, scale px, speed × t].
     Mottle,
+    /// [width px, angle°, intensity] + colour.
+    Rim,
 }
 
 /// Evaluated post effect: numbers in `v` by kind (lengths in canvas px):
@@ -1100,6 +1102,7 @@ impl<'a> Compiler<'a> {
                     }
                     e
                 }
+                Effect::Rim { color, width, angle, intensity } => self.post(PostKind::Rim, &[width, angle, intensity], &[color], id, &what, start, step, shift),
                 Effect::Vignette { amount, softness } => self.post(PostKind::Vignette, &[amount, softness], &[], id, &what, start, step, shift),
                 Effect::Grain { amount, size, seed } => {
                     let mut e = self.post(PostKind::Grain, &[amount, size], &[], id, &what, start, step, shift);
@@ -2343,6 +2346,12 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                         v[1] *= scale;
                         v[2] *= t;
                     }
+                    PostKind::Rim => {
+                        // Toward the light, as an offset of `width` px.
+                        let (s, c) = crate::dm::sin_cos(v[1].to_radians());
+                        let len = v[0] * scale;
+                        v = [s * len, -c * len, v[2], 0.0, 0.0];
+                    }
                     _ => {}
                 }
                 // Grain changes every frame (and holds on stepped frames).
@@ -2424,7 +2433,15 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
             stroke_style: match (&s.stroke_style, &s.dash_offset) {
                 (Some(style), Some(offset)) => Some(Arc::new(crate::document::StrokeStyle { dash_offset: offset.at(t), ..(**style).clone() })),
                 (style, _) => style.clone(),
-            },
+            }
+            .map(|style| match style.ink {
+                // Line boil: a new drawing of the line every 1/boil s.
+                Some(ink) if ink.boil > 0.0 => {
+                    let k = (t * ink.boil).floor() as i64 as u32;
+                    Arc::new(crate::document::StrokeStyle { ink: Some(crate::document::Ink { seed: ink.seed.wrapping_add(k.wrapping_mul(7919)), ..ink }), ..(*style).clone() })
+                }
+                _ => style,
+            }),
             stroke_gradient: s.stroke_gradient.clone(),
             path: s.path.as_ref().map(|(paths, index)| path_morph(paths, index.at(t))),
             field: s.field.as_ref().map(|f| FieldState {
@@ -2433,7 +2450,7 @@ fn layer(layers: &[CLayer], i: usize, tc: f64, inherited: Option<Step>, space: &
                 warp: f.warp.at(t),
                 warp_scale: f.warp_scale.at(t).max(1e-3),
             }),
-            rough: s.rough,
+            rough: s.rough.map(|r| if r.boil > 0.0 { crate::document::Rough { seed: r.seed.wrapping_add(((t * r.boil).floor() as i64 as u32).wrapping_mul(104_729)), ..r } } else { r }),
         }),
         CKind::Text(tx) => Content::Text(text_state(tx, t)),
         CKind::Mesh(m) => match &l.rope {
