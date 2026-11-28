@@ -1617,7 +1617,8 @@ impl Toolbox {
             let video = self.input_file(video);
             let info = crate::measure::probe(&video)?;
             fps_used = info.fps.max(1.0);
-            t_from = get_f64(args, "from").unwrap_or(0.0);
+            // On the frame grid, so consecutive tiles are consecutive frames.
+            t_from = (get_f64(args, "from").unwrap_or(0.0) * fps_used).round() / fps_used;
             let times: Vec<f64> = (0..count).map(|k| t_from + (k as i64 * every) as f64 / fps_used).collect();
             for (t, img, d) in video_frames(&video, &times, width)? {
                 series.push(round(d));
@@ -1657,7 +1658,8 @@ impl Toolbox {
             let offset = get_f64(args, "offset").unwrap_or(0.0);
             // The reference steps at its own frame rate: every frame of it.
             let rfps = crate::measure::probe(&r)?.fps.max(1.0);
-            let times: Vec<f64> = (0..ours_tiles).map(|k| t_from + offset + (k as i64 * every) as f64 / rfps).collect();
+            let r0 = ((t_from + offset) * rfps).round() / rfps;
+            let times: Vec<f64> = (0..ours_tiles).map(|k| r0 + (k as i64 * every) as f64 / rfps).collect();
             for (t, img, d) in video_frames(&r, &times, width)? {
                 reference.push(round(d));
                 cells.push((format!("ref {:.2}s · Δ{:.1}", t, d), img));

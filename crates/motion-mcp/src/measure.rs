@@ -1472,7 +1472,10 @@ pub fn video_frames(video: &Path, times: &[f64], width: u32) -> Result<Vec<(f64,
         out.iter().zip(&n).map(|(a, b)| a / b.max(1.0)).collect()
     };
     let mut out = Vec::new();
+    // Decoded frames carry their own timestamps; match each wanted time to
+    // the nearest one, a half frame early so rounding never doubles a frame.
     for &t in times {
+        let t = t + dt * 0.01;
         let k = all.iter().enumerate().min_by(|a, b| (a.1 .0 - t).abs().total_cmp(&(b.1 .0 - t).abs())).map(|(k, _)| k);
         let Some(k) = k else { continue };
         let change = if k > 0 { mean_abs(&small(&all[k].1), &small(&all[k - 1].1)) as f64 } else { 0.0 };

@@ -299,12 +299,12 @@ def S02(s):  # and the first shovel of dirt comes down. — CU: a shovel tips it
                                     sparkle(f"{s['sid']}sh-gl", -36, -10, r=12)],
                   transform={"position": ks([(t0, [820, 560]), (td - 0.2, [760, 760], "glide")]), "anchor": [0, -300],
                              "rotation": ks([(t0, 160), (td - 0.25, 165), (td - 0.08, 215, "snap")])})
-    load = shape(f"{s['sid']}load", blob(0, 0, 90, 50, n=12, lump=0.25, seed=2), CREAM_DK, w=3.2)
+    load = shape(f"{s['sid']}load", blob(0, 0, 70, 40, n=12, lump=0.25, seed=2), GOLD_DK, w=3.2)
     load["transform"] = {"position": ks([(t0, [760, 760]), (td - 0.2, [740, 820]), (td + 0.12, [600, 1220], "in")]),
                          "scale": ks([(td - 0.05, [1, 1]), (td + 0.12, [1.5, 0.7], "in")]),
                          "opacity": ks([(td + 0.1, 1), (td + 0.16, 0, "linear")])}
     dirt = props.dirt_clods(f"{s['sid']}c", 380, 820, 820, 1560, td - 0.05, t1, n=60, seed=3)
-    puff = props.puffs(f"{s['sid']}pf", 580, 1260, td + 0.1, td + 1.0, n=3, s=1.4, color=CREAM_DK, rise=140, seed=4)
+    puff = props.puffs(f"{s['sid']}pf", 580, 1300, td + 0.1, td + 1.0, n=2, s=0.7, color=CREAM_DK, rise=120, seed=4)
     jolt = [(td + 0.1, 580, 1120, 2.35, "snap"), (td + 0.16, 596, 1104, 2.38, "linear"), (td + 0.22, 570, 1130, 2.36, "linear"), (td + 0.3, 584, 1116, 2.37, "linear")]
     return dict(pit=True, world=world, mid=[env], fore_extra=[shovel, load] + dirt + puff, defocus=7,
                 cam=cam((t0, 580, 1180, 1.85), (td, 580, 1140, 2.0, "glide"), *jolt, (t1, 580, 1130, 2.5, "linear"), clamp=False),
@@ -833,6 +833,7 @@ for sid, line_, idx, fn in TABLE:
 build_times()
 
 WHIP = 2 * F  # each side of the cut
+TWOS = {"S01", "S02", "S06", "S12", "S14", "S24", "S31"}  # action shots
 DAY = {"S01", "S02", "S03", "S04", "S08", "S09", "S10", "S11", "S12", "S13", "S14", "S16"}
 
 
@@ -854,7 +855,8 @@ def stage(s, spec, k):
         cam_comp(f"{sid}-sky", world["sky"] + spec.get("sky_extra", []), DEPTH["sky"], c, blur * 1.3),
         cam_comp(f"{sid}-back", world["back"] + spec.get("back_extra", []), DEPTH["back"], c, blur),
         cam_comp(f"{sid}-set", world["mid"] + spec.get("set_extra", []), DEPTH["mid"], c, blur * 0.8),
-        rimmed(cam_comp(f"{sid}-act", [{"id": f"{sid}-twos", "kind": "comp", "time": {"step_fps": 12}, "layers": spec.get("mid", [])}], DEPTH["mid"], c), s),
+        # Action steps on twos; talking shots and the camera stay smooth.
+        rimmed(cam_comp(f"{sid}-act", [{"id": f"{sid}-twos", "kind": "comp", "time": {"step_fps": 12 if sid in TWOS else 0}, "layers": spec.get("mid", [])}], DEPTH["mid"], c), s),
         cam_comp(f"{sid}-front", world.get("front", []) if spec.get("pit") else [], DEPTH["mid"], c, blur * 0.8),
         cam_comp(f"{sid}-fore", world["fore"] + spec.get("fore_extra", []), DEPTH["fore"], c),
     ]

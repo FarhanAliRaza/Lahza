@@ -159,8 +159,8 @@ def dirt_clods(id, x0, x1, y_top, y_bot, t0, t1, n=40, seed=0):
         x = rnd.uniform(x0, x1)
         start = t0 + (t1 - t0) * rnd.uniform(0, 0.7)
         dur = rnd.uniform(0.35, 0.6)
-        r = rnd.uniform(10, 26)
-        clod = shape(f"{id}-{k}", blob(0, 0, r, r * 0.8, n=7, lump=0.25, seed=k), CREAM_DK if k % 3 else GOLD_DK, w=2.2, rough=0.5)
+        r = rnd.uniform(7, 17)
+        clod = shape(f"{id}-{k}", blob(0, 0, r, r * 0.8, n=7, lump=0.3, seed=k), GOLD_DK if k % 3 else RED_DK, w=2.0, rough=0.5)
         clod["transform"] = {"position": {"keys": [{"at": round(start, 3), "v": r2((x, y_top - rnd.uniform(0, 300)))}, {"at": round(start + dur, 3), "v": r2((x + rnd.uniform(-40, 40), y_bot)), "ease": "in"}]},
                              "rotation": {"keys": [{"at": round(start, 3), "v": 0}, {"at": round(start + dur, 3), "v": rnd.uniform(-180, 180), "ease": "linear"}]}}
         clod["time"] = {"start": round(start, 3), "end": round(t1 + 2, 3)}
