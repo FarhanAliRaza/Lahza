@@ -183,13 +183,15 @@ def embers(id, x0, x1, y0, t0, t1, n=24, seed=0, rise=500):
     return L
 
 
-def puffs(id, x, y, t0, t1, n=6, s=1.0, color=CREAM, rise=420, seed=0, every=None):
-    """Smoke or steam puffs rising and spreading."""
+def puffs(id, x, y, t0, t1, n=6, s=1.0, color=CREAM, rise=420, seed=0, every=None, lead=1.0):
+    """Smoke or steam puffs rising and spreading. `lead`: seconds the first
+    puff starts before t0 (continuous smoke is already rising when a shot
+    opens; an impact's dust must not appear before the impact: lead 0)."""
     rnd = random.Random(seed)
     L = []
     every = every or (t1 - t0) / n
     for k in range(n):
-        start = t0 + k * every - 1.0
+        start = t0 + k * every - lead
         dur = rnd.uniform(1.8, 2.6)
         p = shape(f"{id}-{k}", blob(0, 0, 50 * s, 36 * s, n=10, lump=0.18, seed=k), color, w=2.4, rough=0.6)
         p["transform"] = {"position": {"keys": [{"at": round(start, 3), "v": r2((x, y))}, {"at": round(start + dur, 3), "v": r2((x + rnd.uniform(-60, 120) * s, y - rise * s)), "ease": "out"}]},

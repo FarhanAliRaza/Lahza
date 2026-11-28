@@ -110,6 +110,14 @@ These held across references and are worth checking first:
   (`ink.boil`, `rough.boil` at 12): a perfectly still line reads as vector.
 - **Captions stay small.** 1–3 words in natural case at about 3.5% of the
   frame height; large all-caps captions dominate the picture.
+- **Effects start at their cause.** Dust, sparks, a shake or a flash
+  belong to an event and start on its frame; only continuous things
+  (chimney smoke, steam, a crowd) may already be running when a shot opens.
+  A strip across every impact shows it: Δ should jump on the impact frame
+  (3 → 30), and nothing of the effect may sit on screen before it.
+- **Nothing covers the face that acts.** Dust, props and captions in front
+  of a reacting face hide the reaction the shot is for; read the strip's
+  faces frame by frame.
 - **Transitions carry.** In a whip the outgoing and incoming shots move
   together, edge to edge (the same ease, a full frame apart), blurred along
   the move; if the incoming shot covers the outgoing one it reads as a

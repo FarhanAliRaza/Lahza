@@ -304,7 +304,7 @@ def S02(s):  # and the first shovel of dirt comes down. — CU: a shovel tips it
                          "scale": ks([(td - 0.05, [1, 1]), (td + 0.12, [1.5, 0.7], "in")]),
                          "opacity": ks([(td + 0.1, 1), (td + 0.16, 0, "linear")])}
     dirt = props.dirt_clods(f"{s['sid']}c", 380, 820, 820, 1560, td - 0.05, t1, n=60, seed=3)
-    puff = props.puffs(f"{s['sid']}pf", 580, 1300, td + 0.1, td + 1.0, n=2, s=0.7, color=CREAM_DK, rise=120, seed=4)
+    puff = []  # dust over his face hid the scream; the clods carry the impact
     jolt = [(td + 0.1, 580, 1120, 2.35, "snap"), (td + 0.16, 596, 1104, 2.38, "linear"), (td + 0.22, 570, 1130, 2.36, "linear"), (td + 0.3, 584, 1116, 2.37, "linear")]
     return dict(pit=True, world=world, mid=[env], fore_extra=[shovel, load] + dirt + puff, defocus=7,
                 cam=cam((t0, 580, 1180, 1.85), (td, 580, 1140, 2.0, "glide"), *jolt, (t1, 580, 1130, 2.5, "linear"), clamp=False),
@@ -478,7 +478,7 @@ def S12(s):  # They carry the boat straight into a pit. — WIDE: carried across
               extra("drev", f"{s['sid']}d0", (780, 1560), 0.6, mood="shock", seed=51)]
     boat = sets.boat(f"{s['sid']}b", 700, 1560, 0.95)
     group = {"id": f"{s['sid']}grp", "kind": "comp", "transform": {"position": move}, "layers": inboat + [comp(f"{s['sid']}bt", boat)]}
-    dust = props.puffs(f"{s['sid']}dust", 700, 1500, tp + 1.0, tp + 2.0, n=3, s=1.4, color=CREAM_DK, rise=160, seed=3)
+    dust = props.puffs(f"{s['sid']}dust", 700, 1500, tp + 0.1, tp + 1.0, n=3, s=1.4, color=CREAM_DK, rise=160, seed=3, lead=0)
     return dict(pit=True, world=world, mid=[group], fore_extra=dust,
                 cam=cam((t0, 640, 1300, 1.0), (tp, 700, 1380, 1.12, "gesture"), (tp + 0.1, 700, 1400, 1.18, "snap"), (t1, 700, 1390, 1.2, "linear")),
                 sfx=[("hit", tp + 0.1, -7)])
