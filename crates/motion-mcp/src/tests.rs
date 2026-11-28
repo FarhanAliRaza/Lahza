@@ -1024,7 +1024,7 @@ fn check_flags_blank_frames_at_the_start_and_after_cuts() {
 }
 
 #[test]
-fn review_renders_scenes_cuts_and_phone_sheets() {
+fn review_renders_scenes_cuts_phone_and_motion_sheets() {
     let (mut tb, dir) = toolbox("review");
     tb.call("project_create", json!({"path": "film", "duration": 6, "width": 640, "height": 360})).unwrap();
     let mut ops = Vec::new();
@@ -1038,8 +1038,11 @@ fn review_renders_scenes_cuts_and_phone_sheets() {
     let out = tb.call("review", json!({"save": "sheets"})).unwrap();
     let r = &out.json;
     let names: Vec<&str> = r["sheets"].as_array().unwrap().iter().map(|s| s["sheet"].as_str().unwrap()).collect();
-    assert_eq!(names, ["scenes", "cuts", "phone"], "{r:#}");
-    assert_eq!(out.images.len(), 3);
+    assert_eq!(names, ["scenes", "cuts", "phone", "motion"], "{r:#}");
+    assert_eq!(out.images.len(), 4);
+    // Still text in every scene: each scene's motion window reads as frozen.
+    assert_eq!(r["motion"].as_array().unwrap().len(), 3, "{r:#}");
+    assert_eq!(r["frozen_windows"], 3, "{r:#}");
     // Each scene 0.4 s in and at its middle, labelled with its scene.
     let scenes: Vec<(String, f64)> = r["scenes"].as_array().unwrap().iter().map(|f| (f["scene"].as_str().unwrap().to_string(), f["t"].as_f64().unwrap())).collect();
     assert_eq!(scenes.len(), 6);
@@ -1057,7 +1060,7 @@ fn review_renders_scenes_cuts_and_phone_sheets() {
     let phone = image::load_from_memory(&out.images[2]).unwrap();
     assert!(phone.width() >= 360 * 4, "{}", phone.width());
     assert!(r["checklist"].as_str().unwrap().contains("P0 t=4.2s · where · problem → exact change"));
-    for f in ["review-scenes.png", "review-cuts.png", "review-phone-1.png"] {
+    for f in ["review-scenes.png", "review-cuts.png", "review-phone-1.png", "review-motion.png"] {
         assert!(dir.join("sheets").join(f).is_file(), "{f}");
     }
     std::fs::remove_dir_all(&dir).ok();

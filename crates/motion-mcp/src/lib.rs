@@ -27,6 +27,9 @@ Usage:
   lahza motion track <video> (--color HEX [--tolerance N] [--region x,y,w,h] | --point x,y | --box x,y,w,h)
                     [--from S] [--to S] [--keys [--scale S] [--at S] [--layer ID]]
   lahza motion fit <samples.json> [--fps N]   samples [[t, value], …], or a track output (fits its x/y)
+  lahza motion strip <project|video> [--from REF] [--count N] [--every N] [--width PX] [--columns N] [--against REF.mp4 [--offset S]] [-o strip.png]
+                    motion collage: consecutive frames, each with Δ (change since the frame before), a reference strip below
+  lahza motion measure <video> motion [--against REF.mp4 [--offset S]]   change per frame, drawings per second, holds
   lahza motion measure <video> cuts|events|ink|captions|curve [--from S] [--to S] [--at S] [--region x,y,w,h]
                     [--color HEX | --point x,y | --box x,y,w,h]   (curve: track it, fit an ease)
   lahza motion fit-camera <project> <marks.json> [--scene ID] [--fix fov,shift] [--apply]
@@ -239,10 +242,40 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
                 return Err("events drift from their markers".into());
             }
         }
+        "strip" => {
+            let src = args.get(1).ok_or("strip needs <project|video>")?;
+            let is_video = [".mp4", ".mov", ".webm", ".mkv", ".gif"].iter().any(|e| src.to_lowercase().ends_with(e));
+            let mut a = if is_video { json!({"video": src}) } else { json!({"project": src}) };
+            if let Some(v) = flag(args, "--from") {
+                a["from"] = v.parse::<f64>().map(|x| json!(x)).unwrap_or_else(|_| json!(v));
+            }
+            for f in ["count", "every", "width", "columns"] {
+                if let Some(v) = flag(args, &format!("--{f}")) {
+                    a[f] = json!(v.parse::<u64>().map_err(|e| format!("--{f}: {e}"))?);
+                }
+            }
+            if let Some(v) = flag(args, "--against") {
+                a["against"] = json!(v);
+            }
+            if let Some(v) = flag(args, "--offset") {
+                a["offset"] = json!(v.parse::<f64>().map_err(|e| format!("--offset: {e}"))?);
+            }
+            let out = tb.call("strip", a)?;
+            let path = flag(args, "-o").unwrap_or_else(|| "strip.png".into());
+            std::fs::write(&path, &out.images[0]).map_err(|e| format!("{path}: {e}"))?;
+            println!("{path}");
+            print(&out.json);
+        }
         "measure" => {
             let video = args.get(1).ok_or("measure needs <video> <kind>")?;
             let kind = args.get(2).ok_or("measure needs <video> <kind>")?;
             let mut a = json!({"video": video, "kind": kind});
+            if let Some(v) = flag(args, "--against") {
+                a["against"] = json!(v);
+            }
+            if let Some(v) = flag(args, "--offset") {
+                a["offset"] = json!(v.parse::<f64>().map_err(|e| format!("--offset: {e}"))?);
+            }
             for f in ["from", "to", "at", "tolerance"] {
                 if let Some(v) = flag(args, &format!("--{f}")) {
                     a[f] = json!(v.parse::<f64>().map_err(|e| format!("--{f}: {e}"))?);

@@ -2,6 +2,9 @@
 
 ## The loop
 
+0. **Study the reference first** (when there is one): see
+   [Learning from a reference](#learning-from-a-reference). Measure it
+   before deciding anything; the numbers become the film's targets.
 1. **Brief → visual script.** One row per spoken line or musical section:
    the words, the visual, the sync anchor (`word:canal`, `bar:5`, `hit:2`)
    and the style, plus a `BANNED:` line (see
@@ -45,8 +48,72 @@
    `review` for the whole film (scenes, every cut, phone width). Look at the
    frames; fix; repeat.
 7. **Whole-film review** with `review` before calling it done (see
-   [Whole-film review](#whole-film-review)).
+   [Whole-film review](#whole-film-review)), including its motion sheet,
+   and `strip` with `against` on every shot type you are unsure of.
 8. **Render** a draft (`quality: "draft"`), then the final.
+
+## Learning from a reference
+
+A reference is the only honest measure of "good". Before building, and
+again after the first render, take it apart with the tools, not by eye:
+
+1. **Overview.** One frame every 2 s in a grid (`snapshot` for a project,
+   `strip --every 48` for a video): shot sizes, how often a face fills the
+   frame, how much is close-up.
+2. **Motion.** `measure kind=motion` gives the change per frame (median,
+   p10, p90), how often a new drawing arrives (on ones, twos, threes) and
+   the held stretches. With `against`, ours and the reference are measured
+   side by side with a verdict. A film whose median change is under half
+   the reference's reads as frozen next to it, however good its stills.
+3. **Strips.** `strip` lays consecutive frames out with Δ (the change since
+   the frame before) on each: one strip per shot type (a talking close-up,
+   an action, an insert, a transition). Put the reference underneath with
+   `against`/`offset` and read the two row by row. Snapshots hide motion;
+   strips show it: a face that only blinks (Δ at the grain floor, ≈ 1), a
+   camera push too slow to see, drawings on twos (Δ alternating high/low),
+   a whip that covers the next shot instead of carrying it.
+4. **Pixels.** Crop the same feature (an eye, a hand, a line) from both at
+   the same scale and count: lines per face, their weight, texture marks per
+   square inch, whether form comes from line or from tone.
+5. **Write the targets down** next to the visual script: median Δ, share
+   of close-ups, marks per face, caption size. Check the first render
+   against them before polishing anything.
+
+### What the measurements keep showing
+
+These held across references and are worth checking first:
+
+- **Motion is most of the difference.** A strong reference changes 4–8 Δ
+  per frame even in a "still" talking shot (the camera pushes and drifts,
+  something in the frame is always moving); a puppet film sits near 1.
+  Move the camera every frame (a push of 15–30% over a shot, plus a small
+  handheld drift), act in beats every 0.3–0.5 s, and give actions their own
+  drawn poses: a rotation of a rigid part is not acting.
+- **Drawings on twos for action, smooth everything else.** References
+  animate characters on twos (a new drawing every second frame) during
+  action and keep the camera and secondary motion smooth. Step only the
+  cast (`time.step_fps: 12` on a comp inside the camera's layer), never
+  the camera.
+- **Form from line, not from tone.** Dense, purposeful ink (contour lines
+  around cheeks and folds, stacked lids and bags, broken forehead lines,
+  stipple, strands of hair in clumps) reads as illustration. Flat
+  geometric light and shade patches on skin (diagonal splits, trapezoids,
+  diamond highlights) read as vector clip art. Keep skin a flat bright tone;
+  put the hard two-tone light on sets.
+- **Rim light carries the night.** A bright warm edge on every silhouette
+  (`rim`) separates the cast from a blue background better than any shading.
+- **Shoot close.** Most frames of a strong short are close-ups and mediums
+  where the subject fills 60–100% of the frame, often with an out-of-focus
+  shoulder or object in front. Small figures in a big, empty set read as
+  a diagram.
+- **Lines live.** A hand-inked look needs the line to boil slightly
+  (`ink.boil`, `rough.boil` at 12): a perfectly still line reads as vector.
+- **Captions stay small.** 1–3 words in natural case at about 3.5% of the
+  frame height; large all-caps captions dominate the picture.
+- **Transitions carry.** In a whip the outgoing and incoming shots move
+  together, edge to edge (the same ease, a full frame apart), blurred along
+  the move; if the incoming shot covers the outgoing one it reads as a
+  smear.
 
 ## A film, not a page
 
@@ -172,6 +239,15 @@ numbers off a reference instead of eyeballing them:
   changes: caption timing to match.
 - `curve`: track a target (`color`, `point` or `box`, as `track`) and fit
   one of the engine's eases to its x and y.
+- `motion`: the change per frame (median, p10, p90), how often a new
+  drawing arrives (ones, twos, threes; per second) and the held stretches;
+  `against` measures a second video (ours against the reference) and says
+  what to change.
+
+`strip {from, count, every, against, offset}` (CLI `lahza motion strip
+<project|video>`) lays consecutive frames out with Δ on each, from a
+project or a video, with a reference strip underneath: the collage to read
+motion by, where a contact sheet of single frames hides it.
 
 ## Matching a reference camera
 
@@ -588,7 +664,7 @@ outside the radius instead.
 Per-scene snapshots miss what only shows at cuts and on a phone: a cut to
 half a second of blank paper, a transition showing a half-faded box with
 ghosted text, a 3D object drawn over the next scene's map in a crossfade,
-labels too small to read on a phone. `review` renders three sheets of the
+labels too small to read on a phone. `review` renders four sheets of the
 whole film (small, no motion blur), every frame labelled with its scene and
 time:
 
@@ -596,6 +672,9 @@ time:
 - **cuts**: a strip at −0.2, −0.1, 0, +0.1, +0.2 s around every scene
   boundary, spanning the transition when it is longer;
 - **phone**: the scene frames 360 px wide, in pages.
+- **motion**: six consecutive frames every 2.5 s, each labelled with Δ, its
+  change since the frame before; windows whose median Δ is under 2 are
+  listed as frozen (the grain floor is about 1).
 
 Then, sheet by sheet:
 
@@ -605,6 +684,10 @@ Then, sheet by sheet:
 3. At every cut: no blank or near-blank frame, no half-faded box or
    ghosted text, nothing of one scene drawn over the other.
 4. At 360 px: can every line be read? If not, make it bigger or cut it.
+5. On the motion sheet: does every window move? A frozen window is a held
+   picture; fix it with camera motion, faster acting beats or drawn poses,
+   then compare with the reference (`measure kind=motion`, `strip
+   against`).
 
 One note per problem, worst first: P0 (the viewer is lost or sees a broken
 frame), P1 (it costs attention), P2 (polish), as

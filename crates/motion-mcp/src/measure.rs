@@ -1291,3 +1291,194 @@ pub fn ssim_summary(frames: &[(f64, Vec<f64>)]) -> Value {
     json!({"mean": round(mean), "p05": round(p05), "min": round(v[0]),
            "worst_cell": {"column": col, "row": row, "ssim": round(worst.1.min(1.0))}})
 }
+
+// ------------------------------------------------------------------ motion
+
+/// Per-frame picture change of `video`, at 72 px wide (grain averages
+/// away), with cuts and whips left out of the statistics.
+pub fn changes(video: &Path, from: f64, to: Option<f64>) -> Result<(VideoInfo, Vec<f64>, Vec<f32>), String> {
+    let info = probe(video)?;
+    let w = 72u32;
+    let h = ((info.height as f64 * w as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+    let mut times = Vec::new();
+    let mut prev: Option<Vec<f32>> = None;
+    let mut d = Vec::new();
+    frames(video, from, to, w, h, |t, buf| {
+        let g = gray(buf);
+        if let Some(p) = &prev {
+            times.push(t);
+            d.push(mean_abs(&g, p));
+        }
+        prev = Some(g);
+    })?;
+    Ok((info, times, d))
+}
+
+/// How a picture moves, frame by frame: the change per frame (mean |Δ
+/// luma|, 0–255, at 72 px wide), how often a new drawing arrives (a frame
+/// that changes much more than its neighbours: animation on twos spikes on
+/// every second frame, on threes every third, smooth motion on ones never),
+/// and the stretches where nothing moves. Cuts and whips (changes over
+/// 6× the median) are left out of the statistics.
+pub fn motion(video: &Path, from: f64, to: Option<f64>) -> Result<Value, String> {
+    let (info, times, d) = changes(video, from, to)?;
+    if d.len() < 8 {
+        return Err("motion: fewer than 8 frames".into());
+    }
+    let mut sorted = d.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted[sorted.len() / 2].max(0.05);
+    let cut = |x: f32| x > median * 6.0 && x > 8.0;
+    let kept: Vec<f32> = d.iter().copied().filter(|x| !cut(*x)).collect();
+    let mut ks = kept.clone();
+    ks.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| ks[((ks.len() - 1) as f64 * p).round() as usize] as f64;
+    let mean = kept.iter().sum::<f32>() as f64 / kept.len().max(1) as f64;
+    // Frames that hardly change: held drawings with a still camera.
+    const STILL: f32 = 0.35;
+    let still_share = kept.iter().filter(|x| **x < STILL).count() as f64 / kept.len().max(1) as f64;
+    let mut holds = Vec::new();
+    let mut i = 0;
+    while i < d.len() {
+        if d[i] < STILL {
+            let mut j = i;
+            while j < d.len() && d[j] < STILL {
+                j += 1;
+            }
+            let dur = (j - i) as f64 / info.fps.max(1.0);
+            if dur >= 0.5 {
+                holds.push(json!({"t": round(times[i]), "seconds": round(dur)}));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    // New drawings: a frame that changes 1.6× more than both neighbours.
+    let mut spikes = 0usize;
+    let mut moving = 0usize;
+    for k in 1..d.len() - 1 {
+        if cut(d[k]) || d[k] < STILL {
+            continue;
+        }
+        moving += 1;
+        if d[k] > 1.6 * d[k - 1] && d[k] > 1.6 * d[k + 1] {
+            spikes += 1;
+        }
+    }
+    let spike_share = spikes as f64 / moving.max(1) as f64;
+    let steps = if moving < d.len() / 5 {
+        "held (mostly still)"
+    } else if spike_share > 0.36 {
+        "twos (a new drawing every 2nd frame)"
+    } else if spike_share > 0.22 {
+        "threes or mixed"
+    } else {
+        "ones (smooth: every frame moves alike)"
+    };
+    // Per second: the mean change (to graph where the film goes still) and
+    // whether that second animates on twos (most of its frames alternate).
+    let mut per_second = Vec::new();
+    let mut twos_seconds = Vec::new();
+    let fps = info.fps.max(1.0);
+    let step = fps.round().max(1.0) as usize;
+    for (c, chunk) in d.chunks(step).enumerate() {
+        let v: Vec<f32> = chunk.iter().copied().filter(|x| !cut(*x)).collect();
+        per_second.push(round(v.iter().sum::<f32>() as f64 / v.len().max(1) as f64));
+        let base = c * step;
+        let peaks = (base.max(1)..(base + chunk.len()).min(d.len() - 1)).filter(|&k| !cut(d[k]) && d[k] > STILL && d[k] > 1.4 * d[k - 1] && d[k] > 1.4 * d[k + 1]).count();
+        if peaks as f64 >= 0.3 * step as f64 {
+            twos_seconds.push(c);
+        }
+    }
+    Ok(json!({
+        "fps": info.fps, "frames": d.len() + 1,
+        "change": {"mean": round(mean), "median": round(pct(0.5)), "p10": round(pct(0.1)), "p90": round(pct(0.9))},
+        "still_share": round(still_share),
+        "holds": holds,
+        "drawings": {"spike_share": round(spike_share), "reads_as": steps, "per_second": round(spike_share * fps),
+                     "seconds_on_twos": twos_seconds.len(), "share_of_seconds_on_twos": round(twos_seconds.len() as f64 / per_second.len().max(1) as f64)},
+        "per_second_change": per_second,
+        "cuts_left_out": d.iter().filter(|x| cut(**x)).count(),
+        "note": "change = mean |Δ luma| per frame at 72 px wide (0–255). Compare a render with its reference: a film whose median change is a fraction of the reference's reads as frozen; spike_share ≈ 0.5 is animation on twos.",
+    }))
+}
+
+/// Motion of `ours` against a reference: both measured, and the ratios.
+pub fn motion_against(ours: &Path, reference: &Path, from: f64, to: Option<f64>, offset: f64) -> Result<Value, String> {
+    let a = motion(ours, from, to)?;
+    let b = motion(reference, (from + offset).max(0.0), to.map(|t| t + offset))?;
+    let ratio = |k: &str| {
+        let (x, y) = (a["change"][k].as_f64().unwrap_or(0.0), b["change"][k].as_f64().unwrap_or(0.0));
+        if y > 0.0 { round(x / y) } else { 0.0 }
+    };
+    let (mr, med) = (ratio("mean"), ratio("median"));
+    let mut verdict = Vec::new();
+    if med < 0.5 {
+        verdict.push(format!("ours moves {:.0}% as much as the reference per frame (median): it reads as frozen next to it; move the camera every frame, act in beats of 0.3–0.5 s, and give action drawn poses", med * 100.0));
+    }
+    let (sa, sb) = (a["drawings"]["share_of_seconds_on_twos"].as_f64().unwrap_or(0.0), b["drawings"]["share_of_seconds_on_twos"].as_f64().unwrap_or(0.0));
+    if sb > 0.1 && sa < sb * 0.5 {
+        verdict.push(format!("the reference animates on twos (a new drawing every second frame) in {:.0}% of its seconds, ours in {:.0}%: step the characters' clocks to 12 fps and give each move its own drawings", sb * 100.0, sa * 100.0));
+    }
+    let (ha, hb) = (a["still_share"].as_f64().unwrap_or(0.0), b["still_share"].as_f64().unwrap_or(0.0));
+    if ha > hb + 0.1 {
+        verdict.push(format!("ours holds still for {:.0}% of its frames against {:.0}% in the reference", ha * 100.0, hb * 100.0));
+    }
+    Ok(json!({"ours": a, "reference": b, "ratio": {"mean": mr, "median": med}, "verdict": verdict}))
+}
+
+/// An image's luma at 72 px wide (cell means), for frame-to-frame change.
+pub fn small_gray(img: &image::RgbaImage) -> Vec<f32> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let (sw, sh) = (72usize, ((h as f64 * 72.0 / w.max(1) as f64).round() as usize).max(2));
+    let mut out = vec![0.0f32; sw * sh];
+    let mut n = vec![0.0f32; sw * sh];
+    for (x, y, p) in img.enumerate_pixels() {
+        let i = (y as usize * sh / h).min(sh - 1) * sw + (x as usize * sw / w).min(sw - 1);
+        out[i] += 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+        n[i] += 1.0;
+    }
+    out.iter().zip(&n).map(|(a, b)| a / b.max(1.0)).collect()
+}
+
+/// Mean |Δ| of two `small_gray` pictures.
+pub fn change(a: &[f32], b: &[f32]) -> f64 {
+    mean_abs(a, b) as f64
+}
+
+/// Frames of a video at the given times, `width` px wide (RGBA), each with
+/// its change from the frame before it (mean |Δ luma| at 72 px).
+pub fn video_frames(video: &Path, times: &[f64], width: u32) -> Result<Vec<(f64, image::RgbaImage, f64)>, String> {
+    let info = probe(video)?;
+    let h = ((info.height as f64 * width as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+    let (from, to) = (times.iter().cloned().fold(f64::INFINITY, f64::min), times.iter().cloned().fold(0.0, f64::max));
+    let dt = 1.0 / info.fps.max(1.0);
+    let mut all: Vec<(f64, Vec<u8>)> = Vec::new();
+    frames(video, (from - dt).max(0.0), Some(to + dt * 2.5), width, h, |t, buf| all.push((t, buf.to_vec())))?;
+    let small = |buf: &[u8]| -> Vec<f32> {
+        // 72 px wide, averaged from the decoded frame.
+        let (sw, sh) = (72usize, ((h as f64 * 72.0 / width as f64).round() as usize).max(2));
+        let mut out = vec![0.0f32; sw * sh];
+        let mut n = vec![0.0f32; sw * sh];
+        for y in 0..h as usize {
+            for x in 0..width as usize {
+                let p = &buf[(y * width as usize + x) * 3..][..3];
+                let i = (y * sh / h as usize).min(sh - 1) * sw + (x * sw / width as usize).min(sw - 1);
+                out[i] += 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+                n[i] += 1.0;
+            }
+        }
+        out.iter().zip(&n).map(|(a, b)| a / b.max(1.0)).collect()
+    };
+    let mut out = Vec::new();
+    for &t in times {
+        let k = all.iter().enumerate().min_by(|a, b| (a.1 .0 - t).abs().total_cmp(&(b.1 .0 - t).abs())).map(|(k, _)| k);
+        let Some(k) = k else { continue };
+        let change = if k > 0 { mean_abs(&small(&all[k].1), &small(&all[k - 1].1)) as f64 } else { 0.0 };
+        let rgba: Vec<u8> = all[k].1.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        let img = image::RgbaImage::from_raw(width, h, rgba).ok_or("bad frame")?;
+        out.push((all[k].0, img, change));
+    }
+    Ok(out)
+}

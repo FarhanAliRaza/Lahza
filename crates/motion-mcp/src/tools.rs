@@ -67,6 +67,10 @@ Look at every sheet before calling the film done (run check first: first_frame_e
 2. Cover the words: do the frames alone still tell the story?
 3. Cuts sheet: no blank or near-blank frame, no half-faded box or ghosted text, nothing of one scene drawn over the other.
 4. Phone sheets: can every line be read at 360 px wide? If not, make it bigger or cut it.
+5. Motion sheet: six consecutive frames every 2.5 s, each with Δ (change since the frame before). A window listed as frozen
+   (median Δ under 2, the grain floor is ≈ 1) is a held picture: a face that only blinks, a push too slow to see. Move the
+   camera every frame, act in beats of 0.3–0.5 s, give action its own drawn poses. Measure a reference with
+   measure kind=motion and compare medians; use strip with `against` to read ours and the reference row by row.
 One note per problem, worst first (P0 the viewer is lost or sees a broken frame, P1 it costs attention, P2 polish):
   P0 t=4.2s · where · problem → exact change";
 
@@ -241,11 +245,22 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "measure",
-            description: "Measure a reference video. kind cuts: cuts, flashes, dissolves and whips from frame differences at 64×36. events: where the picture starts and stops changing (cuts left out) and the box of what changed. ink: text size at `at` in `region` (each line's height, stroke width). captions: when the caption band (region, default the bottom fifth) holds caption text (pixels near `color`, default white, within `tolerance`) and when it changes. curve: track `target` (as track: color/point/box) and fit an ease to its x and y.",
-            schema: obj(json!({"video": {"type": "string"}, "kind": {"type": "string", "enum": ["cuts", "events", "ink", "captions", "curve"]},
+            description: "Measure a reference video. kind cuts: cuts, flashes, dissolves and whips from frame differences at 64×36. events: where the picture starts and stops changing (cuts left out) and the box of what changed. ink: text size at `at` in `region` (each line's height, stroke width). captions: when the caption band (region, default the bottom fifth) holds caption text (pixels near `color`, default white, within `tolerance`) and when it changes. curve: track `target` (as track: color/point/box) and fit an ease to its x and y. motion: how much the picture changes per frame (median, p10/p90), how often a new drawing arrives (on ones, twos, threes), the held stretches; with `against` (a reference video, `offset` its seconds minus ours) both are measured and compared, with a verdict.",
+            schema: obj(json!({"video": {"type": "string"}, "kind": {"type": "string", "enum": ["cuts", "events", "ink", "captions", "curve", "motion"]},
+                "against": {"type": "string", "description": "motion: a reference video to compare with"}, "offset": {"type": "number"},
                 "from": {"type": "number"}, "to": {"type": "number"}, "at": {"type": "number", "description": "ink: the time"},
                 "region": {"type": "array", "items": {"type": "number"}, "description": "[x, y, w, h] source px"},
                 "color": {"type": "string"}, "point": {"type": "array", "items": {"type": "number"}}, "box": {"type": "array", "items": {"type": "number"}}, "tolerance": {"type": "number"}}), &["video", "kind"]),
+            read_only: true,
+        },
+        ToolDef {
+            name: "strip",
+            description: "Motion collage: consecutive frames in a grid, each labelled with its frame, time and Δ (how much the picture changed since the frame before it: mean |Δ luma| at 72 px, 0–255). Use it to see motion that single snapshots hide: a held face, a puppet that only blinks, a camera push too slow to see, a whip that covers instead of carries, animation on twos (Δ alternating high/low). From a project (`project`, rendered) or a `video`; `against` adds a reference video's strip below at the same frame rate (from + `offset`) so the two read row by row. Returns the sheet and the Δ series with its median and held tiles.",
+            schema: obj(json!({"video": {"type": "string", "description": "a video instead of the project"},
+                "from": time, "count": {"type": "integer", "default": 24, "description": "tiles (max 48)"},
+                "every": {"type": "integer", "default": 1, "description": "frames between tiles"},
+                "width": {"type": "integer", "default": 160}, "columns": {"type": "integer", "default": 8},
+                "against": {"type": "string", "description": "reference video drawn below"}, "offset": {"type": "number", "description": "reference seconds minus ours"}}), &[]),
             read_only: true,
         },
         ToolDef {
@@ -259,7 +274,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "review",
-            description: "Review the whole film as a viewer meets it, before calling it done; per-scene snapshots miss what only shows at cuts and on a phone. Renders three sheets (small, no motion blur), every frame labelled with its scene and time: scenes (each scene 0.4 s after it starts and at its middle), cuts (a strip at −0.2, −0.1, 0, +0.1, +0.2 s around every scene boundary, spanning the transition when it is longer: blank frames, half-faded boxes, ghosted text, one scene drawn over another) and phone (the scene frames 360 px wide, in pages). Returns the sheets as images and a checklist: describe each frame as a stranger would, naming every object (anything you would have to explain is a P0); cover the words and see if the frames still tell the story; read every line at 360 px. Write notes as `P0 t=4.2s · where · problem → exact change`.",
+            description: "Review the whole film as a viewer meets it, before calling it done; per-scene snapshots miss what only shows at cuts and on a phone. Renders three sheets (small, no motion blur), every frame labelled with its scene and time: scenes (each scene 0.4 s after it starts and at its middle), cuts (a strip at −0.2, −0.1, 0, +0.1, +0.2 s around every scene boundary, spanning the transition when it is longer: blank frames, half-faded boxes, ghosted text, one scene drawn over another) phone (the scene frames 360 px wide, in pages) and motion (six consecutive frames every 2.5 s with Δ, the change since the frame before; windows whose median Δ is under 2 are listed as frozen). Returns the sheets as images and a checklist: describe each frame as a stranger would, naming every object (anything you would have to explain is a P0); cover the words and see if the frames still tell the story; read every line at 360 px. Write notes as `P0 t=4.2s · where · problem → exact change`.",
             schema: obj(json!({"save": {"type": "string", "description": "also write the sheets into this folder: review-scenes.png, review-cuts.png, review-phone-1.png, …"}}), &[]),
             read_only: true,
         },
@@ -518,6 +533,7 @@ impl Toolbox {
             "compare" => self.compare(&args),
             "fit_camera" => self.fit_camera(&args),
             "measure" => self.measure(&args),
+            "strip" => self.strip(&args),
             "render" => self.render(&args),
             "render_status" => self.render_status(&args),
             "history" => self.history(&args),
@@ -1578,9 +1594,93 @@ impl Toolbox {
                 let fps = lahza_motion_core::time::Fps::whole(info.fps.round().max(1.0) as u32);
                 crate::measure::fit_curve(&pts, fps)?
             }
-            other => return Err(format!("measure: kind '{other}': cuts, events, ink, captions or curve")),
+            "motion" => match get_str(args, "against") {
+                Some(r) => crate::measure::motion_against(&video, &self.input_file(r), from, to, get_f64(args, "offset").unwrap_or(0.0))?,
+                None => crate::measure::motion(&video, from, to)?,
+            },
+            other => return Err(format!("measure: kind '{other}': cuts, events, ink, captions, curve or motion")),
         };
         Ok(Output::json(out))
+    }
+
+    fn strip(&mut self, args: &Value) -> ToolResult {
+        use crate::measure::{change, small_gray, video_frames};
+        let count = args.get("count").and_then(Value::as_u64).unwrap_or(24).clamp(2, 48) as usize;
+        let every = args.get("every").and_then(Value::as_u64).unwrap_or(1).max(1) as i64;
+        let width = args.get("width").and_then(Value::as_u64).unwrap_or(160).clamp(48, 640) as u32;
+        let columns = args.get("columns").and_then(Value::as_u64).unwrap_or(8).clamp(1, 16) as u32;
+        let mut cells: Vec<(String, image::RgbaImage)> = Vec::new();
+        let mut series: Vec<f64> = Vec::new();
+        let mut fps_used = 30.0;
+        let mut t_from = 0.0;
+        if let Some(video) = get_str(args, "video") {
+            let video = self.input_file(video);
+            let info = crate::measure::probe(&video)?;
+            fps_used = info.fps.max(1.0);
+            t_from = get_f64(args, "from").unwrap_or(0.0);
+            let times: Vec<f64> = (0..count).map(|k| t_from + (k as i64 * every) as f64 / fps_used).collect();
+            for (t, img, d) in video_frames(&video, &times, width)? {
+                series.push(round(d));
+                cells.push((format!("f{} · {:.2}s · Δ{:.1}", (t * fps_used).round(), t, d), img));
+            }
+        } else {
+            let dir = self.dir(args)?;
+            let compiled = self.compiled(&dir);
+            let fps = compiled.fps();
+            fps_used = fps.as_f64();
+            let from = match args.get("from") {
+                Some(v) => self.resolve_time(&dir, v)?.1,
+                None => 0.0,
+            };
+            let n0 = fps.nearest_frame(from).max(0);
+            t_from = fps.time_of(n0);
+            let last = compiled.frame_count().saturating_sub(1) as i64;
+            let scale = ((width as f64 * 2.0) / compiled.settings.width as f64).clamp(0.05, 1.0);
+            let renderer = self.renderer(&dir);
+            renderer.set_scale(scale);
+            let mut prev = if n0 > 0 { Some(small_gray(&renderer.try_render(&compiled, fps.time_of(n0 - every.min(n0)))?)) } else { None };
+            for k in 0..count as i64 {
+                let n = (n0 + k * every).min(last);
+                let img = renderer.try_render(&compiled, fps.time_of(n))?;
+                let g = small_gray(&img);
+                let d = prev.as_ref().map(|p| change(&g, p)).unwrap_or(0.0);
+                prev = Some(g);
+                series.push(round(d));
+                cells.push((format!("f{n} · {:.2}s · Δ{:.1}", fps.time_of(n), d), img));
+            }
+            renderer.set_scale(1.0);
+        }
+        let ours_tiles = cells.len();
+        let mut reference = Vec::new();
+        if let Some(r) = get_str(args, "against") {
+            let r = self.input_file(r);
+            let offset = get_f64(args, "offset").unwrap_or(0.0);
+            // The reference steps at its own frame rate: every frame of it.
+            let rfps = crate::measure::probe(&r)?.fps.max(1.0);
+            let times: Vec<f64> = (0..ours_tiles).map(|k| t_from + offset + (k as i64 * every) as f64 / rfps).collect();
+            for (t, img, d) in video_frames(&r, &times, width)? {
+                reference.push(round(d));
+                cells.push((format!("ref {:.2}s · Δ{:.1}", t, d), img));
+            }
+        }
+        let median = |v: &[f64]| {
+            let mut s: Vec<f64> = v.iter().skip(1).copied().collect();
+            s.sort_by(|a, b| a.total_cmp(b));
+            s.get(s.len() / 2).copied().unwrap_or(0.0)
+        };
+        let held = series.iter().skip(1).filter(|d| **d < 0.35).count();
+        let png = lahza_motion_render::encode_png(&sheet::contact_sheet(&cells, columns, width));
+        if let Some(save) = get_str(args, "save") {
+            let path = self.path(save);
+            std::fs::write(&path, &png).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        let mut out = json!({"tiles": ours_tiles, "every_frames": every, "delta": series, "median_delta": round(median(&series)), "held_tiles": held,
+            "note": "Δ = change since the frame before (mean |Δ luma| at 72 px). A face that only blinks shows Δ near the grain floor (≈1); a moving shot 4–10; animation on twos alternates high/low."});
+        if !reference.is_empty() {
+            out["reference_delta"] = json!(reference);
+            out["reference_median_delta"] = json!(round(median(&reference)));
+        }
+        Ok(Output { json: out, images: vec![png] })
     }
 
     fn fit_camera(&mut self, args: &Value) -> ToolResult {
@@ -1827,6 +1927,33 @@ impl Toolbox {
                 listed.push(row);
             }
         }
+        // Motion: six consecutive frames every 2.5 s of each scene, with how
+        // much each changed since the one before (a still picture hides it).
+        let (mut motion_cells, mut motion) = (Vec::new(), Vec::new());
+        renderer.set_scale((thumb * 2.0) / pw);
+        for (id, start, end, _) in &scenes {
+            let len = end - start;
+            let windows = ((len / 2.5).floor() as usize).max(1);
+            for w in 0..windows {
+                let t0 = start + len * (w as f64 + 0.5) / windows as f64;
+                let n0 = fps.nearest_frame(t0).clamp(1, last.max(1));
+                let mut prev = crate::measure::small_gray(&renderer.render(&compiled, fps.time_of(n0 - 1)));
+                let mut deltas = Vec::new();
+                for k in 0..6 {
+                    let n = (n0 + k).min(last);
+                    let img = renderer.render(&compiled, fps.time_of(n));
+                    let g = crate::measure::small_gray(&img);
+                    let d = crate::measure::change(&g, &prev);
+                    prev = g;
+                    deltas.push(d);
+                    motion_cells.push((format!("{id} f{n} Δ{d:.1}"), img));
+                }
+                let mut sorted = deltas.clone();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                let median = sorted[sorted.len() / 2];
+                motion.push(json!({"scene": id, "t": round(fps.time_of(n0)), "median_delta": round(median), "frozen": median < 2.0}));
+            }
+        }
         let backend = renderer.backend_label();
         let dropped = renderer.dropped();
         renderer.set_scale(options.scale);
@@ -1840,6 +1967,7 @@ impl Toolbox {
         for page in frames.chunks(4 * rows) {
             sheets.push(("phone", sheet::contact_sheet(page, 4, PHONE_WIDTH as u32)));
         }
+        sheets.push(("motion", sheet::contact_sheet(&motion_cells, 6, thumb as u32)));
         let images: Vec<Vec<u8>> = sheets.iter().map(|(_, s)| lahza_motion_render::encode_png(s)).collect();
         let mut saved = Vec::new();
         if let Some(folder) = get_str(args, "save") {
@@ -1862,12 +1990,15 @@ impl Toolbox {
         let what = |name: &str| match name {
             "scenes" => "each scene 0.4 s after it starts and at its middle",
             "cuts" => "every cut at −0.2, −0.1, 0, +0.1, +0.2 s (across the transition when it is longer); the label's scene changes at the cut",
+            "motion" => "six consecutive frames every 2.5 s, each with Δ, its change since the frame before (frozen windows are listed in `motion`)",
             _ => "the scene frames 360 px wide, as on a phone",
         };
         let mut out = json!({
             "sheets": sheets.iter().enumerate().map(|(i, (name, _))| json!({"image": i, "sheet": name, "shows": what(name)})).collect::<Vec<_>>(),
             "scenes": listed,
             "cuts": cuts,
+            "motion": motion,
+            "frozen_windows": motion.iter().filter(|m| m["frozen"] == true).count(),
             "checklist": REVIEW_CHECKLIST,
             "renderer": backend,
         });
