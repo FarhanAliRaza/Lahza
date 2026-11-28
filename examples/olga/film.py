@@ -167,11 +167,46 @@ def find(layer, id):
     return None
 
 
-def act(rig, head=None, body=None, rot=None, sway=1.5, bob=3.0, seed=0, flip=False, scale=1.0):
+NOW = (0.0, 1.0)  # the shot being built (t0, t1): extras and beats use it
+
+
+def beat_keys(t0, t1, amp, seed, every=(0.35, 0.55), shape=None):
+    """Acting beats: a small pose change every 0.35–0.55 s that snaps with
+    a little overshoot (alternating sides), so nothing on screen holds."""
+    rnd = random.Random(seed)
+    keys = [{"at": round(t0, 3), "v": 0}]
+    t, side = t0 + rnd.uniform(0.1, 0.3), 1
+    while t < t1:
+        v = side * amp * rnd.uniform(0.5, 1.0)
+        keys.append({"at": round(t, 3), "v": shape(v) if shape else round(v, 2), "ease": "pop", "dur": "6f"})
+        side = -side if rnd.random() < 0.8 else side
+        t += rnd.uniform(*every)
+    if shape:
+        keys[0]["v"] = shape(0)
+    return {"keys": keys}
+
+
+def beat_wrap(layer, id, t0, t1, rot_amp=0.0, bob_amp=0.0, seed=0):
+    """Wrap a comp's layers in a beat comp (rotation about its origin, a
+    vertical bob), leaving the comp's own keys alone."""
+    inner = {"id": id, "kind": "comp", "transform": {}, "layers": layer["layers"]}
+    if rot_amp:
+        inner["transform"]["rotation"] = beat_keys(t0, t1, rot_amp, seed)
+    if bob_amp:
+        inner["transform"]["position"] = beat_keys(t0, t1, bob_amp, seed + 101, shape=lambda v: [0, -abs(round(v, 2))])
+    layer["layers"] = [inner]
+    return layer
+
+
+def act(rig, head=None, body=None, rot=None, sway=1.5, bob=3.0, seed=0, flip=False, scale=1.0, t0=None, t1=None):
     """Head rotation keys, whole-body position/rotation keys and a breathing
-    sway on a built rig."""
+    sway on a built rig, plus acting beats every 0.35–0.55 s."""
     id = rig["id"]
+    t0, t1 = (t0, t1) if t0 is not None else NOW
     h = find(rig, f"{id}-head")
+    if h:
+        beat_wrap(h, f"{id}-headbeat", t0, t1, rot_amp=4.0, seed=seed + 11)
+    beat_wrap(rig, f"{id}-bodybeat", t0, t1, bob_amp=7.0, seed=seed + 12)
     if h:
         base = ks(head) if head else {"base": 0}
         base["add"] = [{"type": "wiggle", "hz": 0.7, "amp": sway, "seed": seed + 1}]
@@ -211,32 +246,37 @@ def build_times():
 def olga_rig(id, pos, scale, t0, t1, beats, arm_l=None, arm_r=None, hand_l="rest", hand_r="rest", head=None, body=None, rot=None, flip=False, seed=0):
     r = cast.olga(id, pos, 1.0, mood_keys=mood_track(t0, t1, beats), arm_l=ks(arm_l) if arm_l else None, arm_r=ks(arm_r) if arm_r else None,
                   hand_l=hand_l, hand_r=hand_r)
-    return act(r, head, body, rot, seed=seed, flip=flip, scale=scale)
+    return act(r, head, body, rot, seed=seed, flip=flip, scale=scale, t0=t0, t1=t1)
 
 
 def envoy_rig(id, pos, scale, t0, t1, beats, arm_l=None, arm_r=None, hand_l="fist", hand_r="fist", head=None, body=None, rot=None, flip=False, seed=0, tunic=RED):
     r = cast.envoy(id, pos, 1.0, mood_keys=mood_track(t0, t1, beats), arm_l=ks(arm_l) if arm_l else None, arm_r=ks(arm_r) if arm_r else None,
                    hand_l=hand_l, hand_r=hand_r, tunic=tunic)
-    return act(r, head, body, rot, seed=seed, flip=flip, scale=scale)
+    return act(r, head, body, rot, seed=seed, flip=flip, scale=scale, t0=t0, t1=t1)
 
 
 def igor_rig(id, pos, scale, t0, t1, beats, arm_l=None, arm_r=None, hand_l="fist", hand_r="open", head=None, body=None, rot=None, flip=False, seed=0):
     r = cast.igor(id, pos, 1.0, mood_keys=mood_track(t0, t1, beats), arm_l=ks(arm_l) if arm_l else None, arm_r=ks(arm_r) if arm_r else None,
                   hand_l=hand_l, hand_r=hand_r)
-    return act(r, head, body, rot, seed=seed, flip=flip, scale=scale)
+    return act(r, head, body, rot, seed=seed, flip=flip, scale=scale, t0=t0, t1=t1)
 
 
 def extra(kind, id, pos, scale=1.0, flip=False, mood="neutral", bob=4, seed=0, **kw):
     r = (cast.guard if kind == "guard" else cast.drevlian)(id, pos, scale, flip=flip, mood=mood, **kw)
     pk = {"base": r["transform"]["position"], "add": [{"type": "wiggle", "hz": 0.6, "amp": bob, "seed": seed}]}
     r["transform"]["position"] = pk
+    # Extras sway from their feet in beats too (fewer marks, same life).
+    beat_wrap(r, f"{id}-beat", NOW[0], NOW[1], rot_amp=2.5, bob_amp=4.0, seed=seed_of(id))
     return r
 
 
-def screen(id, layers, t0, t1, drift=(0, -30), zoom=(1.0, 1.08)):
-    """Layers fixed to the frame (inserts), with their own slow push."""
+def screen(id, layers, t0, t1, drift=(0, -60), zoom=(1.0, 1.2)):
+    """Layers fixed to the frame (inserts), with their own push and a
+    handheld drift."""
+    pos = ks([(t0, [0, 0]), (t1, list(drift), "linear")])
+    pos["add"] = [{"type": "wiggle", "hz": 1.1, "amp": 8, "seed": seed_of(id)}]
     return {"id": id, "kind": "comp", "transform": {
-        "position": ks([(t0, [0, 0]), (t1, list(drift), "linear")]),
+        "position": pos,
         "anchor": [C[0], C[1]],
         "scale": ks([(t0, [zoom[0], zoom[0]]), (t1, [zoom[1], zoom[1]], "linear")])}, "layers": [
         {"id": f"{id}-in", "kind": "comp", "transform": {"position": [C[0], C[1]]}, "layers": layers}]}
@@ -250,6 +290,23 @@ def tremble(layer, hz=7, deg=1.6, seed=0):
     """Fear: a fast shiver of the whole body."""
     layer["transform"]["rotation"] = {"base": 0, "add": [{"type": "wiggle", "hz": hz, "amp": deg, "seed": seed}]}
     return layer
+
+
+def flapper(id, kind, s_, t0, t1, at, bundle=False, lit=False, flap=0.083):
+    """A perched bird that flaps on twos and hops in beats."""
+    draw = props.pigeon if kind == "pigeon" else props.sparrow
+    up = comp(f"{id}-u", draw(f"{id}-u", 0, s_, bundle, lit))
+    dn = comp(f"{id}-d", draw(f"{id}-d", 1, s_, bundle, lit))
+    ku, kd, t, k = [], [], t0, 0
+    while t < t1:
+        ku.append({"at": round(t, 3), "v": 1 if k % 2 else 0, "ease": "hold"})
+        kd.append({"at": round(t, 3), "v": 0 if k % 2 else 1, "ease": "hold"})
+        t += flap * (1 if (k // 6) % 2 == 0 else 3)  # bursts of flapping, then a rest
+        k += 1
+    up["transform"]["opacity"] = {"keys": ku}
+    dn["transform"]["opacity"] = {"keys": kd}
+    pos = beat_keys(t0, t1, 18, seed_of(id) + 5, shape=lambda v: [round(at[0], 2), round(at[1] - abs(v), 2)])
+    return {"id": id, "kind": "comp", "transform": {"position": pos, "rotation": beat_keys(t0, t1, 8, seed_of(id))}, "layers": [up, dn]}
 
 
 def S01(s):  # Twenty men sit in a boat at the bottom of a pit, — the boat in the pit: men cower, peek up, flinch; dirt trickles from the rim
@@ -378,9 +435,10 @@ def S07(s):  # for coming back to take their tribute twice. — INSERT: Igor's g
     ig = igor_rig(f"{s['sid']}i", (520, 1900), 1.1, t0, t1, [(t0, "joy"), (tw, "joy")], head=[(t0, -4), (tt, 6), (tw, -6)],
                   arm_l=[(t0, arm_deg(-1, 40)), (tt, arm_deg(-1, -20)), (tw, arm_deg(-1, 50))], arm_r=[(t0, arm_deg(1, 30)), (tt + 0.1, arm_deg(1, -25)), (tw + 0.1, arm_deg(1, 40))],
                   hand_l="grip", hand_r="grip", body=[(t0, (0, 0)), (tt, (0, 30)), (tw, (0, -10))], seed=33)
-    pile = comp(f"{s['sid']}tp", props.tribute(f"{s['sid']}tr", 1.6), transform={"position": [540, 1500]})
-    return dict(world=world, mid=[ig], fore_extra=[pile], defocus=6,
-                cam=cam((t0, 540, 1250, 1.5), (tw, 540, 1260, 1.62, "snap"), (t1, 540, 1250, 1.68, "linear")),
+    pile = comp(f"{s['sid']}tp", props.tribute(f"{s['sid']}tr", 1.25), transform={"position": ks([(t0, [540, 1790]), (tt, [540, 1810], "snap"), (tt + 0.2, [540, 1790], "pop"), (tw, [540, 1815], "snap"), (tw + 0.2, [540, 1790], "pop")]),
+                                                                              "rotation": ks([(t0, 0), (tt, 3, "snap"), (tt + 0.25, -1, "pop"), (tw, -4, "snap"), (tw + 0.25, 1, "pop")])})
+    return dict(cap_y=1760, world=world, mid=[ig], fore_extra=[pile], defocus=6,
+                cam=cam((t0, 540, 1330, 1.45), (tt - 0.08, 548, 1336, 1.56, "linear"), (tt, 540, 1330, 1.62, "snap"), (tt + 0.12, 552, 1240, 1.64, "linear"), (tw - 0.08, 530, 1262, 1.74, "linear"), (tw, 540, 1260, 1.8, "snap"), (tw + 0.12, 528, 1250, 1.82, "linear"), (t1, 540, 1250, 1.95, "linear")),
                 sfx=[("pop", tt + 0.05, -14), ("pop", tw + 0.05, -12)])
 
 
@@ -690,10 +748,15 @@ def S24(s):  # Five thousand of them never get up. — the table of slumped gues
         d = extra("drev", f"{s['sid']}d{k}", (x, 1720), 0.85, flip=k % 2 == 1, mood="blink", tunic=RED if k % 2 else CREAM, seed=100 + k, bob=0)
         d["transform"]["rotation"] = ks([(t0, 0), (t0 + 0.15 * k + 0.3, 70 if k % 2 == 0 else -70, "bounce")])
         slumped.append(d)
-    guards = [extra("guard", f"{s['sid']}g{k}", (x, 1500), 0.7, flip=k == 1, seed=105 + k) for k, x in enumerate([180, 1320])]
+    guards = []
+    for k, (x0, x1) in enumerate([(-80, 200), (1580, 1300)]):
+        g = extra("guard", f"{s['sid']}g{k}", (x0, 1500), 0.7, flip=k == 1, seed=105 + k, bob=0)
+        g["transform"]["position"] = ks([(t0, [x0, 1500]), (t1, [x1, 1500], "linear")])
+        g["transform"]["position"]["add"] = [{"type": "wiggle", "hz": 3.0, "amp": 6, "seed": k}]
+        guards.append(g)
     ol = olga_rig(f"{s['sid']}o", (760, 1300), 0.6, t0, t1, [(t0, "anger"), (tf + 1.0, "smug")], seed=107)
     return dict(world=world, mid=[ol] + guards + slumped + grave_torches(s["sid"], world, t1),
-                cam=cam((t0, 760, 1420, 1.15), (t1, 760, 1360, 1.0, "linear")),
+                cam=cam((t0, 760, 1460, 1.35), (t1, 760, 1360, 1.0, "linear")),
                 sfx=[("sting", tf, -11), ("thud", t0 + 0.45, -14)])
 
 
@@ -727,12 +790,14 @@ def S27(s):  # three pigeons and three sparrows from every house. — INSERT: th
     birds = []
     for k in range(3):
         tk = t0 + 0.12 * k
-        b = comp(f"{s['sid']}p{k}", props.pigeon(f"{s['sid']}pg{k}", k % 2, 1.6), transform={"position": [230 + k * 300, 980], "scale": ks([(tk - 0.01, [0, 0]), (tk + 0.05, [1, 1], "pop")])})
+        b = flapper(f"{s['sid']}p{k}", "pigeon", 1.6, tk, t1, (230 + k * 300, 980))
+        b["transform"]["scale"] = ks([(tk - 0.01, [0, 0]), (tk + 0.05, [1, 1], "pop")])
         b["time"] = {"start": round(tk - 0.01, 3)}
         birds.append(b)
     for k in range(3):
         tk = tsp + 0.12 * k
-        b = comp(f"{s['sid']}s{k}", props.sparrow(f"{s['sid']}sp{k}", k % 2, 1.8), transform={"position": [230 + k * 300, 1320], "scale": ks([(tk - 0.01, [0, 0]), (tk + 0.05, [1, 1], "pop")])})
+        b = flapper(f"{s['sid']}s{k}", "sparrow", 1.8, tk, t1, (230 + k * 300, 1320))
+        b["transform"]["scale"] = ks([(tk - 0.01, [0, 0]), (tk + 0.05, [1, 1], "pop")])
         b["time"] = {"start": round(tk - 0.01, 3)}
         birds.append(b)
     d = extra("drev", f"{s['sid']}d", (880, 2440), 1.2, flip=True, mood="joy", seed=131)
@@ -745,10 +810,10 @@ def S28(s):  # Her soldiers tie sulphur and rags to every bird — INSERT: hands
     t0, t1 = s["t0"], s["t1"]
     world = sets.iskorosten(f"{s['sid']}i", dusk=True)
     ts = cue("l12", "sulphur")
-    pg = comp(f"{s['sid']}pg", props.pigeon(f"{s['sid']}p", 1, 4.0), transform={"position": [470, 1050], "rotation": {"base": 0, "add": [{"type": "wiggle", "hz": 2.0, "amp": 3, "seed": 2}]}})
+    pg = flapper(f"{s['sid']}pg", "pigeon", 4.0, t0, t1, (470, 1050))
     bundle = comp(f"{s['sid']}bun", props.sulphur(f"{s['sid']}su", 0, 0, 3.0), transform={"position": ks([(t0, [700, 1500]), (ts, [500, 1160], "snap")])})
     hands = [comp(f"{s['sid']}h{k}", cast.hand(f"{s['sid']}hd{k}", "grip" if k else "fist", lit=k == 0, side=1 - 2 * k, size=2.4),
-                  transform={"position": ks([(t0, [380 + 300 * k, 1400]), (ts, [400 + 220 * k, 1180]), (ts + 0.3, [410 + 220 * k, 1170]), (ts + 0.6, [395 + 220 * k, 1185])]),
+                  transform={"position": ks([(t0, [380 + 300 * k, 1400]), (ts, [400 + 220 * k, 1180])] + [(ts + 0.18 * j, [400 + 220 * k + (14 if (j + k) % 2 else -14), 1180 + (10 if j % 2 else -10)], "snap") for j in range(1, 14)]),
                              "rotation": 180}) for k in range(2)]
     return dict(world=world, mid=[], screen_extra=[pg, bundle] + hands, defocus=9,
                 cam=cam((t0, 600, 1300, 1.3), (t1, 600, 1300, 1.36, "linear")),
@@ -777,7 +842,7 @@ def S30(s):  # The birds fly home, to their nests under dry eaves. — WIDE: bur
         st = t0 + rnd.uniform(0.0, 0.8)
         birds += props.flier(f"{s['sid']}b{k}", "pigeon" if k % 2 else "sparrow", rnd.uniform(200, 1300), 2100, ex + 40, ey + 30, st, st + rnd.uniform(1.5, 2.1), s=1.0, bundle=True, lit=True, arc=-160)
     return dict(world=world, mid=birds, back_extra=isk_life(s["sid"], t0, t1, world),
-                cam=cam((t0, 760, 1560, 1.12), (t1, 760, 1220, 1.12, "gesture")),
+                cam=cam((t0, 760, 1600, 1.12), (t1, 760, 1200, 1.3, "linear")),
                 sfx=[])
 
 
@@ -808,7 +873,7 @@ def S32(s):  # Later, the Church made Olga a saint. — the icon: Olga haloed, s
     for k, (cx_, cy_) in enumerate(world["candles"]):
         candles += sets.flame(f"{s['sid']}cf{k}", cx_, cy_, 0.6, seed=40 + k, until=t1 + 1)
     return dict(world=world, mid=[ol] + candles,
-                cam=cam((t0, 750, 1150, 1.05), (t1, 750, 1050, 1.25, "linear")),
+                cam=cam((t0, 690, 1180, 1.0), (t1, 800, 1020, 1.5, "linear"), clamp=False),
                 sfx=[("chime", ts, -10), ("riser", ts - 1.6, -20)])
 
 
@@ -845,11 +910,25 @@ def rimmed(layer, s):
 DIRS = [(-1, 0), (0, -1), (1, 0), (0, 1)]
 
 
+def visible_push(c, gain=0.25):
+    """A camera that barely zooms (under 12% over the shot) pushes in about
+    18%, so the frame never sits still; pull-backs are left as they are."""
+    z0, z1 = c[0][3], c[-1][3]
+    if not (0.95 <= z1 / z0 < 1.12) or len(c) < 2:
+        return c
+    ta, tb = c[0][0], c[-1][0]
+    out = []
+    for (tt, cx, cy, z, ease) in c:
+        u = (tt - ta) / max(1e-6, tb - ta)
+        out.append((tt, cx, cy, round(z * (1 + gain * u), 4), ease))
+    return out
+
+
 def stage(s, spec, k):
     """A shot: its set's depth layers through the camera, its actors, its
     whips in and out."""
     sid, t0, t1 = s["sid"], s["t0"], s["t1"]
-    world, c = spec["world"], spec["cam"]
+    world, c = spec["world"], visible_push(spec["cam"])
     blur = spec.get("defocus", 0)
     layers = [
         cam_comp(f"{sid}-sky", world["sky"] + spec.get("sky_extra", []), DEPTH["sky"], c, blur * 1.3),
@@ -914,7 +993,7 @@ def captions():
         size = round(min(66, 0.84 * W / (0.6 * len(text))), 1)
         L.append({"id": f"cap{k:03d}", "kind": "text", "text": text, "font": CAPTION_FONT, "size": size, "color": "#ffe21a",
                   "weight": 2.0, "stroke": {"color": INK, "width": 9}, "tracking": 0, "role": "caption", "space": "screen",
-                  "transform": {"position": [C[0], 1540], "opacity": {"keys": [{"at": round(a, 3), "v": 0.5}, {"at": round(a + 3 * F, 3), "v": 1, "ease": "hold"}]}},
+                  "transform": {"position": [C[0], next((sh["cap_y"] for sh in SHOTS if sh["t0"] <= c[0][0] < sh["t1"]), 1540)], "opacity": {"keys": [{"at": round(a, 3), "v": 0.5}, {"at": round(a + 3 * F, 3), "v": 1, "ease": "hold"}]}},
                   "time": {"start": round(a, 3), "end": round(b, 3)}})
     return L
 
@@ -972,7 +1051,10 @@ def build():
     shots = []
     sfx = []
     for k, s in enumerate(SHOTS):
+        global NOW
+        NOW = (s["t0"], s["t1"])
         spec = s["fn"](s)
+        s["cap_y"] = spec.get("cap_y", 1540)
         shots.append(stage(s, spec, k))
         sfx += spec.get("sfx", [])
     film = {"id": "film", "kind": "comp", "layers": shots, "effects": FINISH}

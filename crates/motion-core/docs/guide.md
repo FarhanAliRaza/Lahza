@@ -110,6 +110,11 @@ These held across references and are worth checking first:
   (`ink.boil`, `rough.boil` at 12): a perfectly still line reads as vector.
 - **Captions stay small.** 1–3 words in natural case at about 3.5% of the
   frame height; large all-caps captions dominate the picture.
+- **A snap is an arrival, not a move.** `snap`, `glide` and the springs
+  reach their value within a few frames and then hold: a camera keyed
+  `snap` from the start of a shot to a beat seconds later sits still in
+  between. Lead up linearly (or with `push`) and snap only the last few
+  frames into the hit.
 - **Effects start at their cause.** Dust, sparks, a shake or a flash
   belong to an event and start on its frame; only continuous things
   (chimney smoke, steam, a crowd) may already be running when a shot opens.

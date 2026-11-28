@@ -353,6 +353,15 @@ fn motion(tb: &mut Toolbox, args: &[String]) -> Result<(), String> {
             for p in out.json["saved"].as_array().into_iter().flatten() {
                 println!("{}", p.as_str().unwrap_or(""));
             }
+            // Motion: every window's median Δ, frozen ones marked.
+            let motion = out.json["motion"].as_array().cloned().unwrap_or_default();
+            if !motion.is_empty() {
+                println!("\nmotion (median Δ of six consecutive frames; under 2 reads as frozen):");
+                for m in &motion {
+                    println!("  {:>6.2}s {:<10} Δ {:>5.2}{}", m["t"].as_f64().unwrap_or(0.0), m["scene"].as_str().unwrap_or(""), m["median_delta"].as_f64().unwrap_or(0.0), if m["frozen"] == true { "  FROZEN" } else { "" });
+                }
+                println!("  {} frozen of {}", out.json["frozen_windows"], motion.len());
+            }
             println!("\n{}", out.json["checklist"].as_str().unwrap_or(""));
             if out.json["ok"] == false {
                 return Err(format!("not drawn as asked: {}", out.json["errors"]));
